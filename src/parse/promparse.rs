@@ -16,7 +16,10 @@
 
 use std::borrow::Cow;
 
-use super::float::{FloatBuf, common_openmetrics_float, format_openmetrics_float, parse_go_float};
+use super::float::{
+    FloatBuf, common_openmetrics_float, format_openmetrics_float, parse_go_float,
+    parse_go_float_no_underscore,
+};
 use super::promlex::{Lexer, Token};
 use super::{
     BUCKET_LABEL, Entry, LabelsBuffer, METRIC_NAME_LABEL, MetricType, ParseError, Parser,
@@ -25,6 +28,18 @@ use super::{
 
 /// Go's `value.NormalNaN`, the canonical NaN bit pattern Prometheus stores.
 const NORMAL_NAN: u64 = 0x7ff8_0000_0000_0001;
+
+/// Byte offsets of a UTF-8 validated `(label_name, label_value)` pair in the input slice.
+///
+/// Storing lifetime-free byte spans allows `ArrowDecoder` to reuse the parser's label capacity
+/// across scrapes with different input lifetimes under `#![forbid(unsafe_code)]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LabelSpan {
+    pub(crate) name_start: usize,
+    pub(crate) name_end: usize,
+    pub(crate) val_start: usize,
+    pub(crate) val_end: usize,
+}
 
 /// Zero-copy parser for the Prometheus text exposition format 0.0.4.
 ///
@@ -38,14 +53,21 @@ pub struct PromParser<'a> {
     value: f64,
     timestamp: Option<i64>,
     line_start: usize,
+    name_offset: usize,
     name: Option<&'a [u8]>,
     /// Escaped label names and values, without quotes, already checked to be UTF-8.
-    labels: Vec<(&'a str, &'a str)>,
+    labels: Vec<LabelSpan>,
 }
 
 impl<'a> PromParser<'a> {
     /// Creates a parser over `input`.
     pub fn new(input: &'a [u8]) -> Self {
+        Self::with_scratch(input, Vec::new())
+    }
+
+    /// Creates a parser over `input` reusing a caller-owned `labels` span buffer.
+    pub(crate) fn with_scratch(input: &'a [u8], mut labels: Vec<LabelSpan>) -> Self {
+        labels.clear();
         Self {
             lexer: Lexer::new(input),
             series: b"",
@@ -54,11 +76,42 @@ impl<'a> PromParser<'a> {
             value: 0.0,
             timestamp: None,
             line_start: 0,
+            name_offset: 0,
             name: None,
-            labels: Vec::new(),
+            labels,
         }
     }
 
+    /// Returns the reusable label span buffer so callers can preserve capacity across scrapes.
+    pub(crate) fn into_scratch(mut self) -> Vec<LabelSpan> {
+        self.labels.clear();
+        self.labels
+    }
+
+    /// Returns the byte offset of the current entry's metric name in `input`.
+    pub(crate) fn name_offset(&self) -> usize {
+        self.name_offset
+    }
+
+    /// Returns the raw metric name and raw (escaped) help text for `Entry::Help` without
+    /// allocating a `Cow::Owned` buffer.
+    pub(crate) fn raw_help(&self) -> (&'a [u8], &'a [u8]) {
+        (self.metric_name(), self.text)
+    }
+
+    /// Returns the raw metric name, validated UTF-8 label spans, full input slice, optional
+    /// timestamp in milliseconds, and sample value for `Entry::Series`.
+    pub(crate) fn raw_series_parts(&self) -> (&'a [u8], &[LabelSpan], &'a [u8], Option<i64>, f64) {
+        (
+            self.metric_name(),
+            &self.labels,
+            self.lexer.input,
+            self.timestamp,
+            self.value,
+        )
+    }
+
+    #[inline]
     fn next_token(&mut self) -> Token {
         loop {
             let token = self.lexer.lex();
@@ -84,6 +137,7 @@ impl<'a> PromParser<'a> {
             start += 1;
             end -= 1;
         }
+        self.name_offset = start;
         self.name = Some(&self.lexer.input[start..end]);
         if self.next_token() != Token::Text {
             return Err(self.unexpected("expected text"));
@@ -120,6 +174,7 @@ impl<'a> PromParser<'a> {
         let mut token = first;
         if first == Token::MName {
             // Go uses the line start, so leading blanks become part of the name.
+            self.name_offset = self.line_start;
             self.series = self.consumed_line();
             self.name = Some(self.series);
             token = self.next_token();
@@ -133,6 +188,7 @@ impl<'a> PromParser<'a> {
     }
 
     /// Returns the bytes of the current line that the lexer has consumed so far.
+    #[inline]
     fn consumed_line(&self) -> &'a [u8] {
         &self.lexer.input[self.line_start..self.lexer.pos]
     }
@@ -146,7 +202,7 @@ impl<'a> PromParser<'a> {
                 Token::QString => true,
                 _ => return Err(self.unexpected("expected label name")),
             };
-            let name = self.token_str(quoted)?;
+            let (name_start, name_end) = self.validated_token_span(quoted)?;
             token = self.next_token();
             if quoted && matches!(token, Token::Comma | Token::BraceClose) {
                 if self.name.is_some() {
@@ -154,7 +210,8 @@ impl<'a> PromParser<'a> {
                         offset: self.line_start,
                     });
                 }
-                self.name = Some(name.as_bytes());
+                self.name_offset = name_start;
+                self.name = Some(&self.lexer.input[name_start..name_end]);
                 if token == Token::BraceClose {
                     return Ok(());
                 }
@@ -167,7 +224,13 @@ impl<'a> PromParser<'a> {
             if self.next_token() != Token::LValue {
                 return Err(self.unexpected("expected label value"));
             }
-            self.labels.push((name, self.token_str(true)?));
+            let (val_start, val_end) = self.validated_token_span(true)?;
+            self.labels.push(LabelSpan {
+                name_start,
+                name_end,
+                val_start,
+                val_end,
+            });
             token = self.next_token();
             if token == Token::Comma {
                 token = self.next_token();
@@ -175,13 +238,25 @@ impl<'a> PromParser<'a> {
         }
     }
 
-    /// Returns the current token as UTF-8, without its quotes when `quoted`.
-    fn token_str(&self, quoted: bool) -> Result<&'a str, ParseError> {
-        let raw = self.lexer.token();
-        let raw = if quoted { &raw[1..raw.len() - 1] } else { raw };
-        std::str::from_utf8(raw).map_err(|_| ParseError::InvalidUtf8 {
-            offset: self.lexer.token_start,
-        })
+    /// Validates that the current token is UTF-8 and returns its unquoted `(start, end)` offsets.
+    #[inline]
+    fn validated_token_span(&self, quoted: bool) -> Result<(usize, usize), ParseError> {
+        let end = self.lexer.input.len();
+        let mut start = self.lexer.token_start.min(end);
+        let mut stop = self.lexer.pos.min(end);
+        if quoted {
+            start += 1;
+            stop -= 1;
+            let raw = &self.lexer.input[start..stop];
+            // Unquoted `LName` tokens only contain `[a-zA-Z0-9_]`, so only quoted strings can
+            // carry non-ASCII bytes that require UTF-8 validation.
+            if !raw.is_ascii() && std::str::from_utf8(raw).is_err() {
+                return Err(ParseError::InvalidUtf8 {
+                    offset: self.lexer.token_start,
+                });
+            }
+        }
+        Ok((start, stop))
     }
 
     fn parse_metric_suffix(&mut self, token: Token) -> Result<Entry, ParseError> {
@@ -206,12 +281,9 @@ impl<'a> PromParser<'a> {
             Token::Linebreak => {}
             Token::Timestamp => {
                 let raw = self.lexer.token();
-                let timestamp = std::str::from_utf8(raw)
-                    .ok()
-                    .and_then(|digits| digits.parse().ok())
-                    .ok_or_else(|| {
-                        ParseError::InvalidTimestamp(String::from_utf8_lossy(raw).into_owned())
-                    })?;
+                let timestamp = parse_timestamp_i64(raw).ok_or_else(|| {
+                    ParseError::InvalidTimestamp(String::from_utf8_lossy(raw).into_owned())
+                })?;
                 self.timestamp = Some(timestamp);
                 if self.next_token() != Token::Linebreak {
                     return Err(self.unexpected("expected linebreak after timestamp"));
@@ -222,6 +294,7 @@ impl<'a> PromParser<'a> {
         Ok(Entry::Series)
     }
 
+    #[inline]
     fn metric_name(&self) -> &'a [u8] {
         self.name.unwrap_or_default()
     }
@@ -266,9 +339,14 @@ impl<'a> Parser<'a> for PromParser<'a> {
         // next_entry() already checked that a series name is UTF-8.
         let name = std::str::from_utf8(self.metric_name()).unwrap_or_default();
         buf.push(Cow::Borrowed(METRIC_NAME_LABEL), unescape_label(name));
-        for &(name, value) in &self.labels {
-            let name = unescape_label(name);
-            let value = normalize_float_label(self.last_type, &name, unescape_label(value));
+        let input = self.lexer.input;
+        for span in &self.labels {
+            let raw_name =
+                std::str::from_utf8(&input[span.name_start..span.name_end]).unwrap_or_default();
+            let raw_val =
+                std::str::from_utf8(&input[span.val_start..span.val_end]).unwrap_or_default();
+            let name = unescape_label(raw_name);
+            let value = normalize_float_label(self.last_type, &name, unescape_label(raw_val));
             buf.push(name, value);
         }
         buf.sort();
@@ -303,40 +381,68 @@ fn normalize_float_label<'v>(
 
 /// Maps a `# TYPE` value to a [`MetricType`]. Prometheus text spells the unknown type `untyped`.
 fn parse_metric_type(text: &[u8]) -> Result<MetricType, ParseError> {
-    if text == b"untyped" {
-        return Ok(MetricType::Unknown);
+    match text {
+        b"untyped" => Ok(MetricType::Unknown),
+        b"counter" => Ok(MetricType::Counter),
+        b"gauge" => Ok(MetricType::Gauge),
+        b"histogram" => Ok(MetricType::Histogram),
+        b"summary" => Ok(MetricType::Summary),
+        _ => Err(ParseError::InvalidMetricType(
+            String::from_utf8_lossy(text).into_owned(),
+        )),
     }
-    [
-        MetricType::Counter,
-        MetricType::Gauge,
-        MetricType::Histogram,
-        MetricType::Summary,
-    ]
-    .into_iter()
-    .find(|metric_type| metric_type.as_str().as_bytes() == text)
-    .ok_or_else(|| ParseError::InvalidMetricType(String::from_utf8_lossy(text).into_owned()))
+}
+
+/// Unescapes `\\`, `\n`, and, when `quote` is `true`, `\"` into `scratch` without allocating
+/// once `scratch` has sufficient capacity. Returns `raw` directly when no backslash is present.
+#[inline]
+pub(crate) fn unescape_bytes_into<'c>(
+    raw: &'c [u8],
+    quote: bool,
+    scratch: &'c mut Vec<u8>,
+) -> &'c [u8] {
+    let Some(first_slash) = raw.iter().position(|&b| b == b'\\') else {
+        return raw;
+    };
+    scratch.clear();
+    unescape_from_slash(raw, first_slash, quote, scratch);
+    scratch.as_slice()
+}
+
+fn unescape_from_slash(raw: &[u8], first_slash: usize, quote: bool, out: &mut Vec<u8>) {
+    out.reserve(raw.len());
+    out.extend_from_slice(&raw[..first_slash]);
+
+    let mut i = first_slash;
+    let mut plain_start = first_slash;
+    while i < raw.len() {
+        if raw[i] == b'\\' {
+            let replaced = match raw.get(i + 1) {
+                Some(b'\\') => Some(b'\\'),
+                Some(b'n') => Some(b'\n'),
+                Some(b'"') if quote => Some(b'"'),
+                _ => None,
+            };
+            if let Some(ch) = replaced {
+                out.extend_from_slice(&raw[plain_start..i]);
+                out.push(ch);
+                i += 2;
+                plain_start = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.extend_from_slice(&raw[plain_start..]);
 }
 
 /// Go's `strings.Replacer` for `\\` and `\n`, plus `\"` when `quote` is set.
 fn unescape(raw: &[u8], quote: bool) -> Cow<'_, [u8]> {
-    if !raw.contains(&b'\\') {
+    let Some(first_slash) = raw.iter().position(|&b| b == b'\\') else {
         return Cow::Borrowed(raw);
-    }
-    let mut out = Vec::with_capacity(raw.len());
-    let mut bytes = raw.iter().copied().peekable();
-    while let Some(byte) = bytes.next() {
-        let replaced = match (byte, bytes.peek()) {
-            (b'\\', Some(b'\\')) => b'\\',
-            (b'\\', Some(b'n')) => b'\n',
-            (b'\\', Some(b'"')) if quote => b'"',
-            _ => {
-                out.push(byte);
-                continue;
-            }
-        };
-        bytes.next();
-        out.push(replaced);
-    }
+    };
+    let mut out = Vec::new();
+    unescape_from_slash(raw, first_slash, quote, &mut out);
     Cow::Owned(out)
 }
 
@@ -352,11 +458,53 @@ fn unescape_label(raw: &str) -> Cow<'_, str> {
 }
 
 /// Go's `parseFloat` in promparse.go, which rejects `pP_` before `strconv.ParseFloat`.
+#[inline]
 fn parse_sample_value(raw: &[u8]) -> Option<f64> {
-    if raw.iter().any(|byte| matches!(byte, b'p' | b'P' | b'_')) {
+    if raw.is_empty() {
         return None;
     }
-    parse_go_float(std::str::from_utf8(raw).ok()?)
+    // Fast path for exact integer counters and gauges up to 15 digits (< 2^53).
+    let (neg, digits) = match raw[0] {
+        b'-' => (true, &raw[1..]),
+        b'+' => (false, &raw[1..]),
+        _ => (false, raw),
+    };
+    if !digits.is_empty() && digits.len() <= 15 {
+        let mut acc = 0u64;
+        let mut all_digits = true;
+        for &b in digits {
+            if b.is_ascii_digit() {
+                acc = acc * 10 + u64::from(b - b'0');
+            } else {
+                all_digits = false;
+                break;
+            }
+        }
+        if all_digits {
+            let v = acc as f64;
+            return Some(if neg { -v } else { v });
+        }
+    }
+
+    for &b in raw {
+        if !b.is_ascii() || matches!(b, b'p' | b'P' | b'_') {
+            return None;
+        }
+    }
+    let text = std::str::from_utf8(raw).ok()?;
+    parse_go_float_no_underscore(text)
+}
+
+#[inline]
+fn parse_timestamp_i64(raw: &[u8]) -> Option<i64> {
+    if raw.is_empty() {
+        return None;
+    }
+    let mut acc = 0i64;
+    for &b in raw {
+        acc = acc.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+    }
+    Some(acc)
 }
 
 #[cfg(test)]
@@ -603,6 +751,23 @@ mod tests {
                 matches!(normalized, Cow::Borrowed(text) if text == want),
                 "{raw}"
             );
+        }
+    }
+
+    #[test]
+    fn unescape_bytes_into_reuses_scratch() {
+        let mut scratch = Vec::new();
+        for (raw, want_q, want_noq) in [
+            ("plain", "plain", "plain"),
+            ("a\\\"\\\\\\n\\x", "a\"\\\n\\x", "a\\\"\\\n\\x"),
+            ("\\\\n", "\\n", "\\n"),
+            ("\\©", "\\©", "\\©"),
+            ("two\\\\ \\n \\\" x", "two\\ \n \" x", "two\\ \n \\\" x"),
+        ] {
+            let got_q = unescape_bytes_into(raw.as_bytes(), true, &mut scratch).to_vec();
+            assert_eq!(got_q, want_q.as_bytes(), "quote=true {raw:?}");
+            let got_noq = unescape_bytes_into(raw.as_bytes(), false, &mut scratch).to_vec();
+            assert_eq!(got_noq, want_noq.as_bytes(), "quote=false {raw:?}");
         }
     }
 }

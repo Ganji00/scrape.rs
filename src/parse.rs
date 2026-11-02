@@ -26,6 +26,7 @@ mod promparse;
 
 pub use omparse::OpenMetricsParser;
 pub use promparse::PromParser;
+pub(crate) use promparse::{LabelSpan, unescape_bytes_into};
 
 /// Label name under which [`Parser::labels`] stores the metric name.
 pub const METRIC_NAME_LABEL: &str = "__name__";
