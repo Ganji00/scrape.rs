@@ -1,2 +1,3 @@
 /target
+/tests/otap-compat/Cargo.lock
 /tests/otap-compat/target

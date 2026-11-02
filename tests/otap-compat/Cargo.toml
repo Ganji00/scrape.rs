@@ -8,6 +8,11 @@ publish = false
 # Upstream `otel-arrow-dfe-pdata` has no feature flag to disable `datafusion`, `tonic`, `tokio`,
 # `nix`, and `zstd`, so resolving it pulls ~380 transitive crates (~5.3k lines in `Cargo.lock`)
 # and requires MSRV 1.94 versus `expfmt`'s MSRV 1.88.
+#
+# Per Rust's lockfile guidance (https://blog.rust-lang.org/2023/08/29/committing-lockfiles/),
+# root `Cargo.lock` stays committed to pin MSRV 1.88 and byte-exact `prost-build` checks, while
+# `tests/otap-compat/Cargo.lock` is gitignored so `stable` CI tests compatibility against the
+# latest `0.62.x` `otel-arrow-dfe-pdata` graph without checking in a 5k-line lockfile.
 [workspace]
 
 [dev-dependencies]

@@ -17,6 +17,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Resolve OTAP compatibility lockfile for cache key
+        run: cargo generate-lockfile --manifest-path tests/otap-compat/Cargo.toml
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
