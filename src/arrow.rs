@@ -13,10 +13,10 @@
 
 //! Layer 1 columnar Apache Arrow decoder producing OpenTelemetry Arrow Protocol metric batches.
 //!
-//! [`ArrowDecoder`] streams entries from Layer 0 parsers directly into reusable columnar buffers
+//! [`ArrowDecoder`] ingests entries from Layer 0 parsers one by one into reusable columnar buffers
 //! and arena-backed string interners without per-sample heap allocations, locks, or shared
-//! thread-synchronized state, so single-threaded `!Send` scrape loops can reuse one decoder with
-//! bounded memory.
+//! thread-synchronized state, then finalizes one [`OtapMetricRecords`] batch set per scrape.
+//! Single-threaded `!Send` scrape loops can reuse one decoder across scrapes with bounded memory.
 
 mod intern;
 mod records;
@@ -318,7 +318,24 @@ impl ArrowDecoder {
             + self.scratch_bytes.capacity()
     }
 
-    /// Decodes a single exposition payload of `format` into OTAP metric [`RecordBatch`]es.
+    /// Decodes a single exposition scrape buffer of `format` into OTAP metric [`RecordBatch`]es.
+    ///
+    /// # Streaming and batching
+    ///
+    /// Input parsing is streaming within `input`: `decode` pulls `Entry` items one by one from
+    /// `PromParser` and appends directly into reusable columnar staging vectors and arena string
+    /// interners without materializing intermediate per-sample structs or per-string allocations.
+    ///
+    /// Output emission is batched per scrape call rather than chunked mid-scrape. Each `decode`
+    /// call expects `input` to hold one complete exposition payload and returns at most one
+    /// [`RecordBatch`] per [`MetricPayloadType`] table covering the entire scrape. Whole-scrape
+    /// finalization is required because:
+    /// - Prometheus text 0.0.4 allows interleaved samples for an earlier metric family and
+    ///   trailing `# HELP` lines after samples, so `UnivariateMetrics` descriptions and parent IDs
+    ///   are only complete at end-of-scrape.
+    /// - OTAP schemas adaptively omit unused optional columns (`description`, `id`,
+    ///   `time_unix_nano`, `flags`) and choose dictionary key widths (`UInt8`, `UInt16`, or plain
+    ///   `Utf8`) from whole-batch cardinality and nullability.
     pub fn decode(
         &mut self,
         input: &[u8],
