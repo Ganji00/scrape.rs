@@ -26,8 +26,14 @@ prost-types = { version = "0.14", optional = true }
 thiserror = "2"
 
 [dev-dependencies]
+criterion = { version = "0.8", default-features = false }
 prost-build = "=0.14.4"
 protox = "0.10"
+
+[[bench]]
+name = "decode"
+harness = false
+required-features = ["arrow"]
 
 [lints.rust]
 missing_docs = "warn"
