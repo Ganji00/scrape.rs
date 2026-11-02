@@ -1,0 +1,106 @@
+// Copyright 2026 The Prometheus Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Bounded-memory verification for `!Send` single-threaded `tokio::task::LocalSet` scrape loops
+//! using both `retained_memory_bytes()` and `dhat` live heap tracking.
+
+use std::cell::RefCell;
+use std::fs;
+use std::path::Path;
+use std::rc::Rc;
+
+use expfmt::arrow::{ArrowDecoder, DecodeOptions, OtapMetricRecords};
+use expfmt::format::Format;
+use otel_arrow_dfe_pdata::otap::{Metrics, OtapArrowRecords, OtapBatchStore};
+use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
+
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
+fn to_otap_arrow_records(records: &OtapMetricRecords) -> OtapArrowRecords {
+    let mut store = Metrics::new();
+    for (payload_type, batch) in records.iter() {
+        let wire_type = ArrowPayloadType::try_from(payload_type.as_i32())
+            .expect("MetricPayloadType matches ArrowPayloadType wire discriminant");
+        store
+            .set(wire_type, batch.clone())
+            .unwrap_or_else(|err| panic!("OTAP schema rejected {payload_type:?}: {err}"));
+    }
+    OtapArrowRecords::Metrics(store)
+}
+
+#[test]
+fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
+    let _profiler = dhat::Profiler::builder().testing().build();
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/textparse");
+    let nometa = fs::read(root.join("alltypes.237mfs.nometa.prom.txt")).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("single-threaded runtime builds");
+    let local = tokio::task::LocalSet::new();
+
+    local.block_on(&rt, async move {
+        // Wrap `ArrowDecoder` in `!Send` `Rc<RefCell<_>>` to mirror thread-per-core OTAP receivers.
+        let shared_decoder = Rc::new(RefCell::new(ArrowDecoder::new()));
+        let opts = DecodeOptions::new().with_timestamp_ms(1_700_000_000_000);
+
+        let handle = tokio::task::spawn_local(async move {
+            let mut warmup_decoder_mem = 0usize;
+            let mut warmup_batch_mem = 0usize;
+            let mut warmup_live_heap = 0usize;
+
+            for i in 0..32 {
+                let records = shared_decoder
+                    .borrow_mut()
+                    .decode(&nometa, &Format::TEXT, &opts)
+                    .expect("scrape succeeds");
+                let otap = to_otap_arrow_records(&records);
+                let dec_mem = shared_decoder.borrow().retained_memory_bytes();
+                let batch_mem = otap.retained_memory_bytes();
+                drop(otap);
+                drop(records);
+
+                let live_heap = dhat::HeapStats::get().curr_bytes;
+
+                // Record baseline at `i == 1` so both `ArrowDecoder` scratch buffers and Tokio's
+                // `LocalSet` `yield_now` queue have completed their one-time initial allocation.
+                if i == 1 {
+                    warmup_decoder_mem = dec_mem;
+                    warmup_batch_mem = batch_mem;
+                    warmup_live_heap = live_heap;
+                    assert!(warmup_decoder_mem > 0);
+                    assert!(warmup_batch_mem > 0);
+                    assert!(warmup_live_heap > 0);
+                } else if i > 1 {
+                    assert_eq!(
+                        dec_mem, warmup_decoder_mem,
+                        "decoder scratch memory grew after warmup at iteration {i}"
+                    );
+                    assert_eq!(
+                        batch_mem, warmup_batch_mem,
+                        "output OTAP batch memory changed across identical scrapes at iteration {i}"
+                    );
+                    assert_eq!(
+                        live_heap, warmup_live_heap,
+                        "live heap bytes leaked after dropping scrape batch at iteration {i}"
+                    );
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        handle.await.expect("local task succeeds");
+    });
+}

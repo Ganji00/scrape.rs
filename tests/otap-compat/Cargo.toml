@@ -1,0 +1,21 @@
+[package]
+name = "expfmt-otap-compat"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone workspace so `otel-arrow-dfe-pdata`'s `datafusion` dependency (MSRV 1.94) does not
+# enter the root `expfmt` crate's MSRV 1.88 `Cargo.lock`.
+[workspace]
+
+[dev-dependencies]
+dhat = "0.3"
+expfmt = { path = "../..", default-features = false, features = ["arrow"] }
+otel-arrow-dfe-pdata = { version = "0.62", features = ["testing"] }
+tokio = { version = "1.48", default-features = false, features = ["macros", "rt"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

@@ -13,9 +13,11 @@
 
 //! Prometheus and OpenMetrics wire exposition format decoders.
 
+#[cfg(feature = "arrow")]
+pub mod arrow;
 #[cfg(feature = "dto")]
 pub mod dto;
 pub mod format;
-// The Arrow and dto decoders (#7, #8) are the public API and will use this parser.
+// Layer 0 parsers remain crate-internal; `arrow` and `dto` expose the public decoding APIs.
 #[allow(dead_code, unused_imports)]
 pub(crate) mod parse;

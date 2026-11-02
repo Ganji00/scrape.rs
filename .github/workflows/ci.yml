@@ -18,14 +18,30 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            tests/otap-compat -> target
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Check formatting (OTAP compatibility suite)
+        run: cargo fmt --manifest-path tests/otap-compat/Cargo.toml --all -- --check
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Run clippy (no default features)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
       - name: Run tests (all features)
         run: cargo test --all-features
       - name: Run tests (no default features)
         run: cargo test --no-default-features
+      - name: Run clippy (OTAP compatibility suite)
+        env:
+          CARGO_TARGET_DIR: target
+        run: cargo clippy --manifest-path tests/otap-compat/Cargo.toml --all-targets -- -D warnings
+      - name: Run OTAP compatibility tests
+        env:
+          CARGO_TARGET_DIR: target
+        run: cargo test --manifest-path tests/otap-compat/Cargo.toml
 
   msrv:
     name: MSRV (1.88)

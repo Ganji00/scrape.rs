@@ -9,12 +9,18 @@ repository = "https://github.com/prometheus/expfmt-rs"
 keywords = ["prometheus", "openmetrics", "metrics", "opentelemetry", "arrow"]
 categories = ["parser-implementations", "encoding"]
 
+[workspace]
+exclude = ["tests/otap-compat"]
+
 [features]
 default = ["arrow", "dto"]
-arrow = []
+arrow = ["dep:arrow-array", "dep:arrow-buffer", "dep:arrow-schema"]
 dto = ["dep:prost", "dep:prost-types"]
 
 [dependencies]
+arrow-array = { version = "59", default-features = false, optional = true }
+arrow-buffer = { version = "59", default-features = false, optional = true }
+arrow-schema = { version = "59", default-features = false, optional = true }
 prost = { version = "0.14", optional = true }
 prost-types = { version = "0.14", optional = true }
 thiserror = "2"
