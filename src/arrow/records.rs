@@ -15,10 +15,22 @@
 
 use arrow_array::RecordBatch;
 
-/// OTAP `ArrowPayloadType` wire discriminants produced by [`super::ArrowDecoder`].
+/// Metric subset of OTAP `ArrowPayloadType` wire discriminants produced by [`super::ArrowDecoder`].
 ///
-/// Discriminant values match `opentelemetry.proto.experimental.arrow.v1.ArrowPayloadType`
-/// in [`open-telemetry/otel-arrow`](https://github.com/open-telemetry/otel-arrow).
+/// Discriminant values match `opentelemetry.proto.experimental.arrow.v1.ArrowPayloadType` in
+/// [`open-telemetry/otel-arrow`](https://github.com/open-telemetry/otel-arrow), and the
+/// `tests/otap-compat` suite asserts exact wire parity against `otel-arrow-dfe-pdata`.
+///
+/// `expfmt` defines this metric-only enum locally rather than importing `ArrowPayloadType` from
+/// `otel-arrow-dfe-pdata` for three reasons:
+/// 1. Upstream `otel-arrow` has not split a standalone schema or proto crate out of
+///    `otel-arrow-dfe-pdata`, which unconditionally pulls in `datafusion`, `tonic`, and `tokio`
+///    and requires MSRV 1.94, exceeding `expfmt`'s MSRV 1.88.
+/// 2. `otel-arrow`'s planned Prometheus scrape receiver (`open-telemetry/otel-arrow#3277`) intends
+///    to depend on `expfmt`, so a reverse runtime dependency from `expfmt` would create a cycle.
+/// 3. `ArrowPayloadType` includes trace and log tables (`Spans`, `Logs`, `SpanEvents`, etc.) that
+///    `ArrowDecoder` never emits, whereas `MetricPayloadType` narrows `get` and `iter` to metric
+///    tables.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(i32)]
 #[non_exhaustive]

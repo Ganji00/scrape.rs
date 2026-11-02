@@ -64,6 +64,32 @@ fn number_dp(attrs: &[(&str, &str)], time_unix_nano: u64, val: f64) -> NumberDat
 }
 
 #[test]
+fn metric_payload_type_discriminants_match_otap_proto() {
+    let cases = [
+        (
+            MetricPayloadType::UnivariateMetrics,
+            ArrowPayloadType::UnivariateMetrics,
+        ),
+        (
+            MetricPayloadType::NumberDataPoints,
+            ArrowPayloadType::NumberDataPoints,
+        ),
+        (
+            MetricPayloadType::NumberDpAttrs,
+            ArrowPayloadType::NumberDpAttrs,
+        ),
+        (
+            MetricPayloadType::MetricAttrs,
+            ArrowPayloadType::MetricAttrs,
+        ),
+    ];
+    for (local, upstream) in cases {
+        assert_eq!(local.as_i32(), upstream as i32);
+        assert_eq!(ArrowPayloadType::try_from(local.as_i32()), Ok(upstream));
+    }
+}
+
+#[test]
 fn counter_gauge_and_untyped_round_trip_through_otap_and_otlp() {
     let payload = concat!(
         "# HELP http_requests_total Total HTTP requests.\\nLine two\\\\end.\n",
