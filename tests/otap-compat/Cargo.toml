@@ -4,8 +4,10 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 
-# Standalone workspace so `otel-arrow-dfe-pdata`'s `datafusion` dependency (MSRV 1.94) does not
-# enter the root `expfmt` crate's MSRV 1.88 `Cargo.lock`.
+# Standalone workspace isolating `otel-arrow-dfe-pdata` from the root `expfmt` crate.
+# Upstream `otel-arrow-dfe-pdata` has no feature flag to disable `datafusion`, `tonic`, `tokio`,
+# `nix`, and `zstd`, so resolving it pulls ~380 transitive crates (~5.3k lines in `Cargo.lock`)
+# and requires MSRV 1.94 versus `expfmt`'s MSRV 1.88.
 [workspace]
 
 [dev-dependencies]
