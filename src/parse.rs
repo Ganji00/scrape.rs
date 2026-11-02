@@ -245,14 +245,15 @@ pub trait Parser<'a> {
 
     /// Clears `buf`, fills it with the exemplar labels of the current sample sorted by name,
     /// and returns the exemplar value and optional timestamp in ms. Returns `None` when the
-    /// sample has no exemplar.
-    fn exemplar(&self, buf: &mut LabelsBuffer<'a>) -> Option<(f64, Option<i64>)> {
+    /// sample has no exemplar or it was already returned, like Go.
+    fn exemplar(&mut self, buf: &mut LabelsBuffer<'a>) -> Option<(f64, Option<i64>)> {
         buf.clear();
         None
     }
 
     /// Returns the start timestamp in ms of the current sample, read from its `_created` line.
-    /// Takes `&mut self` because, like Go, it caches the last hit.
+    /// Takes `&mut self` because, like Go, it caches the last hit and turns on `_created`
+    /// skipping, so later `_created` lines are not returned as series.
     fn start_timestamp(&mut self) -> Option<i64> {
         None
     }

@@ -31,7 +31,8 @@ const CREATED_SUFFIX: &[u8] = b"_created";
 /// Zero-copy parser for the OpenMetrics 1.0 text exposition format.
 ///
 /// Mirrors Go's `textparse.NewOpenMetricsParser` with Prometheus's default scrape options:
-/// `_created` lines are returned as series, and type and unit labels are disabled.
+/// `_created` lines are returned as series until the first [`Parser::start_timestamp`]
+/// lookahead, and type and unit labels are disabled.
 pub struct OpenMetricsParser<'a> {
     lexer: Lexer<'a>,
     skip_created_series: bool,
@@ -408,8 +409,9 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
         buf.sort();
     }
 
-    fn exemplar(&self, buf: &mut LabelsBuffer<'a>) -> Option<(f64, Option<i64>)> {
+    fn exemplar(&mut self, buf: &mut LabelsBuffer<'a>) -> Option<(f64, Option<i64>)> {
         buf.clear();
+        let exemplar = self.exemplar.take()?;
         // Go keeps exemplar labels escaped.
         for &(name, value) in &self.exemplar_labels {
             buf.push(
@@ -418,7 +420,7 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
             );
         }
         buf.sort();
-        self.exemplar
+        Some(exemplar)
     }
 
     /// Peeks ahead for the `_created` line of the current series, like Go's `StartTimestamp`,
@@ -454,6 +456,9 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
             break (same_series && peek.value.is_finite()).then_some((peek.value * 1000.0) as i64);
         };
         self.peek_labels = std::mem::take(&mut peek.labels);
+        // Go turns on `_created` skipping after every lookahead, even without
+        // `WithOMParserSTSeriesSkipped`.
+        self.skip_created_series = true;
         if found.is_some() {
             let mut key = std::mem::take(&mut self.start_timestamp_key);
             key.clear();
@@ -655,6 +660,29 @@ mod tests {
             let input: &'static [u8] = input;
             assert_eq!(first_start_timestamp(input), None);
         }
+    }
+
+    #[test]
+    fn start_timestamp_turns_on_created_skipping() {
+        let mut parser =
+            OpenMetricsParser::new(b"# TYPE a counter\na_total 1\na_created 5\nb 1\n# EOF\n");
+        let mut series = Vec::new();
+        while let Some(entry) = parser.next_entry().unwrap() {
+            if entry == Entry::Series {
+                series.push(parser.metric_name());
+                parser.start_timestamp();
+            }
+        }
+        assert_eq!(series, [&b"a_total"[..], b"b"]);
+    }
+
+    #[test]
+    fn exemplar_is_returned_once() {
+        let mut parser = OpenMetricsParser::new(b"a_total 1 # {id=\"x\"} 2\n# EOF\n");
+        let mut buf = LabelsBuffer::new();
+        assert_eq!(parser.next_entry(), Ok(Some(Entry::Series)));
+        assert_eq!(parser.exemplar(&mut buf), Some((2.0, None)));
+        assert_eq!(parser.exemplar(&mut buf), None);
     }
 
     #[test]
