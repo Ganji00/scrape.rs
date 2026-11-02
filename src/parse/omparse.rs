@@ -204,8 +204,8 @@ impl<'a> OpenMetricsParser<'a> {
                     offset: self.lexer.token_start,
                 });
             }
-            // The token can end in NUL bytes after the closing quote, which Go keeps in the
-            // value while it drops the quote.
+            // The token can end in NUL bytes after the closing quote. Go drops only the last
+            // byte, so it keeps the quote and all but the last NUL in the value.
             let close = value.iter().rposition(|&byte| byte == b'"').unwrap_or(0);
             let label = (&self.lexer.input[start..end], &value[1..close.max(1)]);
             if exemplar {
