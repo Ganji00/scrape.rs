@@ -52,6 +52,8 @@ pub struct OpenMetricsParser<'a> {
     labels: Vec<(&'a [u8], &'a [u8])>,
     exemplar: Option<(f64, Option<i64>)>,
     exemplar_labels: Vec<(&'a [u8], &'a [u8])>,
+    /// Labels buffer lent to the start timestamp lookahead, so it does not allocate per call.
+    peek_labels: Vec<(&'a [u8], &'a [u8])>,
     /// Go's start timestamp cache: the series key and start timestamp of the last hit.
     start_timestamp_key: Vec<u8>,
     start_timestamp: Option<i64>,
@@ -75,6 +77,7 @@ impl<'a> OpenMetricsParser<'a> {
             labels: Vec::new(),
             exemplar: None,
             exemplar_labels: Vec::new(),
+            peek_labels: Vec::new(),
             start_timestamp_key: Vec::new(),
             start_timestamp: None,
         }
@@ -201,7 +204,10 @@ impl<'a> OpenMetricsParser<'a> {
                     offset: self.lexer.token_start,
                 });
             }
-            let label = (&self.lexer.input[start..end], &value[1..value.len() - 1]);
+            // The token can end in NUL bytes after the closing quote, which Go keeps in the
+            // value while it drops the quote.
+            let close = value.iter().rposition(|&byte| byte == b'"').unwrap_or(0);
+            let label = (&self.lexer.input[start..end], &value[1..close.max(1)]);
             if exemplar {
                 self.exemplar_labels.push(label);
             } else {
@@ -245,9 +251,14 @@ impl<'a> OpenMetricsParser<'a> {
     fn parse_exemplar(&mut self) -> Result<(), ParseError> {
         if self.ignore_exemplar {
             loop {
+                let before = self.lexer.pos;
                 match self.lexer.lex() {
                     Token::Linebreak => return Ok(()),
                     Token::Eof => return Err(ParseError::MissingEof),
+                    // Go loops forever here, so a scrape target could stall the scraper.
+                    Token::Invalid if self.lexer.pos == before => {
+                        return Err(self.unexpected("expected linebreak after exemplar"));
+                    }
                     _ => {}
                 }
             }
@@ -430,27 +441,27 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
         peek.lexer = self.lexer.clone();
         peek.ignore_exemplar = true;
         peek.metric_type = self.metric_type;
-        peek.family_name_len = self.family_name_len;
-        loop {
+        peek.labels = std::mem::take(&mut self.peek_labels);
+        let found = loop {
             if !matches!(peek.next_entry(), Ok(Some(Entry::Series))) {
-                self.start_timestamp = None;
-                return None;
+                break None;
             }
             let Some(peeked_family) = peek.metric_name().strip_suffix(CREATED_SUFFIX) else {
                 continue;
             };
-            if !peek.series_key(peeked_family).eq(self.series_key(family)) {
-                self.start_timestamp = None;
-                return None;
-            }
-            let start_timestamp = (peek.value * 1000.0) as i64;
+            let same_series = peek.series_key(peeked_family).eq(self.series_key(family));
+            // Go converts NaN and Inf into a timestamp that looks valid.
+            break (same_series && peek.value.is_finite()).then_some((peek.value * 1000.0) as i64);
+        };
+        self.peek_labels = std::mem::take(&mut peek.labels);
+        if found.is_some() {
             let mut key = std::mem::take(&mut self.start_timestamp_key);
             key.clear();
             key.extend(self.series_key(family));
             self.start_timestamp_key = key;
-            self.start_timestamp = Some(start_timestamp);
-            return Some(start_timestamp);
         }
+        self.start_timestamp = found;
+        found
     }
 }
 
@@ -477,6 +488,7 @@ fn normalize_float_label<'v>(
     name: &str,
     value: Cow<'v, str>,
 ) -> Cow<'v, str> {
+    // NOTE: Go's ParseFloat also accepts hex floats here (le="0x1p3"); we leave them as is.
     let Some(parsed) = is_float_label(metric_type, name.as_bytes())
         .then(|| parse_go_float(&value))
         .flatten()
@@ -614,5 +626,43 @@ mod tests {
             Err(ParseError::InvalidUnit { .. })
         ));
         assert_eq!(parse_all(b"# UNIT a_seconds seconds\n# EOF\n"), Ok(()));
+    }
+
+    fn first_start_timestamp(input: &'static [u8]) -> Option<i64> {
+        let mut parser = OpenMetricsParser::new(input).skip_created_series();
+        while parser.next_entry().unwrap() != Some(Entry::Series) {}
+        parser.start_timestamp()
+    }
+
+    #[test]
+    fn start_timestamp_stops_on_invalid_exemplar() {
+        // Go's lookahead loops forever on this input.
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let input = b"# TYPE a counter\na_total 1\na_total{x=\"1\"} 2 # {id=\"x\"}x\n# EOF\n";
+            done.send(first_start_timestamp(input)).unwrap();
+        });
+        let start = result.recv_timeout(std::time::Duration::from_secs(5));
+        assert_eq!(start, Ok(None));
+    }
+
+    #[test]
+    fn start_timestamp_ignores_non_finite_created() {
+        for input in [
+            &b"# TYPE a counter\na_total 1\na_created NaN\n# EOF\n"[..],
+            b"# TYPE a counter\na_total 1\na_created +Inf\n# EOF\n",
+        ] {
+            let input: &'static [u8] = input;
+            assert_eq!(first_start_timestamp(input), None);
+        }
+    }
+
+    #[test]
+    fn label_value_drops_nul_after_closing_quote() {
+        let mut parser = OpenMetricsParser::new(b"a{b=\"c\"\0} 1\n# EOF\n");
+        let mut buf = LabelsBuffer::new();
+        assert_eq!(parser.next_entry(), Ok(Some(Entry::Series)));
+        parser.labels(&mut buf);
+        assert_eq!(buf.get("b"), Some("c"));
     }
 }

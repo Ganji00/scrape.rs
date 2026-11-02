@@ -133,7 +133,7 @@ func renderOMParse(data []byte, startTimestamps bool) string {
 			}
 			// StartTimestamp peeks ahead and overwrites the series, offsets and
 			// value, so it runs last. Without WithOMParserSTSeriesSkipped it
-			// also turns off _created skipping, so it only runs in st mode.
+			// also turns on _created skipping, so it only runs in st mode.
 			if startTimestamps {
 				fmt.Fprintf(&out, "st %d\n", parser.StartTimestamp())
 			}
