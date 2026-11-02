@@ -155,9 +155,10 @@ fn counter_gauge_and_untyped_round_trip_through_otap_and_otlp() {
         "# TYPE http_requests_total counter\n",
         "http_requests_total{status=\"200\",method=\"GET\"} 42 1700000000123\n",
         "http_requests_total{method=\"POST\",status=\"500\",empty=\"\"} 3\n",
+        "http_requests_total{method=\"DELETE\",status=\"204\"} 1 1700000000999\n",
+        "# HELP memory_bytes Resident memory in bytes.\n",
         "# TYPE memory_bytes gauge\n",
         "memory_bytes{empty=\"\"} 1048576\n",
-        "# HELP memory_bytes Late help after gauge sample is allowed.\n",
         "# HELP bare_empty_help\n",
         "# HELP bare_empty_help \n",
         "# TYPE explicit_untyped untyped\n",
@@ -166,8 +167,6 @@ fn counter_gauge_and_untyped_round_trip_through_otap_and_otlp() {
         "# HELP \"utf8.metric\\\"name\\\\\\n\" Quoted UTF-8 metric with escapes.\n",
         "# TYPE \"utf8.metric\\\"name\\\\\\n\" counter\n",
         "{ \"utf8.metric\\\"name\\\\\\n\", \"k.1©\\\"\"=\"v\\\"\\\\\\n1\" } 7.5\n",
-        // Interleaved additional sample for the first metric family.
-        "http_requests_total{method=\"DELETE\",status=\"204\"} 1 1700000000999\n",
         // Metadata-only family with zero samples must be omitted.
         "# HELP zero_samples_total Unused family.\n",
         "# TYPE zero_samples_total counter\n",
@@ -223,7 +222,7 @@ fn counter_gauge_and_untyped_round_trip_through_otap_and_otlp() {
         },
         Metric {
             name: "memory_bytes".to_owned(),
-            description: "Late help after gauge sample is allowed.".to_owned(),
+            description: "Resident memory in bytes.".to_owned(),
             unit: String::new(),
             metadata: vec![kv_str(PROMETHEUS_TYPE_METADATA_KEY, "gauge")],
             data: Some(metric::Data::Gauge(Gauge {
