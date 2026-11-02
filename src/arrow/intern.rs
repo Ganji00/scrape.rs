@@ -16,12 +16,22 @@
 use arrow_array::StringArray;
 use arrow_buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 
+/// Sentinel `Bucket::id` marking an unoccupied open-addressed hash table slot.
 const EMPTY_SLOT: u32 = u32::MAX;
+
+/// Multiplicative constant from `rustc-hash` (`FxHasher`), derived from the golden ratio over
+/// 64 bits.
 const FX_SEED: u64 = 0x517c_c1b7_2722_0a95;
 
+/// Open-addressed hash table slot mapping a string's 64-bit hash to its interned `u32` ID.
+///
+/// Storing `hash` inline beside `id` lets linear probing skip non-matching slots in contiguous
+/// `Bucket` memory without touching the `offsets` or `bytes` buffers until a hash match occurs.
 #[derive(Clone, Copy)]
 struct Bucket {
+    /// Cached `fx_hash` of the interned byte slice, or `0` when `id == EMPTY_SLOT`.
     hash: u64,
+    /// Index into `StringInterner::offsets` (`0..len()`), or `EMPTY_SLOT` when vacant.
     id: u32,
 }
 
