@@ -15,6 +15,15 @@
 //!
 //! Caching every `Arc<Schema>` combination in `LazyLock` avoids allocating `Field` metadata
 //! `HashMap`s and `Schema` vectors on every scrape.
+//!
+//! Concrete `arrow_schema::Schema` instances are constructed here rather than imported from
+//! `otel-arrow-dfe-pdata` because `otel-arrow-dfe-pdata` stays a dev-only test dependency (see
+//! [`super::MetricPayloadType`]) and its `schema::payloads::get` API returns an abstract schema
+//! validator (`otel_arrow_dfe_pdata::schema::Schema` with optional fields and minimum dictionary
+//! key bounds) rather than a fixed `arrow_schema::Schema`. Each OTAP `RecordBatch` selects its
+//! concrete `arrow_schema::Schema` per scrape according to present optional columns, nullability,
+//! and dictionary key width (`UInt8`, `UInt16`, or `Utf8`). The `tests/otap-compat` suite validates
+//! every emitted batch directly against `otel_arrow_dfe_pdata::schema::payloads::get`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};

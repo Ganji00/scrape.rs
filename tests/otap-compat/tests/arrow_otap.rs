@@ -28,17 +28,45 @@ use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{AnyValue, KeyValue,
 use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{
     AggregationTemporality, Gauge, Metric, NumberDataPoint, Sum, metric, number_data_point,
 };
+use otel_arrow_dfe_pdata::schema::{
+    consts, is_id_plain_encoded, is_parent_id_plain_encoded, payloads,
+};
 use otel_arrow_dfe_pdata::testing::equiv::assert_equivalent;
 use otel_arrow_dfe_pdata::testing::round_trip::{otap_to_otlp, to_metrics_data};
 
+fn assert_matches_otap_schema(records: &OtapMetricRecords) {
+    for (payload_type, batch) in records.iter() {
+        let wire_type = ArrowPayloadType::try_from(payload_type.as_i32())
+            .expect("MetricPayloadType matches ArrowPayloadType wire discriminant");
+        payloads::get(wire_type)
+            .check_match(batch)
+            .unwrap_or_else(|err| panic!("upstream OTAP schema rejected {payload_type:?}: {err}"));
+
+        let schema = batch.schema();
+        if schema.index_of(consts::ID).is_ok() {
+            assert!(
+                is_id_plain_encoded(batch),
+                "{payload_type:?} id column must carry plain encoding metadata"
+            );
+        }
+        if schema.index_of(consts::PARENT_ID).is_ok() {
+            assert!(
+                is_parent_id_plain_encoded(batch),
+                "{payload_type:?} parent_id column must carry plain encoding metadata"
+            );
+        }
+    }
+}
+
 fn to_otap_arrow_records(records: &OtapMetricRecords) -> OtapArrowRecords {
+    assert_matches_otap_schema(records);
     let mut store = Metrics::new();
     for (payload_type, batch) in records.iter() {
         let wire_type = ArrowPayloadType::try_from(payload_type.as_i32())
             .expect("MetricPayloadType matches ArrowPayloadType wire discriminant");
         store
             .set(wire_type, batch.clone())
-            .unwrap_or_else(|err| panic!("OTAP schema rejected {payload_type:?}: {err}"));
+            .unwrap_or_else(|err| panic!("OTAP batch store rejected {payload_type:?}: {err}"));
     }
     OtapArrowRecords::Metrics(store)
 }
@@ -87,6 +115,37 @@ fn metric_payload_type_discriminants_match_otap_proto() {
         assert_eq!(local.as_i32(), upstream as i32);
         assert_eq!(ArrowPayloadType::try_from(local.as_i32()), Ok(upstream));
     }
+}
+
+#[test]
+fn adaptive_schema_variants_match_upstream_otap_schema_definitions() {
+    let mut decoder = ArrowDecoder::new();
+
+    // Minimal schema: no description, no counter columns, no dp id, no timestamps, no flags.
+    let minimal = decoder
+        .decode(b"bare_gauge 1\n", &Format::TEXT, &DecodeOptions::new())
+        .expect("minimal payload decodes");
+    assert_matches_otap_schema(&minimal);
+
+    // Mixed explicit and omitted timestamps (nullable `time_unix_nano` when fallback is `None`).
+    let mixed_ts = decoder
+        .decode(
+            b"m_ts{a=\"1\"} 1 1700000000000\nm_ts{a=\"2\"} 2\n",
+            &Format::TEXT,
+            &DecodeOptions::new(),
+        )
+        .expect("mixed timestamp payload decodes");
+    assert_matches_otap_schema(&mixed_ts);
+
+    // >256 distinct label keys upgrades `NumberDpAttrs.key` from `Dict(UInt8)` to `Dict(UInt16)`.
+    let mut wide_keys = String::from("# TYPE wide_total counter\n");
+    for i in 0..260 {
+        wide_keys.push_str(&format!("wide_total{{k_{i}=\"v\"}} {i}\n"));
+    }
+    let wide = decoder
+        .decode(wide_keys.as_bytes(), &Format::TEXT, &DecodeOptions::new())
+        .expect("wide key payload decodes");
+    assert_matches_otap_schema(&wide);
 }
 
 #[test]
