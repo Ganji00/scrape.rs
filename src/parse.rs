@@ -19,9 +19,12 @@ use std::borrow::Cow;
 mod float;
 #[cfg(test)]
 mod go_diff_tests;
+mod omlex;
+mod omparse;
 mod promlex;
 mod promparse;
 
+pub use omparse::OpenMetricsParser;
 pub use promparse::PromParser;
 
 /// Label name under which [`Parser::labels`] stores the metric name.
@@ -41,6 +44,8 @@ pub enum Entry {
     Type,
     /// A `# HELP` line. Read it with [`Parser::help`].
     Help,
+    /// A `# UNIT` line. Read it with [`Parser::unit`].
+    Unit,
     /// Any other comment line. Read it with [`Parser::comment`].
     Comment,
     /// A sample with a float64 value. Read it with [`Parser::series`] and [`Parser::labels`].
@@ -64,6 +69,12 @@ pub enum MetricType {
     Histogram,
     /// `summary`.
     Summary,
+    /// OpenMetrics `gaugehistogram`.
+    GaugeHistogram,
+    /// OpenMetrics `info`.
+    Info,
+    /// OpenMetrics `stateset`.
+    Stateset,
 }
 
 impl MetricType {
@@ -75,6 +86,9 @@ impl MetricType {
             Self::Gauge => "gauge",
             Self::Histogram => "histogram",
             Self::Summary => "summary",
+            Self::GaugeHistogram => "gaugehistogram",
+            Self::Info => "info",
+            Self::Stateset => "stateset",
         }
     }
 }
@@ -115,6 +129,26 @@ pub enum ParseError {
     InvalidMetricName {
         /// Byte offset of the start of the series in the input.
         offset: usize,
+    },
+
+    /// An OpenMetrics payload does not end with `# EOF`.
+    #[error("data does not end with # EOF")]
+    MissingEof,
+
+    /// An OpenMetrics payload has data after `# EOF`.
+    #[error("unexpected data after # EOF at byte {offset}")]
+    DataAfterEof {
+        /// Byte offset of the first byte after `# EOF`.
+        offset: usize,
+    },
+
+    /// A `# UNIT` line names a unit that is not a suffix of the metric name.
+    #[error("unit {unit:?} is not a suffix of metric {metric:?}")]
+    InvalidUnit {
+        /// The metric name from the `# UNIT` line.
+        metric: String,
+        /// The unit from the `# UNIT` line.
+        unit: String,
     },
 }
 
@@ -196,6 +230,11 @@ pub trait Parser<'a> {
     /// Returns the text of the current [`Entry::Comment`], including the leading `#`.
     fn comment(&self) -> &'a [u8];
 
+    /// Returns the metric name and unit of the current [`Entry::Unit`].
+    fn unit(&self) -> (&'a [u8], &'a [u8]) {
+        (b"", b"")
+    }
+
     /// Returns the raw series bytes, optional sample timestamp in ms, and float64 value.
     fn series(&self) -> (&'a [u8], Option<i64>, f64);
 
@@ -203,4 +242,18 @@ pub trait Parser<'a> {
     /// the metric name is stored under [`METRIC_NAME_LABEL`], and `le` on histograms and
     /// `quantile` on summaries use OpenMetrics float formatting.
     fn labels(&self, buf: &mut LabelsBuffer<'a>);
+
+    /// Clears `buf`, fills it with the exemplar labels of the current sample sorted by name,
+    /// and returns the exemplar value and optional timestamp in ms. Returns `None` when the
+    /// sample has no exemplar.
+    fn exemplar(&self, buf: &mut LabelsBuffer<'a>) -> Option<(f64, Option<i64>)> {
+        buf.clear();
+        None
+    }
+
+    /// Returns the start timestamp in ms of the current sample, read from its `_created` line.
+    /// Takes `&mut self` because, like Go, it caches the last hit.
+    fn start_timestamp(&mut self) -> Option<i64> {
+        None
+    }
 }

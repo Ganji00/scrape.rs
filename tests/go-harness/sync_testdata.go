@@ -18,7 +18,9 @@
 // model/textparse testdata files, and extracts canonical parser test inputs from
 // model/textparse/*_test.go into the repository's top-level testdata/ directory.
 // It also writes the entries textparse.NewPromParser returns for each Prometheus
-// text fixture to testdata/promparse/.
+// text fixture to testdata/promparse/, and the entries
+// textparse.NewOpenMetricsParser returns for each OpenMetrics fixture to
+// testdata/omparse/ and testdata/omparse_st/.
 package main
 
 import (
@@ -67,8 +69,8 @@ func run() error {
 	}
 
 	outRoot := filepath.Clean(filepath.Join("..", "..", "testdata"))
-	if err := os.RemoveAll(outRoot); err != nil {
-		return fmt.Errorf("clean %s: %w", outRoot, err)
+	if err := cleanOutRoot(outRoot); err != nil {
+		return err
 	}
 
 	var synced []string
@@ -133,6 +135,12 @@ func run() error {
 	}
 	synced = append(synced, promParseFiles...)
 
+	omParseFiles, err := writeOMParseExpected(outRoot)
+	if err != nil {
+		return err
+	}
+	synced = append(synced, omParseFiles...)
+
 	sort.Strings(synced)
 	m := manifest{
 		Modules: map[string]string{
@@ -150,6 +158,27 @@ func run() error {
 		return fmt.Errorf("write manifest.json: %w", err)
 	}
 
+	return nil
+}
+
+// handWrittenDirs are testdata/ subdirectories that are not generated, so the
+// clean step keeps them.
+var handWrittenDirs = map[string]bool{"omerrors": true}
+
+// cleanOutRoot removes everything in outRoot except handWrittenDirs.
+func cleanOutRoot(outRoot string) error {
+	entries, err := os.ReadDir(outRoot)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("readdir %s: %w", outRoot, err)
+	}
+	for _, entry := range entries {
+		if handWrittenDirs[entry.Name()] {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(outRoot, entry.Name())); err != nil {
+			return fmt.Errorf("clean %s: %w", outRoot, err)
+		}
+	}
 	return nil
 }
 

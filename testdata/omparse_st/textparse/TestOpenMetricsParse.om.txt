@@ -1,0 +1,147 @@
+help "go_gc_duration_seconds" "A summary of the GC invocation durations."
+type "go_gc_duration_seconds" summary
+unit "go_gc_duration_seconds" "seconds"
+series "go_gc_duration_seconds{quantile=\"0\"}" 3f09dfc772bd2e41 - "__name__"="go_gc_duration_seconds" "quantile"="0.0"
+st 0
+series "go_gc_duration_seconds{quantile=\"0.25\"}" 3f13763aab07e73c - "__name__"="go_gc_duration_seconds" "quantile"="0.25"
+st 0
+series "go_gc_duration_seconds{quantile=\"0.5\",a=\"b\"}" 3f15fa12554226c1 - "__name__"="go_gc_duration_seconds" "a"="b" "quantile"="0.5"
+st 0
+help "nohelp1" ""
+help "help2" "escape \\ \x0a \\ \" \\x chars"
+unit "nounit" ""
+series "go_gc_duration_seconds{quantile=\"1.0\",a=\"b\"}" 3f15fa12554226c1 - "__name__"="go_gc_duration_seconds" "a"="b" "quantile"="1.0"
+st 0
+series "go_gc_duration_seconds_count" 4058c00000000000 - "__name__"="go_gc_duration_seconds_count"
+st 0
+series "some:aggregate:rate5m{a_b=\"c\"}" 3ff0000000000000 - "__name__"="some:aggregate:rate5m" "a_b"="c"
+st 0
+help "go_goroutines" "Number of goroutines that currently exist."
+type "go_goroutines" gauge
+series "go_goroutines" 4040800000000000 123123 "__name__"="go_goroutines"
+st 0
+type "hh" histogram
+series "hh_bucket{le=\"+Inf\"}" 3ff0000000000000 - "__name__"="hh_bucket" "le"="+Inf"
+st 0
+type "gh" gaugehistogram
+series "gh_bucket{le=\"+Inf\"}" 3ff0000000000000 - "__name__"="gh_bucket" "le"="+Inf"
+st 0
+type "hhh" histogram
+series "hhh_bucket{le=\"+Inf\"}" 3ff0000000000000 - "__name__"="hhh_bucket" "le"="+Inf"
+exemplar 4010000000000000 - "id"="histogram-bucket-test"
+st 0
+series "hhh_count" 3ff0000000000000 - "__name__"="hhh_count"
+exemplar 4010000000000000 - "id"="histogram-count-test"
+st 0
+type "ggh" gaugehistogram
+series "ggh_bucket{le=\"+Inf\"}" 3ff0000000000000 - "__name__"="ggh_bucket" "le"="+Inf"
+exemplar 4010000000000000 123123 "id"="gaugehistogram-bucket-test" "xx"="yy"
+st 0
+series "ggh_count" 3ff0000000000000 - "__name__"="ggh_count"
+exemplar 4010000000000000 123123 "id"="gaugehistogram-count-test" "xx"="yy"
+st 0
+type "smr_seconds" summary
+series "smr_seconds_count" 4000000000000000 - "__name__"="smr_seconds_count"
+exemplar 3ff0000000000000 123321 "id"="summary-count-test"
+st 0
+series "smr_seconds_sum" 4045000000000000 - "__name__"="smr_seconds_sum"
+exemplar 3ff0000000000000 123321 "id"="summary-sum-test"
+st 0
+type "ii" info
+series "ii{foo=\"bar\"}" 3ff0000000000000 - "__name__"="ii" "foo"="bar"
+st 0
+type "ss" stateset
+series "ss{ss=\"foo\"}" 3ff0000000000000 - "__name__"="ss" "ss"="foo"
+st 0
+series "ss{ss=\"bar\"}" 0000000000000000 - "__name__"="ss" "ss"="bar"
+st 0
+series "ss{A=\"a\"}" 0000000000000000 - "A"="a" "__name__"="ss"
+st 0
+type "un" unknown
+series "_metric_starting_with_underscore" 3ff0000000000000 - "__name__"="_metric_starting_with_underscore"
+st 0
+series "testmetric{_label_starting_with_underscore=\"foo\"}" 3ff0000000000000 - "__name__"="testmetric" "_label_starting_with_underscore"="foo"
+st 0
+series "testmetric{label=\"\\\"bar\\\"\"}" 3ff0000000000000 - "__name__"="testmetric" "label"="\"bar\""
+st 0
+help "foo" "Counter with and without labels to certify ST is parsed for both cases"
+type "foo" counter
+series "foo_total" 4031000000000000 1520879607789 "__name__"="foo_total"
+exemplar 4014000000000000 - "id"="counter-test"
+st 1520872607123
+series "foo_total{a=\"b\"}" 4031000000000000 1520879607789 "__name__"="foo_total" "a"="b"
+exemplar 4014000000000000 - "id"="counter-test"
+st 1520872607123
+series "foo_total{le=\"c\"}" 4035000000000000 - "__name__"="foo_total" "le"="c"
+st 1520872621123
+series "foo_total{le=\"1\"}" 4024000000000000 - "__name__"="foo_total" "le"="1"
+st 0
+help "bar" "Summary with ST at the end, making sure we find ST even if it's multiple lines a far"
+type "bar" summary
+series "bar_count" 4031000000000000 - "__name__"="bar_count"
+st 1520872608124
+series "bar_sum" 4113d2d533333333 - "__name__"="bar_sum"
+st 1520872608124
+series "bar{quantile=\"0.95\"}" 405eeccccccccccd - "__name__"="bar" "quantile"="0.95"
+st 1520872608124
+series "bar{quantile=\"0.99\"}" 4062c00000000000 - "__name__"="bar" "quantile"="0.99"
+st 1520872608124
+help "baz" "Histogram with the same objective as above's summary"
+type "baz" histogram
+series "baz_bucket{le=\"0.0\"}" 0000000000000000 - "__name__"="baz_bucket" "le"="0.0"
+st 1520872609125
+series "baz_bucket{le=\"+Inf\"}" 4031000000000000 - "__name__"="baz_bucket" "le"="+Inf"
+st 1520872609125
+series "baz_count" 4031000000000000 - "__name__"="baz_count"
+st 1520872609125
+series "baz_sum" 4113d2d533333333 - "__name__"="baz_sum"
+st 1520872609125
+help "fizz_created" "Gauge which shouldn't be parsed as ST"
+type "fizz_created" gauge
+series "fizz_created" 4031000000000000 - "__name__"="fizz_created"
+st 0
+help "something" "Histogram with _created between buckets and summary"
+type "something" histogram
+series "something_count" 4032000000000000 - "__name__"="something_count"
+st 1520430001000
+series "something_sum" 4113d2d59999999a - "__name__"="something_sum"
+st 1520430001000
+series "something_bucket{le=\"0.0\"}" 3ff0000000000000 - "__name__"="something_bucket" "le"="0.0"
+st 1520430001000
+series "something_bucket{le=\"1\"}" 4000000000000000 - "__name__"="something_bucket" "le"="1.0"
+st 1520430001000
+series "something_bucket{le=\"+Inf\"}" 4032000000000000 - "__name__"="something_bucket" "le"="+Inf"
+st 1520430001000
+help "yum" "Summary with _created between sum and quantiles"
+type "yum" summary
+series "yum_count" 4034000000000000 - "__name__"="yum_count"
+st 1520430003000
+series "yum_sum" 4113d2d600000000 - "__name__"="yum_sum"
+st 1520430003000
+series "yum{quantile=\"0.95\"}" 405eeccccccccccd - "__name__"="yum" "quantile"="0.95"
+st 1520430003000
+series "yum{quantile=\"0.99\"}" 4062c00000000000 - "__name__"="yum" "quantile"="0.99"
+st 1520430003000
+help "foobar" "Summary with _created as the first line"
+type "foobar" summary
+series "foobar_count" 4035000000000000 - "__name__"="foobar_count"
+st 1520430004000
+series "foobar_sum" 4113d2d666666666 - "__name__"="foobar_sum"
+st 1520430004000
+series "foobar{quantile=\"0.95\"}" 405ef33333333333 - "__name__"="foobar" "quantile"="0.95"
+st 1520430004000
+series "foobar{quantile=\"0.99\"}" 4062c33333333333 - "__name__"="foobar" "quantile"="0.99"
+st 1520430004000
+help "nansum" "Summary with NaN value"
+type "nansum" summary
+series "nansum_count" 0000000000000000 - "__name__"="nansum_count"
+st 0
+series "nansum_sum" 0000000000000000 - "__name__"="nansum_sum"
+st 0
+series "nansum{quantile=\"0.95\"}" 7ff8000000000001 - "__name__"="nansum" "quantile"="0.95"
+st 0
+series "nansum{quantile=\"0.99\"}" 7ff8000000000001 - "__name__"="nansum" "quantile"="0.99"
+st 0
+help "metric" "foo\x00bar"
+series "null_byte_metric{a=\"abc\x00\"}" 3ff0000000000000 - "__name__"="null_byte_metric" "a"="abc\x00"
+st 0
