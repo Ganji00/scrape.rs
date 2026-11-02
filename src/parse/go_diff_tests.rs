@@ -109,7 +109,7 @@ fn render<'a>(mut parser: impl Parser<'a>, start_timestamps: bool) -> Vec<u8> {
     }
 }
 
-/// Expected files sit under `testdata/promparse/` at the same relative path as their input.
+/// Expected files sit under `testdata/<dir>/` at the same relative path as their input.
 fn expected_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();

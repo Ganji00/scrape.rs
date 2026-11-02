@@ -138,7 +138,7 @@ pub enum ParseError {
     /// An OpenMetrics payload has data after `# EOF`.
     #[error("unexpected data after # EOF at byte {offset}")]
     DataAfterEof {
-        /// Byte offset of the first byte after `# EOF`.
+        /// Byte offset of the first byte after the `# EOF` line.
         offset: usize,
     },
 
