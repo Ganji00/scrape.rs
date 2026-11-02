@@ -15,13 +15,15 @@
 //!
 //! [`ArrowDecoder`] ingests entries from Layer 0 parsers one by one into reusable columnar buffers
 //! and arena-backed string interners without per-sample heap allocations, locks, or shared
-//! thread-synchronized state, then finalizes one [`OtapMetricRecords`] batch set per scrape.
-//! Single-threaded `!Send` scrape loops can reuse one decoder across scrapes with bounded memory.
+//! thread-synchronized state. Callers can materialize a full scrape with [`ArrowDecoder::decode`]
+//! or pull bounded chunks with [`ArrowDecoder::decode_stream`] so single-threaded `!Send` scrape
+//! loops keep scratch memory bounded and stay within OTAP's `u16` per-batch metric ID limit.
 
 mod intern;
 mod records;
 mod schema;
 
+use std::iter::FusedIterator;
 use std::sync::Arc;
 
 use arrow_array::types::{UInt8Type, UInt16Type};
@@ -48,25 +50,57 @@ use self::schema::{
     univariate_metrics_schema,
 };
 
-/// Options controlling [`ArrowDecoder::decode`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Default upper bound on data points emitted per [`OtapMetricRecords`] chunk in
+/// [`ArrowDecoder::decode_stream`].
+pub const DEFAULT_MAX_DATA_POINTS_PER_BATCH: usize = 16_384;
+
+/// Maximum distinct `UnivariateMetrics` rows representable in a single OTAP batch (`u16` IDs).
+const MAX_METRICS_PER_BATCH: usize = (u16::MAX as usize) + 1;
+
+/// Options controlling [`ArrowDecoder::decode`] and [`ArrowDecoder::decode_stream`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodeOptions {
     /// Default timestamp in milliseconds since the Unix epoch applied to samples that omit an
     /// explicit wire timestamp. When `None`, untimestamped samples leave `time_unix_nano` unset.
     pub timestamp_ms: Option<i64>,
+    /// Maximum number of data points materialized per [`OtapMetricRecords`] chunk yielded by
+    /// [`ArrowDecoder::decode_stream`]. Values of `0` are clamped to `1`. Single-batch
+    /// [`ArrowDecoder::decode`] ignores this limit.
+    pub max_data_points_per_batch: usize,
+}
+
+impl Default for DecodeOptions {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DecodeOptions {
-    /// Creates default [`DecodeOptions`] with no fallback timestamp.
+    /// Creates default [`DecodeOptions`] with no fallback timestamp and
+    /// [`DEFAULT_MAX_DATA_POINTS_PER_BATCH`] data points per streamed batch.
     #[must_use]
     pub const fn new() -> Self {
-        Self { timestamp_ms: None }
+        Self {
+            timestamp_ms: None,
+            max_data_points_per_batch: DEFAULT_MAX_DATA_POINTS_PER_BATCH,
+        }
     }
 
     /// Sets the fallback timestamp in milliseconds for samples without an explicit wire timestamp.
     #[must_use]
     pub const fn with_timestamp_ms(mut self, timestamp_ms: i64) -> Self {
         self.timestamp_ms = Some(timestamp_ms);
+        self
+    }
+
+    /// Sets the maximum number of data points materialized per batch in
+    /// [`ArrowDecoder::decode_stream`].
+    #[must_use]
+    pub const fn with_max_data_points_per_batch(
+        mut self,
+        max_data_points_per_batch: usize,
+    ) -> Self {
+        self.max_data_points_per_batch = max_data_points_per_batch;
         self
     }
 }
@@ -460,6 +494,68 @@ impl ArrowDecoder {
         self.finish_batches(default_ts_ns.is_some())
     }
 
+    /// Streams `input` as a sequence of non-empty [`OtapMetricRecords`] chunks bounded by
+    /// [`DecodeOptions::max_data_points_per_batch`] and OTAP's 65,536-metric per-batch `u16` ID
+    /// limit.
+    ///
+    /// Empty or metadata-only scrapes yield zero items. When a contiguous metric family spans a
+    /// chunk boundary, [`ArrowDecoder`] retains its `# HELP` and `# TYPE` metadata across the
+    /// flush and re-emits the family row in the next chunk only if further samples follow.
+    /// Dropping [`DecodeStream`] early returns the internal parser scratch buffer to `self`.
+    pub fn decode_stream<'dec, 'input>(
+        &'dec mut self,
+        input: &'input [u8],
+        format: &Format,
+        opts: &DecodeOptions,
+    ) -> DecodeStream<'dec, 'input> {
+        self.reset_scrape();
+        let spans = std::mem::take(&mut self.parser_spans);
+        let max_data_points = opts
+            .max_data_points_per_batch
+            .clamp(1, (u32::MAX as usize).saturating_add(1));
+
+        if format.format_type() != FormatType::TextPlain {
+            // TODO(bwplotka): Dispatch FormatType::OpenMetrics once #6 lands and Proto* in Phase 3.
+            return DecodeStream {
+                decoder: self,
+                parser: PromParser::with_scratch(b"", spans),
+                default_ts_ns: None,
+                max_data_points,
+                pending_series: false,
+                init_err: Some(DecodeError::UnsupportedFormat(format.as_str().to_owned())),
+                done: false,
+            };
+        }
+
+        let default_ts_ns = match opts.timestamp_ms {
+            Some(ms) => match ms_to_ns(ms) {
+                Ok(ns) => Some(ns),
+                Err(err) => {
+                    return DecodeStream {
+                        decoder: self,
+                        parser: PromParser::with_scratch(b"", spans),
+                        default_ts_ns: None,
+                        max_data_points,
+                        pending_series: false,
+                        init_err: Some(err),
+                        done: false,
+                    };
+                }
+            },
+            None => None,
+        };
+
+        DecodeStream {
+            decoder: self,
+            parser: PromParser::with_scratch(input, spans),
+            default_ts_ns,
+            max_data_points,
+            pending_series: false,
+            init_err: None,
+            done: false,
+        }
+    }
+
     fn reset_scrape(&mut self) {
         self.current_family.clear();
         self.reset_batch();
@@ -592,62 +688,8 @@ impl ArrowDecoder {
                 // `PromParser` never emits `Entry::Unit` (`# UNIT` is parsed as `Entry::Comment`
                 // in Prometheus text 0.0.4).
                 Entry::Comment | Entry::Unit => {}
-                Entry::Help => {
-                    let (raw_name, raw_help) = parser.raw_help();
-                    let name_offset = parser.name_offset();
-                    self.current_family.transition_if_needed(
-                        raw_name,
-                        name_offset,
-                        &mut self.unescape_buf,
-                    )?;
-                    // Match `prometheus/common/expfmt/text_parse.go`: a bare `# HELP name` line
-                    // without docstring text is a no-op and does not count as setting HELP.
-                    if raw_help.is_empty() {
-                        continue;
-                    }
-                    if self.current_family.has_help || self.current_family.has_samples {
-                        return Err(DecodeError::DuplicateOrLateHelp {
-                            metric: self.current_family.name_string(),
-                        });
-                    }
-                    // `PromParser` already verified `raw_help` is valid UTF-8 on `Entry::Help`.
-                    let unescaped = unescape_bytes_into(raw_help, false, &mut self.unescape_buf);
-                    self.current_family.help.clear();
-                    self.current_family.help.extend_from_slice(unescaped);
-                    self.current_family.has_help = true;
-                }
-                Entry::Type => {
-                    let (raw_name, metric_type) = parser.metric_type();
-                    let name_offset = parser.name_offset();
-                    self.current_family.transition_if_needed(
-                        raw_name,
-                        name_offset,
-                        &mut self.unescape_buf,
-                    )?;
-                    if self.current_family.has_type || self.current_family.has_samples {
-                        return Err(DecodeError::DuplicateOrLateType {
-                            metric: self.current_family.name_string(),
-                        });
-                    }
-                    match metric_type {
-                        MetricType::Counter | MetricType::Gauge | MetricType::Unknown => {
-                            self.current_family.metric_type = metric_type;
-                            self.current_family.has_type = true;
-                        }
-                        // TODO(bwplotka): Assemble classic histograms, summaries, and OpenMetrics
-                        // types in #8 and #9.
-                        MetricType::Histogram
-                        | MetricType::Summary
-                        | MetricType::GaugeHistogram
-                        | MetricType::Info
-                        | MetricType::Stateset => {
-                            return Err(DecodeError::UnsupportedMetricType {
-                                metric: self.current_family.name_string(),
-                                metric_type: metric_type.as_str(),
-                            });
-                        }
-                    }
-                }
+                Entry::Help => self.ingest_help_entry(parser)?,
+                Entry::Type => self.ingest_type_entry(parser)?,
                 Entry::Series => {
                     let (raw_name, label_spans, full_input, sample_ts_ms, value) =
                         parser.raw_series_parts();
@@ -657,21 +699,91 @@ impl ArrowDecoder {
                         name_offset,
                         &mut self.unescape_buf,
                     )?;
-
-                    let dp_index = self.dp_parent_ids.len();
-                    let dp_id =
-                        u32::try_from(dp_index).map_err(|_| DecodeError::CapacityOverflow {
-                            table: "NumberDataPoints",
-                            count: dp_index + 1,
-                        })?;
-
-                    self.append_series_labels(dp_id, label_spans, full_input)?;
-                    let parent_id = self.emit_current_family_into_batch()?;
-                    self.append_data_point(parent_id, value, sample_ts_ms, default_ts_ns)?;
+                    self.append_current_series(
+                        label_spans,
+                        full_input,
+                        sample_ts_ms,
+                        value,
+                        default_ts_ns,
+                    )?;
                 }
             }
         }
         Ok(())
+    }
+
+    #[inline]
+    fn ingest_help_entry(&mut self, parser: &PromParser<'_>) -> Result<(), DecodeError> {
+        let (raw_name, raw_help) = parser.raw_help();
+        let name_offset = parser.name_offset();
+        self.current_family
+            .transition_if_needed(raw_name, name_offset, &mut self.unescape_buf)?;
+        // Match `prometheus/common/expfmt/text_parse.go`: a bare `# HELP name` line without
+        // docstring text is a no-op and does not count as setting HELP.
+        if raw_help.is_empty() {
+            return Ok(());
+        }
+        if self.current_family.has_help || self.current_family.has_samples {
+            return Err(DecodeError::DuplicateOrLateHelp {
+                metric: self.current_family.name_string(),
+            });
+        }
+        // `PromParser` already verified `raw_help` is valid UTF-8 on `Entry::Help`.
+        let unescaped = unescape_bytes_into(raw_help, false, &mut self.unescape_buf);
+        self.current_family.help.clear();
+        self.current_family.help.extend_from_slice(unescaped);
+        self.current_family.has_help = true;
+        Ok(())
+    }
+
+    #[inline]
+    fn ingest_type_entry(&mut self, parser: &PromParser<'_>) -> Result<(), DecodeError> {
+        let (raw_name, metric_type) = parser.metric_type();
+        let name_offset = parser.name_offset();
+        self.current_family
+            .transition_if_needed(raw_name, name_offset, &mut self.unescape_buf)?;
+        if self.current_family.has_type || self.current_family.has_samples {
+            return Err(DecodeError::DuplicateOrLateType {
+                metric: self.current_family.name_string(),
+            });
+        }
+        match metric_type {
+            MetricType::Counter | MetricType::Gauge | MetricType::Unknown => {
+                self.current_family.metric_type = metric_type;
+                self.current_family.has_type = true;
+                Ok(())
+            }
+            // TODO(bwplotka): Assemble classic histograms, summaries, and OpenMetrics types in #8
+            // and #9.
+            MetricType::Histogram
+            | MetricType::Summary
+            | MetricType::GaugeHistogram
+            | MetricType::Info
+            | MetricType::Stateset => Err(DecodeError::UnsupportedMetricType {
+                metric: self.current_family.name_string(),
+                metric_type: metric_type.as_str(),
+            }),
+        }
+    }
+
+    #[inline]
+    fn append_current_series(
+        &mut self,
+        label_spans: &[LabelSpan],
+        full_input: &[u8],
+        sample_ts_ms: Option<i64>,
+        value: f64,
+        default_ts_ns: Option<i64>,
+    ) -> Result<(), DecodeError> {
+        let dp_index = self.dp_parent_ids.len();
+        let dp_id = u32::try_from(dp_index).map_err(|_| DecodeError::CapacityOverflow {
+            table: "NumberDataPoints",
+            count: dp_index + 1,
+        })?;
+
+        self.append_series_labels(dp_id, label_spans, full_input)?;
+        let parent_id = self.emit_current_family_into_batch()?;
+        self.append_data_point(parent_id, value, sample_ts_ms, default_ts_ns)
     }
 
     #[inline]
@@ -1079,6 +1191,120 @@ impl ArrowDecoder {
     }
 }
 
+/// Lending-style streaming iterator yielding bounded, non-empty [`OtapMetricRecords`] chunks from
+/// a single exposition scrape.
+///
+/// Created by [`ArrowDecoder::decode_stream`]. Each `next()` call advances the underlying parser
+/// until [`DecodeOptions::max_data_points_per_batch`], OTAP's 65,536-metric `u16` batch limit, or
+/// end-of-input is reached, then finalizes a batch and clears per-batch staging buffers so peak
+/// decoder scratch memory stays proportional to one chunk.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct DecodeStream<'dec, 'input> {
+    decoder: &'dec mut ArrowDecoder,
+    parser: PromParser<'input>,
+    default_ts_ns: Option<i64>,
+    max_data_points: usize,
+    pending_series: bool,
+    init_err: Option<DecodeError>,
+    done: bool,
+}
+
+impl DecodeStream<'_, '_> {
+    fn step(&mut self) -> Result<Option<OtapMetricRecords>, DecodeError> {
+        loop {
+            let entry = if self.pending_series {
+                self.pending_series = false;
+                Entry::Series
+            } else {
+                match self.parser.next_entry().map_err(DecodeError::from_parse)? {
+                    Some(entry) => entry,
+                    None => {
+                        self.done = true;
+                        if self.decoder.um_metric_types.is_empty() {
+                            return Ok(None);
+                        }
+                        let batch = self.decoder.finish_batches(self.default_ts_ns.is_some())?;
+                        self.decoder.reset_batch();
+                        return Ok(Some(batch));
+                    }
+                }
+            };
+
+            match entry {
+                // `PromParser` never emits `Entry::Unit` (`# UNIT` is parsed as `Entry::Comment`
+                // in Prometheus text 0.0.4).
+                Entry::Comment | Entry::Unit => {}
+                Entry::Help => self.decoder.ingest_help_entry(&self.parser)?,
+                Entry::Type => self.decoder.ingest_type_entry(&self.parser)?,
+                Entry::Series => {
+                    let (raw_name, label_spans, full_input, sample_ts_ms, value) =
+                        self.parser.raw_series_parts();
+                    let name_offset = self.parser.name_offset();
+                    self.decoder.current_family.transition_if_needed(
+                        raw_name,
+                        name_offset,
+                        &mut self.decoder.unescape_buf,
+                    )?;
+                    if self.decoder.current_family.batch_id.is_none()
+                        && self.decoder.um_metric_types.len() >= MAX_METRICS_PER_BATCH
+                    {
+                        self.pending_series = true;
+                        let batch = self.decoder.finish_batches(self.default_ts_ns.is_some())?;
+                        self.decoder.reset_batch();
+                        return Ok(Some(batch));
+                    }
+                    self.decoder.append_current_series(
+                        label_spans,
+                        full_input,
+                        sample_ts_ms,
+                        value,
+                        self.default_ts_ns,
+                    )?;
+                    if self.decoder.dp_parent_ids.len() >= self.max_data_points {
+                        let batch = self.decoder.finish_batches(self.default_ts_ns.is_some())?;
+                        self.decoder.reset_batch();
+                        return Ok(Some(batch));
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Iterator for DecodeStream<'_, '_> {
+    type Item = Result<OtapMetricRecords, DecodeError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        if let Some(err) = self.init_err.take() {
+            self.done = true;
+            return Some(Err(err));
+        }
+        match self.step() {
+            Ok(Some(batch)) => Some(Ok(batch)),
+            Ok(None) => {
+                self.done = true;
+                None
+            }
+            Err(err) => {
+                self.done = true;
+                self.decoder.reset_scrape();
+                Some(Err(err))
+            }
+        }
+    }
+}
+
+impl FusedIterator for DecodeStream<'_, '_> {}
+
+impl Drop for DecodeStream<'_, '_> {
+    fn drop(&mut self) {
+        self.decoder.parser_spans = self.parser.take_scratch();
+    }
+}
+
 #[inline]
 fn ms_to_ns(timestamp_ms: i64) -> Result<i64, DecodeError> {
     timestamp_ms
@@ -1409,5 +1635,117 @@ mod tests {
             .unwrap();
         assert_eq!(str_vals.len(), 1);
         assert_eq!(str_vals.value(0), "x");
+    }
+
+    #[test]
+    fn decode_stream_splits_mid_family_preserves_metadata_and_handles_edges() {
+        let mut dec = ArrowDecoder::new();
+
+        // Empty and metadata-only scrapes yield zero chunks.
+        for empty in [
+            b"" as &[u8],
+            b"# comment\n",
+            b"# HELP unused Help.\n# TYPE unused counter\n",
+        ] {
+            assert_eq!(
+                dec.decode_stream(empty, &Format::TEXT, &DecodeOptions::new())
+                    .count(),
+                0
+            );
+        }
+
+        // Split a 4-sample counter family into chunks of 2, followed by a 1-sample gauge family
+        // and a trailing metadata-only family. Also verify `max_data_points_per_batch = 0` clamps.
+        let zero_opts = DecodeOptions::new().with_max_data_points_per_batch(0);
+        let one_by_one: Vec<_> = dec
+            .decode_stream(b"a 1\na 2\n", &Format::TEXT, &zero_opts)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(one_by_one.len(), 2);
+        assert_eq!(one_by_one[0].num_data_points(), 1);
+        assert_eq!(one_by_one[1].num_data_points(), 1);
+
+        let payload = concat!(
+            "# HELP req_total Total HTTP requests.\n",
+            "# TYPE req_total counter\n",
+            "req_total{shard=\"0\"} 10\n",
+            "req_total{shard=\"1\"} 20\n",
+            "req_total{shard=\"2\"} 30\n",
+            "req_total{shard=\"3\"} 40\n",
+            "# TYPE mem_bytes gauge\n",
+            "mem_bytes 512\n",
+            "# HELP trailing_empty Unused.\n",
+            "# TYPE trailing_empty gauge\n",
+        );
+        let opts = DecodeOptions::new()
+            .with_timestamp_ms(1_700_000_000_000)
+            .with_max_data_points_per_batch(2);
+
+        let chunks: Vec<OtapMetricRecords> = dec
+            .decode_stream(payload.as_bytes(), &Format::TEXT, &opts)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(chunks.len(), 3);
+
+        // Chunks 0 and 1 both carry `req_total` with its original `# HELP` and counter semantics.
+        for chunk in &chunks[..2] {
+            assert_eq!(chunk.num_metrics(), 1);
+            assert_eq!(chunk.num_data_points(), 2);
+            let um = chunk.univariate_metrics().unwrap();
+            let names = um
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let descs = um
+                .column_by_name("description")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(names.value(0), "req_total");
+            assert_eq!(descs.value(0), "Total HTTP requests.");
+            assert!(um.column_by_name("is_monotonic").is_some());
+        }
+
+        // Chunk 2 contains only `mem_bytes`; `req_total` was not re-emitted with zero samples.
+        assert_eq!(chunks[2].num_metrics(), 1);
+        assert_eq!(chunks[2].num_data_points(), 1);
+        let um2 = chunks[2].univariate_metrics().unwrap();
+        let names2 = um2
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names2.value(0), "mem_bytes");
+        assert!(um2.column_by_name("description").is_none());
+        assert!(um2.column_by_name("is_monotonic").is_none());
+
+        // Late `# HELP` or `# TYPE` immediately after a chunk boundary is still rejected.
+        let late_help = b"m{a=\"1\"} 1\nm{a=\"2\"} 2\n# HELP m too late\nm{a=\"3\"} 3\n";
+        let mut stream = dec.decode_stream(late_help, &Format::TEXT, &opts);
+        assert!(stream.next().unwrap().is_ok());
+        let err = stream.next().unwrap().unwrap_err();
+        assert!(matches!(err, DecodeError::DuplicateOrLateHelp { ref metric } if metric == "m"));
+        assert!(stream.next().is_none());
+        drop(stream);
+
+        // Dropping a stream early returns the scratch label span vector to the decoder.
+        let labeled = b"m{k1=\"1\",k2=\"2\",k3=\"3\",k4=\"4\"} 1\nm{k1=\"5\"} 2\n";
+        {
+            let mut stream = dec.decode_stream(labeled, &Format::TEXT, &zero_opts);
+            assert!(stream.next().unwrap().is_ok());
+        }
+        assert!(dec.parser_spans.capacity() >= 4);
+
+        // Init errors surface on the first `next()` and fuse the iterator.
+        let mut bad_fmt = dec.decode_stream(b"m 1\n", &Format::UNKNOWN, &opts);
+        assert!(matches!(
+            bad_fmt.next(),
+            Some(Err(DecodeError::UnsupportedFormat(_)))
+        ));
+        assert!(bad_fmt.next().is_none());
     }
 }

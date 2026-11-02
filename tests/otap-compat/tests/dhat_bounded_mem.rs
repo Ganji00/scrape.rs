@@ -44,7 +44,9 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
     let _profiler = dhat::Profiler::builder().testing().build();
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/textparse");
-    let nometa = fs::read(root.join("alltypes.237mfs.nometa.prom.txt")).unwrap();
+    let nometa: Rc<[u8]> = fs::read(root.join("alltypes.237mfs.nometa.prom.txt"))
+        .unwrap()
+        .into();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -55,6 +57,7 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
         // Wrap `ArrowDecoder` in `!Send` `Rc<RefCell<_>>` to mirror thread-per-core OTAP receivers.
         let shared_decoder = Rc::new(RefCell::new(ArrowDecoder::new()));
         let opts = DecodeOptions::new().with_timestamp_ms(1_700_000_000_000);
+        let nometa_full = Rc::clone(&nometa);
 
         let handle = tokio::task::spawn_local(async move {
             let mut warmup_decoder_mem = 0usize;
@@ -64,7 +67,7 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
             for i in 0..32 {
                 let records = shared_decoder
                     .borrow_mut()
-                    .decode(&nometa, &Format::TEXT, &opts)
+                    .decode(&nometa_full, &Format::TEXT, &opts)
                     .expect("scrape succeeds");
                 let otap = to_otap_arrow_records(&records);
                 let dec_mem = shared_decoder.borrow().retained_memory_bytes();
@@ -99,8 +102,56 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
                 }
                 tokio::task::yield_now().await;
             }
+            warmup_decoder_mem
         });
 
-        handle.await.expect("local task succeeds");
+        let full_decoder_mem = handle.await.expect("local task succeeds");
+
+        // Verify `decode_stream` caps retained decoder scratch memory to a single 128-point chunk
+        // and keeps both decoder capacity and live heap constant across repeated scrapes.
+        let stream_decoder = Rc::new(RefCell::new(ArrowDecoder::new()));
+        let stream_opts = opts.with_max_data_points_per_batch(128);
+        let stream_handle = tokio::task::spawn_local(async move {
+            let mut warmup_stream_dec_mem = 0usize;
+            let mut warmup_stream_live_heap = 0usize;
+
+            for i in 0..32 {
+                {
+                    let mut dec = stream_decoder.borrow_mut();
+                    for chunk_res in dec.decode_stream(&nometa, &Format::TEXT, &stream_opts) {
+                        let chunk = chunk_res.expect("stream chunk succeeds");
+                        let otap = to_otap_arrow_records(&chunk);
+                        drop(otap);
+                        drop(chunk);
+                    }
+                }
+
+                let dec_mem = stream_decoder.borrow().retained_memory_bytes();
+                let live_heap = dhat::HeapStats::get().curr_bytes;
+
+                if i == 1 {
+                    warmup_stream_dec_mem = dec_mem;
+                    warmup_stream_live_heap = live_heap;
+                    assert!(warmup_stream_dec_mem > 0);
+                    assert!(
+                        warmup_stream_dec_mem * 2 < full_decoder_mem,
+                        "expected 128-row streaming decoder ({warmup_stream_dec_mem} B) to retain \
+                         less than half of full-scrape decoder ({full_decoder_mem} B)"
+                    );
+                } else if i > 1 {
+                    assert_eq!(
+                        dec_mem, warmup_stream_dec_mem,
+                        "streaming decoder scratch memory grew after warmup at iteration {i}"
+                    );
+                    assert_eq!(
+                        live_heap, warmup_stream_live_heap,
+                        "live heap bytes leaked after streaming scrape at iteration {i}"
+                    );
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        stream_handle.await.expect("streaming local task succeeds");
     });
 }

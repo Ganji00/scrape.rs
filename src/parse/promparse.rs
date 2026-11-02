@@ -88,6 +88,12 @@ impl<'a> PromParser<'a> {
         self.labels
     }
 
+    /// Takes the reusable label span buffer in place for `Drop` handlers.
+    pub(crate) fn take_scratch(&mut self) -> Vec<LabelSpan> {
+        self.labels.clear();
+        std::mem::take(&mut self.labels)
+    }
+
     /// Returns the byte offset of the current entry's metric name in `input`.
     pub(crate) fn name_offset(&self) -> usize {
         self.name_offset
