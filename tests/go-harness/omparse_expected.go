@@ -30,9 +30,8 @@ var omParseInputGlobs = []string{
 	"omerrors/*.om.txt",
 }
 
-// writeOMParseExpected writes each input's entries twice: to testdata/omparse/
-// with the scrape default (_created lines are series), and to
-// testdata/omparse_st/ with _created skipped and a start timestamp per series.
+// writeOMParseExpected writes each input's entries to testdata/omparse/, with
+// _created lines skipped and a start timestamp per series.
 func writeOMParseExpected(outRoot string) ([]string, error) {
 	var inputs []string
 	for _, glob := range omParseInputGlobs {
@@ -52,20 +51,14 @@ func writeOMParseExpected(outRoot string) ([]string, error) {
 
 	var written []string
 	for _, input := range inputs {
-		for _, outDir := range []string{"omparse", "omparse_st"} {
-			startTimestamps := outDir == "omparse_st"
-			err := writeExpected(outRoot, outDir, input, func(data []byte) string {
-				var opts []textparse.OpenMetricsOption
-				if startTimestamps {
-					opts = append(opts, textparse.WithOMParserSTSeriesSkipped())
-				}
-				return renderEntries(textparse.NewOpenMetricsParser(data, labels.NewSymbolTable(), opts...), startTimestamps)
-			})
-			if err != nil {
-				return nil, err
-			}
-			written = append(written, outDir+"/"+input)
+		err := writeExpected(outRoot, "omparse", input, func(data []byte) string {
+			parser := textparse.NewOpenMetricsParser(data, labels.NewSymbolTable(), textparse.WithOMParserSTSeriesSkipped())
+			return renderEntries(parser, true)
+		})
+		if err != nil {
+			return nil, err
 		}
+		written = append(written, "omparse/"+input)
 	}
 	return written, nil
 }

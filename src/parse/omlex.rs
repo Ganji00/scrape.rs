@@ -174,10 +174,10 @@ impl<'a> Lexer<'a> {
     }
 
     pub(super) fn lex(&mut self) -> Token {
+        self.token_start = self.pos.min(self.input.len());
         if self.pos >= self.input.len() {
             return Token::Eof;
         }
-        self.token_start = self.pos;
         let byte = self.input[self.pos];
         match self.state {
             State::Init => self.lex_init(byte),

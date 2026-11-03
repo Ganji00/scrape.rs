@@ -30,19 +30,20 @@ const CREATED_SUFFIX: &[u8] = b"_created";
 
 /// Zero-copy parser for the OpenMetrics 1.0 text exposition format.
 ///
-/// Mirrors Go's `textparse.NewOpenMetricsParser` with Prometheus's default scrape options:
-/// `_created` lines are returned as series until the first [`Parser::start_timestamp`]
-/// lookahead, and type and unit labels are disabled.
+/// Mirrors Go's `textparse.NewOpenMetricsParser` with `WithOMParserSTSeriesSkipped`:
+/// `_created` lines of counters, summaries, and histograms only feed
+/// [`Parser::start_timestamp`].
 pub struct OpenMetricsParser<'a> {
     lexer: Lexer<'a>,
-    skip_created_series: bool,
-    /// Set while peeking ahead for a `_created` line, where Go skips exemplars unparsed.
-    ignore_exemplar: bool,
+    /// Set once `# EOF` is read, so later calls keep returning `Ok(None)`.
+    done: bool,
+    /// Set while peeking ahead for a `_created` line, where Go skips exemplars unparsed and
+    /// returns `_created` lines.
+    peeking: bool,
     line_start: usize,
     series: &'a [u8],
     text: &'a [u8],
-    /// Start and end of the metric name in the input.
-    name: Option<(usize, usize)>,
+    name: Option<&'a str>,
     /// Length of the name on the last metadata line, Go's `mfNameLen`.
     family_name_len: usize,
     /// The type from the last `# TYPE` line, which Go keeps across metric families.
@@ -50,11 +51,11 @@ pub struct OpenMetricsParser<'a> {
     value: f64,
     timestamp: Option<i64>,
     /// Escaped label names and values, without quotes.
-    labels: Vec<(&'a [u8], &'a str)>,
+    labels: Vec<(&'a str, &'a str)>,
     exemplar: Option<(f64, Option<i64>)>,
-    exemplar_labels: Vec<(&'a [u8], &'a str)>,
+    exemplar_labels: Vec<(&'a str, &'a str)>,
     /// Labels buffer lent to the start timestamp lookahead, so it does not allocate per call.
-    peek_labels: Vec<(&'a [u8], &'a str)>,
+    peek_labels: Vec<(&'a str, &'a str)>,
     /// Go's start timestamp cache: the series key and start timestamp of the last hit.
     start_timestamp_key: Vec<u8>,
     start_timestamp: Option<i64>,
@@ -65,8 +66,8 @@ impl<'a> OpenMetricsParser<'a> {
     pub fn new(input: &'a [u8]) -> Self {
         Self {
             lexer: Lexer::new(input),
-            skip_created_series: false,
-            ignore_exemplar: false,
+            done: false,
+            peeking: false,
             line_start: 0,
             series: b"",
             text: b"",
@@ -84,18 +85,18 @@ impl<'a> OpenMetricsParser<'a> {
         }
     }
 
-    /// Skips `_created` lines of counters, summaries, and histograms, so they only feed
-    /// [`Parser::start_timestamp`]. Go's `WithOMParserSTSeriesSkipped`.
-    pub fn skip_created_series(mut self) -> Self {
-        self.skip_created_series = true;
-        self
-    }
-
     fn unexpected(&self, expected: &'static str) -> ParseError {
         ParseError::UnexpectedToken {
             expected,
             offset: self.lexer.token_start,
         }
+    }
+
+    fn utf8(&self, start: usize, end: usize) -> Result<&'a str, ParseError> {
+        let input = self.lexer.input;
+        std::str::from_utf8(&input[start..end]).map_err(|_| ParseError::InvalidUtf8 {
+            offset: self.lexer.token_start,
+        })
     }
 
     fn parse_metadata(&mut self, kind: Token) -> Result<Entry, ParseError> {
@@ -108,16 +109,22 @@ impl<'a> OpenMetricsParser<'a> {
             end -= 1;
         }
         self.family_name_len = end - start;
-        self.name = Some((start, end));
+        self.name = Some(self.utf8(start, end)?);
         if self.lexer.lex() != Token::Text {
             return Err(self.unexpected("expected text"));
         }
         let text = self.lexer.token();
-        // The text token starts with a blank and ends with a linebreak.
-        self.text = text.get(1..text.len() - 1).unwrap_or_default();
+        // The text token starts with a blank and ends with a linebreak, which the lexer
+        // can follow with NUL bytes.
+        let end = text
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .unwrap_or(text.len());
+        self.text = text.get(1..end).unwrap_or_default();
         match kind {
             Token::Type => {
                 self.metric_type = parse_metric_type(self.text)?;
+                self.start_timestamp = None;
                 Ok(Entry::Type)
             }
             Token::Help => {
@@ -149,7 +156,7 @@ impl<'a> OpenMetricsParser<'a> {
     fn parse_series(&mut self, first: Token) -> Result<Entry, ParseError> {
         let mut token = first;
         if first == Token::MName {
-            self.name = Some((self.line_start, self.lexer.pos));
+            self.name = Some(self.utf8(self.line_start, self.lexer.pos)?);
             token = self.lexer.lex();
         }
         if token == Token::BraceOpen {
@@ -172,6 +179,7 @@ impl<'a> OpenMetricsParser<'a> {
                 _ => return Err(self.unexpected("expected label name")),
             };
             let quoted = token == Token::QString;
+            let name = self.utf8(start, end)?;
             token = self.lexer.lex();
             if quoted && matches!(token, Token::Comma | Token::BraceClose) {
                 if exemplar {
@@ -182,7 +190,7 @@ impl<'a> OpenMetricsParser<'a> {
                         offset: self.line_start,
                     });
                 }
-                self.name = Some((start, end));
+                self.name = Some(name);
                 if token == Token::BraceClose {
                     return Ok(());
                 }
@@ -203,7 +211,7 @@ impl<'a> OpenMetricsParser<'a> {
             // byte, so it keeps the quote and all but the last NUL in the value. We cut at the
             // quote.
             let close = value.rfind('"').unwrap_or(0);
-            let label = (&self.lexer.input[start..end], &value[1..close.max(1)]);
+            let label = (name, &value[1..close.max(1)]);
             if exemplar {
                 self.exemplar_labels.push(label);
             } else {
@@ -245,7 +253,7 @@ impl<'a> OpenMetricsParser<'a> {
 
     /// Parses the exemplar after ` # {`, Go's `parseComment`.
     fn parse_exemplar(&mut self) -> Result<(), ParseError> {
-        if self.ignore_exemplar {
+        if self.peeking {
             loop {
                 let before = self.lexer.pos;
                 match self.lexer.lex() {
@@ -306,8 +314,7 @@ impl<'a> OpenMetricsParser<'a> {
     }
 
     fn metric_name(&self) -> &'a [u8] {
-        self.name
-            .map_or(&[][..], |(start, end)| &self.lexer.input[start..end])
+        self.name.unwrap_or_default().as_bytes()
     }
 
     fn is_created_series(&self) -> bool {
@@ -315,31 +322,36 @@ impl<'a> OpenMetricsParser<'a> {
     }
 
     /// Go's `seriesHash` input: label names and values, without `le` on histograms and
-    /// `quantile` on summaries, followed by the metric family name.
+    /// `quantile` on summaries, followed by the metric family name. Each piece is
+    /// length-prefixed so `{ab="c"}` and `{a="bc"}` differ.
     fn series_key<'k>(&'k self, family: &'k [u8]) -> impl Iterator<Item = u8> + 'k {
         self.labels
             .iter()
             .filter(|(name, _)| !is_float_label(self.metric_type, name))
-            .flat_map(|(name, value)| name.iter().chain(value.as_bytes()))
-            .chain(family)
-            .copied()
+            .flat_map(|(name, value)| [name.as_bytes(), value.as_bytes()])
+            .chain([family])
+            .flat_map(|piece| {
+                piece
+                    .len()
+                    .to_le_bytes()
+                    .into_iter()
+                    .chain(piece.iter().copied())
+            })
     }
 
-    /// The metric family name Go derives from the last metadata line, `currName` in Go.
+    /// The metric family name, cut from the metric name to the length of the name on the
+    /// last metadata line, `currName` in Go.
     fn family_name(&self) -> &'a [u8] {
-        let input = self.lexer.input;
-        let (name_start, _) = self.name.unwrap_or_default();
-        let quoted = self.series.starts_with(b"{\"");
-        let end = self.line_start + self.family_name_len + if quoted { 2 } else { 0 };
-        // Go slices past the series into the rest of the input when the family name is
-        // longer than the series, and panics when it would end before the name starts.
-        let end = end.min(input.len());
-        &input[name_start.min(end)..end]
+        let name = self.metric_name();
+        &name[..self.family_name_len.min(name.len())]
     }
 }
 
 impl<'a> Parser<'a> for OpenMetricsParser<'a> {
     fn next_entry(&mut self) -> Result<Option<Entry>, ParseError> {
+        if self.done {
+            return Ok(None);
+        }
         loop {
             self.line_start = self.lexer.pos;
             self.name = None;
@@ -353,6 +365,7 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
                             offset: self.lexer.token_start,
                         });
                     }
+                    self.done = true;
                     return Ok(None);
                 }
                 Token::Eof => return Err(ParseError::MissingEof),
@@ -360,7 +373,7 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
                 first @ (Token::BraceOpen | Token::MName) => self.parse_series(first)?,
                 _ => return Err(self.unexpected("expected a valid start token")),
             };
-            if entry == Entry::Series && self.skip_created_series && self.is_created_series() {
+            if entry == Entry::Series && !self.peeking && self.is_created_series() {
                 continue;
             }
             return Ok(Some(entry));
@@ -392,10 +405,10 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
         buf.clear();
         buf.push(
             Cow::Borrowed(METRIC_NAME_LABEL),
-            unescape_name(self.metric_name()),
+            unescape_label(self.name.unwrap_or_default()),
         );
         for &(name, value) in &self.labels {
-            let name = unescape_name(name);
+            let name = unescape_label(name);
             let value = normalize_float_label(self.metric_type, &name, unescape_label(value));
             buf.push(name, value);
         }
@@ -405,9 +418,10 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
     fn exemplar(&mut self, buf: &mut LabelsBuffer<'a>) -> Option<(f64, Option<i64>)> {
         buf.clear();
         let exemplar = self.exemplar.take()?;
-        // Go keeps exemplar labels escaped.
+        // Go's OpenMetrics 1.0 parser keeps exemplar labels escaped. We unescape them like
+        // series labels, as Go's OpenMetrics 2.0 parser does.
         for &(name, value) in &self.exemplar_labels {
-            buf.push(String::from_utf8_lossy(name), Cow::Borrowed(value));
+            buf.push(unescape_label(name), unescape_label(value));
         }
         buf.sort();
         Some(exemplar)
@@ -422,7 +436,6 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
         }
         let family = self.family_name();
         if let Some(cached) = self.start_timestamp
-            && cached > 0
             && self
                 .series_key(family)
                 .eq(self.start_timestamp_key.iter().copied())
@@ -431,7 +444,7 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
         }
         let mut peek = OpenMetricsParser::new(self.lexer.input);
         peek.lexer = self.lexer.clone();
-        peek.ignore_exemplar = true;
+        peek.peeking = true;
         peek.metric_type = self.metric_type;
         peek.labels = std::mem::take(&mut self.peek_labels);
         let found = loop {
@@ -446,9 +459,6 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
             break (same_series && peek.value.is_finite()).then_some((peek.value * 1000.0) as i64);
         };
         self.peek_labels = std::mem::take(&mut peek.labels);
-        // Go turns on `_created` skipping after every lookahead, even without
-        // `WithOMParserSTSeriesSkipped`.
-        self.skip_created_series = true;
         if found.is_some() {
             let mut key = std::mem::take(&mut self.start_timestamp_key);
             key.clear();
@@ -468,10 +478,10 @@ fn requires_start_timestamp(metric_type: MetricType) -> bool {
     )
 }
 
-fn is_float_label(metric_type: MetricType, name: &[u8]) -> bool {
+fn is_float_label(metric_type: MetricType, name: &str) -> bool {
     match metric_type {
-        MetricType::Histogram => name == BUCKET_LABEL.as_bytes(),
-        MetricType::Summary => name == QUANTILE_LABEL.as_bytes(),
+        MetricType::Histogram => name == BUCKET_LABEL,
+        MetricType::Summary => name == QUANTILE_LABEL,
         _ => false,
     }
 }
@@ -484,7 +494,7 @@ fn normalize_float_label<'v>(
     value: Cow<'v, str>,
 ) -> Cow<'v, str> {
     // NOTE: Go's ParseFloat also accepts hex floats here (le="0x1p3"); we leave them as is.
-    let Some(parsed) = is_float_label(metric_type, name.as_bytes())
+    let Some(parsed) = is_float_label(metric_type, name)
         .then(|| parse_go_float(&value))
         .flatten()
     else {
@@ -538,15 +548,6 @@ fn unescape(raw: &[u8]) -> Cow<'_, [u8]> {
         out.push(replaced);
     }
     Cow::Owned(out)
-}
-
-/// Unescapes a metric or label name. Go does not check that names are UTF-8, so invalid
-/// bytes become U+FFFD here instead of failing the parse.
-fn unescape_name(raw: &[u8]) -> Cow<'_, str> {
-    match String::from_utf8_lossy(raw) {
-        Cow::Borrowed(name) => unescape_label(name),
-        Cow::Owned(name) => Cow::Owned(unescape_label(&name).into_owned()),
-    }
 }
 
 fn unescape_label(raw: &str) -> Cow<'_, str> {
@@ -632,7 +633,7 @@ mod tests {
     }
 
     fn first_start_timestamp(input: &'static [u8]) -> Option<i64> {
-        let mut parser = OpenMetricsParser::new(input).skip_created_series();
+        let mut parser = OpenMetricsParser::new(input);
         while parser.next_entry().unwrap() != Some(Entry::Series) {}
         parser.start_timestamp()
     }
@@ -659,18 +660,248 @@ mod tests {
         }
     }
 
-    #[test]
-    fn start_timestamp_turns_on_created_skipping() {
-        let mut parser =
-            OpenMetricsParser::new(b"# TYPE a counter\na_total 1\na_created 5\nb 1\n# EOF\n");
-        let mut series = Vec::new();
+    /// Metric name and start timestamp of each series.
+    fn start_timestamps(input: &[u8]) -> Vec<(String, Option<i64>)> {
+        let mut parser = OpenMetricsParser::new(input);
+        let mut out = Vec::new();
         while let Some(entry) = parser.next_entry().unwrap() {
             if entry == Entry::Series {
-                series.push(parser.metric_name());
-                parser.start_timestamp();
+                let name = String::from_utf8_lossy(parser.metric_name()).into_owned();
+                out.push((name, parser.start_timestamp()));
             }
         }
-        assert_eq!(series, [&b"a_total"[..], b"b"]);
+        out
+    }
+
+    #[test]
+    fn skips_created_series() {
+        assert_eq!(
+            start_timestamps(b"# TYPE a counter\na_total 1\na_created 5\nb 1\n# EOF\n"),
+            [("a_total".to_owned(), Some(5000)), ("b".to_owned(), None)]
+        );
+    }
+
+    #[test]
+    fn start_timestamp_keeps_zero_for_the_whole_series() {
+        let input = b"# TYPE bar summary\nbar_count 1\nbar_created 0\nbar_sum 2\n# EOF\n";
+        assert_eq!(
+            start_timestamps(input),
+            [
+                ("bar_count".to_owned(), Some(0)),
+                ("bar_sum".to_owned(), Some(0))
+            ]
+        );
+    }
+
+    #[test]
+    fn start_timestamp_tells_label_splits_apart() {
+        let input = b"# TYPE x counter\nx_total{a=\"bc\"} 1\nx_created{a=\"bc\"} 7\nx_total{ab=\"c\"} 1\n# EOF\n";
+        assert_eq!(
+            start_timestamps(input),
+            [
+                ("x_total".to_owned(), Some(7000)),
+                ("x_total".to_owned(), None)
+            ]
+        );
+    }
+
+    #[test]
+    fn start_timestamp_cache_resets_on_type() {
+        let input =
+            b"# TYPE a counter\na_total 1\na_created 7\n# TYPE a counter\na_total 1\n# EOF\n";
+        assert_eq!(
+            start_timestamps(input),
+            [
+                ("a_total".to_owned(), Some(7000)),
+                ("a_total".to_owned(), None)
+            ]
+        );
+    }
+
+    #[test]
+    fn start_timestamp_finds_quoted_name_after_label() {
+        let input = concat!(
+            "# TYPE \"my.counter\" counter\n",
+            "{q=\"0.9\",\"my.counter_total\"} 1\n",
+            "{q=\"0.9\",\"my.counter_created\"} 7\n",
+            "# EOF\n",
+        );
+        assert_eq!(
+            start_timestamps(input.as_bytes()),
+            [("my.counter_total".to_owned(), Some(7000))]
+        );
+    }
+
+    #[test]
+    fn keeps_returning_none_after_eof() {
+        let mut parser = OpenMetricsParser::new(b"# EOF\n");
+        assert_eq!(parser.next_entry(), Ok(None));
+        assert_eq!(parser.next_entry(), Ok(None));
+    }
+
+    #[test]
+    fn help_text_drops_nul_after_linebreak() {
+        let mut parser = OpenMetricsParser::new(b"# HELP a foo\n\0\0# EOF\n");
+        assert_eq!(parser.next_entry(), Ok(Some(Entry::Help)));
+        assert_eq!(parser.help().1.as_ref(), b"foo");
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_in_quoted_names() {
+        let inputs: &[&[u8]] = &[
+            b"{\"\xff\"} 1\n# EOF\n",
+            b"a{\"\xff\"=\"b\"} 1\n# EOF\n",
+            b"# TYPE \"\xff\" counter\n# EOF\n",
+            b"a_total 1 # {\"\xff\"=\"b\"} 1\n# EOF\n",
+        ];
+        for input in inputs {
+            assert!(
+                matches!(parse_all(input), Err(ParseError::InvalidUtf8 { .. })),
+                "{:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    #[test]
+    fn unescapes_exemplar_labels() {
+        let mut parser = OpenMetricsParser::new(b"a_total 1 # {id=\"a\\\"b\"} 2\n# EOF\n");
+        let mut buf = LabelsBuffer::new();
+        assert_eq!(parser.next_entry(), Ok(Some(Entry::Series)));
+        assert!(parser.exemplar(&mut buf).is_some());
+        assert_eq!(buf.get("id"), Some("a\"b"));
+    }
+
+    #[test]
+    fn unexpected_eof_points_at_the_end() {
+        for input in [&b"# TYPE m"[..], b"a{b=\"c\"}"] {
+            assert_eq!(
+                parse_all(input),
+                Err(ParseError::UnexpectedToken {
+                    expected: match input[0] {
+                        b'#' => "expected text",
+                        _ => "expected value after metric",
+                    },
+                    offset: input.len(),
+                })
+            );
+        }
+    }
+
+    /// Error cases from Go's `TestOpenMetricsParseErrors` and `TestOMNullByteHandling`.
+    #[test]
+    fn rejects_upstream_error_cases() {
+        let missing_eof: &[&[u8]] = &[
+            b"",
+            b"metric 1",
+            b"metric 1\n",
+            b"metric_total 1 # {aa=\"bb\"} 4",
+        ];
+        for input in missing_eof {
+            assert_eq!(parse_all(input), Err(ParseError::MissingEof));
+        }
+        let inputs: &[&[u8]] = &[
+            b"\n",
+            b"metric",
+            b"a\n#EOF\n",
+            b"\n\n#EOF\n",
+            b" a 1\n#EOF\n",
+            b"9\n#EOF\n",
+            b"# TYPE u untyped\n#EOF\n",
+            b"# TYPE c counter \n#EOF\n",
+            b"#  TYPE c counter\n#EOF\n",
+            b"# TYPE \n#EOF\n",
+            b"# TYPE m\n#EOF\n",
+            b"# UNIT metric suffix\n#EOF\n",
+            b"# UNIT metricsuffix suffix\n#EOF\n",
+            b"# UNIT m suffix\n#EOF\n",
+            b"# UNIT \n#EOF\n",
+            b"# UNIT m\n#EOF\n",
+            b"# HELP \n#EOF\n",
+            b"# HELP m\n#EOF\n",
+            b"a\t1\n#EOF\n",
+            b"a 1\t2\n#EOF\n",
+            b"a 1 2 \n#EOF\n",
+            b"a 1 2 #\n#EOF\n",
+            b"a 1 1z\n#EOF\n",
+            b" # EOF\n",
+            b"# EOF\na 1",
+            b"# EOF\n\n",
+            b"# EOFa 1",
+            b"#\tTYPE c counter\n",
+            b"# TYPE c  counter\n",
+            b"a 1 1 1\n# EOF\n",
+            b"a{b='c'} 1\n# EOF\n",
+            b"a{,b=\"c\"} 1\n# EOF\n",
+            b"a{b=\"c\"d=\"e\"} 1\n# EOF\n",
+            b"a{b=\"c\",,d=\"e\"} 1\n# EOF\n",
+            b"a{b=\n# EOF\n",
+            b"a{\xff=\"foo\"} 1\n# EOF\n",
+            b"a{b=\"\xff\"} 1\n# EOF\n",
+            b"{\"a\",\"b = \"c\"}\n# EOF\n",
+            b"{\"a\",b\\nc=\"d\"} 1\n# EOF\n",
+            b"a true\n",
+            b"something_weird{problem=\"\n# EOF\n",
+            b"empty_label_name{=\"\"} 0\n# EOF\n",
+            b"{A}0\n# EOF\n",
+            b"foo 1_2\n\n# EOF\n",
+            b"foo 0x1p-3\n\n# EOF\n",
+            b"foo 0x1P-3\n\n# EOF\n",
+            b"foo 0 1_2\n\n# EOF\n",
+            b"custom_metric_total 1 # {aa=bb}\n# EOF\n",
+            b"custom_metric_total 1 # {aa=\"bb\"}\n# EOF\n",
+            b"custom_metric_total 1 # {aa=\"bb\"}",
+            b"custom_metric_total 1 # {bb}",
+            b"custom_metric_total 1 # {bb, a=\"dd\"}",
+            b"custom_metric_total 1 # {aa=\"bb\",,cc=\"dd\"} 1",
+            b"custom_metric_total 1 # {aa=\"bb\"} 1_2",
+            b"custom_metric_total 1 # {aa=\"bb\"} 0x1p-3",
+            b"custom_metric_total 1 # {aa=\"bb\"} true",
+            b"custom_metric_total 1 # {aa=\"bb\",cc=}",
+            br#"custom_metric_total 1 # {aa=\"\xff\"} 9.0"#,
+            b"{b=\"c\",} 1",
+            b"a 1 NaN",
+            b"a 1 -Inf",
+            b"a 1 Inf",
+            b"# TYPE hhh histogram\nhhh_bucket{le=\"+Inf\"} 1 # {aa=\"bb\"} 4 NaN",
+            b"# TYPE hhh histogram\nhhh_bucket{le=\"+Inf\"} 1 # {aa=\"bb\"} 4 -Inf",
+            b"a{b=\0\"ssss\"} 1\n# EOF\n",
+            b"a{b=\"\0",
+            b"a{b\0=\"hiih\"}\t1",
+            b"a\0{b=\"ddd\"} 1",
+            b"#",
+            b"# H",
+            b"custom_metric_total 1 # {b=\0\"ssss\"} 1\n",
+            b"custom_metric_total 1 # {b=\"\0ss\"} 1\n",
+        ];
+        for input in inputs {
+            assert!(
+                parse_all(input).is_err(),
+                "{:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    /// Valid cases from Go's `TestOpenMetricsParseErrors` and `TestOMNullByteHandling`.
+    #[test]
+    fn accepts_upstream_valid_cases() {
+        let inputs: &[&[u8]] = &[
+            b"# EOF",
+            b"# EOF\n",
+            b"null_byte_metric{a=\"abc\0\"} 1\n# EOF\n",
+            b"a{b=\"\0ss\"} 1\n# EOF\n",
+            b"a{b=\"\0\"} 1\n# EOF\n",
+            b"a{b=\"\0\"} 1\n# EOF",
+        ];
+        for input in inputs {
+            assert_eq!(
+                parse_all(input),
+                Ok(()),
+                "{:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
     }
 
     #[test]

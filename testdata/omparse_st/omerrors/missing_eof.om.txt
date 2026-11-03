@@ -1,4 +1,0 @@
-type "a" counter
-series "a_total" 3ff0000000000000 - "__name__"="a_total"
-st 0
-error

@@ -111,8 +111,7 @@ func renderEntries(parser textparse.Parser, startTimestamps bool) string {
 				writeLabels(&out, ex.Labels)
 			}
 			// StartTimestamp peeks ahead and overwrites the series, offsets and
-			// value, so it runs last. Without WithOMParserSTSeriesSkipped it
-			// also turns on _created skipping, so it only runs in st mode.
+			// value, so it runs last.
 			if startTimestamps {
 				fmt.Fprintf(&out, "st %d\n", parser.StartTimestamp())
 			}

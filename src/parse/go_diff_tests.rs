@@ -11,8 +11,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Compares Layer 0 parser output with Go's `textparse` output stored in `testdata/promparse`,
-//! `testdata/omparse`, and `testdata/omparse_st`.
+//! Compares Layer 0 parser output with Go's `textparse` output stored in `testdata/promparse`
+//! and `testdata/omparse`.
 
 use std::fs;
 use std::io::Write;
@@ -153,13 +153,6 @@ fn matches_go_promparse_output() {
 #[test]
 fn matches_go_openmetricsparse_output() {
     assert_matches_go("omparse", |input| {
-        render(OpenMetricsParser::new(input), false)
-    });
-}
-
-#[test]
-fn matches_go_openmetricsparse_start_timestamps() {
-    assert_matches_go("omparse_st", |input| {
-        render(OpenMetricsParser::new(input).skip_created_series(), true)
+        render(OpenMetricsParser::new(input), true)
     });
 }
