@@ -123,6 +123,26 @@ pub enum DecodeError {
         offset: usize,
     },
 
+    /// OpenMetrics payload did not end with `# EOF`.
+    #[error("data does not end with # EOF")]
+    MissingEof,
+
+    /// OpenMetrics payload contained trailing data after `# EOF`.
+    #[error("unexpected data after # EOF at byte {offset}")]
+    DataAfterEof {
+        /// Byte offset of the first byte after the `# EOF` line.
+        offset: usize,
+    },
+
+    /// `# UNIT` declared a unit that is not a suffix of the metric name.
+    #[error("unit {unit:?} is not a suffix of metric {metric:?}")]
+    InvalidUnit {
+        /// Metric family name declared in `# UNIT`.
+        metric: String,
+        /// Unit declared in `# UNIT`.
+        unit: String,
+    },
+
     /// Two `# HELP` lines were declared for the same metric family.
     #[error("second HELP line for metric name {metric:?}")]
     DuplicateHelp {
@@ -176,6 +196,9 @@ impl DecodeError {
             ParseError::InvalidValue(v) => Self::InvalidValue(v),
             ParseError::InvalidTimestamp(ts) => Self::InvalidTimestamp(ts),
             ParseError::InvalidMetricName { offset } => Self::InvalidMetricName { offset },
+            ParseError::MissingEof => Self::MissingEof,
+            ParseError::DataAfterEof { offset } => Self::DataAfterEof { offset },
+            ParseError::InvalidUnit { metric, unit } => Self::InvalidUnit { metric, unit },
         }
     }
 }
@@ -418,7 +441,9 @@ impl ArrowDecoder {
     ) -> Result<(), DecodeError> {
         while let Some(entry) = parser.next_entry().map_err(DecodeError::from_parse)? {
             match entry {
-                Entry::Comment => {}
+                // `PromParser` never emits `Entry::Unit` (`# UNIT` is parsed as `Entry::Comment`
+                // in Prometheus text 0.0.4).
+                Entry::Comment | Entry::Unit => {}
                 Entry::Help => {
                     let (raw_name, raw_help) = parser.raw_help();
                     let name_offset = parser.name_offset();
@@ -469,17 +494,16 @@ impl ArrowDecoder {
                             fam.metric_type = metric_type;
                             fam.has_type = true;
                         }
-                        // TODO(bwplotka): Assemble classic histograms and summaries in #8.
-                        MetricType::Histogram => {
+                        // TODO(bwplotka): Assemble classic histograms, summaries, and OpenMetrics
+                        // types in #8 and #9.
+                        MetricType::Histogram
+                        | MetricType::Summary
+                        | MetricType::GaugeHistogram
+                        | MetricType::Info
+                        | MetricType::Stateset => {
                             return Err(DecodeError::UnsupportedMetricType {
                                 metric: self.family_names.get(fam_idx).to_owned(),
-                                metric_type: "histogram",
-                            });
-                        }
-                        MetricType::Summary => {
-                            return Err(DecodeError::UnsupportedMetricType {
-                                metric: self.family_names.get(fam_idx).to_owned(),
-                                metric_type: "summary",
+                                metric_type: metric_type.as_str(),
                             });
                         }
                     }
