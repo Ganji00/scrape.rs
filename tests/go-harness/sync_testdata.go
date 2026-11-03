@@ -18,7 +18,9 @@
 // model/textparse testdata files, and extracts canonical parser test inputs from
 // model/textparse/*_test.go into the repository's top-level testdata/ directory.
 // It also writes the entries textparse.NewPromParser returns for each Prometheus
-// text fixture to testdata/promparse/.
+// text fixture to testdata/promparse/, and the entries
+// textparse.NewOpenMetricsParser returns for each OpenMetrics fixture to
+// testdata/omparse/.
 package main
 
 import (
@@ -89,6 +91,12 @@ func run() error {
 	}
 	synced = append(synced, textparseFiles...)
 
+	omErrorFiles, err := copyDirFiles(filepath.Join("testdata", "omerrors"), filepath.Join(outRoot, "omerrors"), outRoot)
+	if err != nil {
+		return err
+	}
+	synced = append(synced, omErrorFiles...)
+
 	astExtracts := []struct {
 		srcFile  string
 		funcName string
@@ -103,6 +111,11 @@ func run() error {
 			srcFile:  filepath.Join(promMod.Dir, "model", "textparse", "openmetricsparse_test.go"),
 			funcName: "TestOpenMetricsParse",
 			outName:  "TestOpenMetricsParse.om.txt",
+		},
+		{
+			srcFile:  filepath.Join(promMod.Dir, "model", "textparse", "openmetricsparse_test.go"),
+			funcName: "TestOpenMetricsParse_UTF8",
+			outName:  "TestOpenMetricsParse_UTF8.om.txt",
 		},
 		{
 			srcFile:  filepath.Join(promMod.Dir, "model", "textparse", "openmetrics2parse_test.go"),
@@ -132,6 +145,12 @@ func run() error {
 		return err
 	}
 	synced = append(synced, promParseFiles...)
+
+	omParseFiles, err := writeOMParseExpected(outRoot)
+	if err != nil {
+		return err
+	}
+	synced = append(synced, omParseFiles...)
 
 	sort.Strings(synced)
 	m := manifest{

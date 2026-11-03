@@ -1,0 +1,104 @@
+help "go_build_info" "Build information about the main Go module."
+type "go_build_info" gauge
+series "go_build_info{checksum=\"\",path=\"\",version=\"\"}" 3ff0000000000000 - "__name__"="go_build_info" "checksum"="" "path"="" "version"=""
+st 0
+help "promhttp_metric_handler_errors" "Total number of internal errors encountered by the promhttp metric handler."
+type "promhttp_metric_handler_errors" counter
+series "promhttp_metric_handler_errors_total{cause=\"encoding\"}" 0000000000000000 - "__name__"="promhttp_metric_handler_errors_total" "cause"="encoding"
+st 1726839813016
+series "promhttp_metric_handler_errors_total{cause=\"gathering\"}" 0000000000000000 - "__name__"="promhttp_metric_handler_errors_total" "cause"="gathering"
+st 1726839813016
+help "rpc_durations_histogram_seconds" "RPC latency distributions."
+type "rpc_durations_histogram_seconds" histogram
+series "rpc_durations_histogram_seconds_bucket{le=\"-0.00099\"}" 0000000000000000 - "__name__"="rpc_durations_histogram_seconds_bucket" "le"="-0.00099"
+st 1726839813016
+series "rpc_durations_histogram_seconds_bucket{le=\"-0.00089\"}" 0000000000000000 - "__name__"="rpc_durations_histogram_seconds_bucket" "le"="-0.00089"
+st 1726839813016
+series "rpc_durations_histogram_seconds_bucket{le=\"-0.0007899999999999999\"}" 0000000000000000 - "__name__"="rpc_durations_histogram_seconds_bucket" "le"="-0.0007899999999999999"
+st 1726839813016
+series "rpc_durations_histogram_seconds_bucket{le=\"-0.0006899999999999999\"}" 0000000000000000 - "__name__"="rpc_durations_histogram_seconds_bucket" "le"="-0.0006899999999999999"
+st 1726839813016
+series "rpc_durations_histogram_seconds_bucket{le=\"-0.0005899999999999998\"}" 0000000000000000 - "__name__"="rpc_durations_histogram_seconds_bucket" "le"="-0.0005899999999999998"
+st 1726839813016
+series "rpc_durations_histogram_seconds_bucket{le=\"-0.0004899999999999998\"}" 0000000000000000 - "__name__"="rpc_durations_histogram_seconds_bucket" "le"="-0.0004899999999999998"
+st 1726839813016
+series "rpc_durations_histogram_seconds_bucket{le=\"-0.0003899999999999998\"}" 0000000000000000 - "__name__"="rpc_durations_histogram_seconds_bucket" "le"="-0.0003899999999999998"
+st 1726839813016
+series "rpc_durations_histogram_seconds_bucket{le=\"-0.0002899999999999998\"}" 4008000000000000 - "__name__"="rpc_durations_histogram_seconds_bucket" "le"="-0.0002899999999999998"
+exemplar bf391165e8bdc72b 1726839814223 "dummyID"="17783"
+st 1726839813016
+series "rpc_durations_histogram_seconds_bucket{le=\"-0.0001899999999999998\"}" 4014000000000000 - "__name__"="rpc_durations_histogram_seconds_bucket" "le"="-0.0001899999999999998"
+exemplar bf2a72b5e9d26f8c 1726839814829 "dummyID"="84741"
+st 1726839813016
+series "rpc_durations_histogram_seconds_bucket{le=\"-8.999999999999979e-05\"}" 4014000000000000 - "__name__"="rpc_durations_histogram_seconds_bucket" "le"="-8.999999999999979e-05"
+st 1726839813016
+series "rpc_durations_histogram_seconds_bucket{le=\"1.0000000000000216e-05\"}" 4020000000000000 - "__name__"="rpc_durations_histogram_seconds_bucket" "le"="1.0000000000000216e-05"
+exemplar bf0832f9264d1904 1726839815133 "dummyID"="19206"
+st 1726839813016
+series "rpc_durations_histogram_seconds_bucket{le=\"0.00011000000000000022\"}" 4022000000000000 - "__name__"="rpc_durations_histogram_seconds_bucket" "le"="0.00011000000000000022"
+exemplar 3f18fa6cf87e29ca 1726839814526 "dummyID"="3974"
+st 1726839813016
+series "rpc_durations_histogram_seconds_bucket{le=\"0.00021000000000000023\"}" 4026000000000000 - "__name__"="rpc_durations_histogram_seconds_bucket" "le"="0.00021000000000000023"
+exemplar 3f26e27a4c20518c 1726839813922 "dummyID"="29640"
+st 1726839813016
+series "rpc_durations_histogram_seconds_bucket{le=\"0.0003100000000000002\"}" 402e000000000000 - "__name__"="rpc_durations_histogram_seconds_bucket" "le"="0.0003100000000000002"
+exemplar 3f324abd9975b91b 1726839814982 "dummyID"="9818"
+st 1726839813016
+series "rpc_durations_histogram_seconds_bucket{le=\"0.0004100000000000002\"}" 402e000000000000 - "__name__"="rpc_durations_histogram_seconds_bucket" "le"="0.0004100000000000002"
+st 1726839813016
+series "rpc_durations_histogram_seconds_bucket{le=\"0.0005100000000000003\"}" 402e000000000000 - "__name__"="rpc_durations_histogram_seconds_bucket" "le"="0.0005100000000000003"
+st 1726839813016
+series "rpc_durations_histogram_seconds_bucket{le=\"0.0006100000000000003\"}" 402e000000000000 - "__name__"="rpc_durations_histogram_seconds_bucket" "le"="0.0006100000000000003"
+st 1726839813016
+series "rpc_durations_histogram_seconds_bucket{le=\"0.0007100000000000003\"}" 402e000000000000 - "__name__"="rpc_durations_histogram_seconds_bucket" "le"="0.0007100000000000003"
+st 1726839813016
+series "rpc_durations_histogram_seconds_bucket{le=\"0.0008100000000000004\"}" 402e000000000000 - "__name__"="rpc_durations_histogram_seconds_bucket" "le"="0.0008100000000000004"
+st 1726839813016
+series "rpc_durations_histogram_seconds_bucket{le=\"0.0009100000000000004\"}" 402e000000000000 - "__name__"="rpc_durations_histogram_seconds_bucket" "le"="0.0009100000000000004"
+st 1726839813016
+series "rpc_durations_histogram_seconds_bucket{le=\"+Inf\"}" 402e000000000000 - "__name__"="rpc_durations_histogram_seconds_bucket" "le"="+Inf"
+st 1726839813016
+series "rpc_durations_histogram_seconds_sum" bf16282a66bb39e6 - "__name__"="rpc_durations_histogram_seconds_sum"
+st 1726839813016
+series "rpc_durations_histogram_seconds_count" 402e000000000000 - "__name__"="rpc_durations_histogram_seconds_count"
+st 1726839813016
+help "rpc_durations_seconds" "RPC latency distributions."
+type "rpc_durations_seconds" summary
+series "rpc_durations_seconds{service=\"exponential\",quantile=\"0.5\"}" 3ea9cd1e196b7907 - "__name__"="rpc_durations_seconds" "quantile"="0.5" "service"="exponential"
+st 1726839813016
+series "rpc_durations_seconds{service=\"exponential\",quantile=\"0.9\"}" 3ebbbed9e874cbac - "__name__"="rpc_durations_seconds" "quantile"="0.9" "service"="exponential"
+st 1726839813016
+series "rpc_durations_seconds{service=\"exponential\",quantile=\"0.99\"}" 3ec1964e80066f09 - "__name__"="rpc_durations_seconds" "quantile"="0.99" "service"="exponential"
+st 1726839813016
+series "rpc_durations_seconds_sum{service=\"exponential\"}" 3ef54e401f00329c - "__name__"="rpc_durations_seconds_sum" "service"="exponential"
+st 1726839813016
+series "rpc_durations_seconds_count{service=\"exponential\"}" 4036000000000000 - "__name__"="rpc_durations_seconds_count" "service"="exponential"
+st 1726839813016
+series "rpc_durations_seconds{service=\"normal\",quantile=\"0.5\"}" bed540640501549f - "__name__"="rpc_durations_seconds" "quantile"="0.5" "service"="normal"
+st 1726839813016
+series "rpc_durations_seconds{service=\"normal\",quantile=\"0.9\"}" 3f333d53bbb4737b - "__name__"="rpc_durations_seconds" "quantile"="0.9" "service"="normal"
+st 1726839813016
+series "rpc_durations_seconds{service=\"normal\",quantile=\"0.99\"}" 3f33cfe942727d6e - "__name__"="rpc_durations_seconds" "quantile"="0.99" "service"="normal"
+st 1726839813016
+series "rpc_durations_seconds_sum{service=\"normal\"}" bf16282a66bb39e6 - "__name__"="rpc_durations_seconds_sum" "service"="normal"
+st 1726839813016
+series "rpc_durations_seconds_count{service=\"normal\"}" 402e000000000000 - "__name__"="rpc_durations_seconds_count" "service"="normal"
+st 1726839813016
+series "rpc_durations_seconds{service=\"uniform\",quantile=\"0.5\"}" 3f179b29c904a3f7 - "__name__"="rpc_durations_seconds" "quantile"="0.5" "service"="uniform"
+st 1726839813016
+series "rpc_durations_seconds{service=\"uniform\",quantile=\"0.9\"}" 3f27551a080d6207 - "__name__"="rpc_durations_seconds" "quantile"="0.9" "service"="uniform"
+st 1726839813016
+series "rpc_durations_seconds{service=\"uniform\",quantile=\"0.99\"}" 3f286f0ec3c8b535 - "__name__"="rpc_durations_seconds" "quantile"="0.99" "service"="uniform"
+st 1726839813016
+series "rpc_durations_seconds_sum{service=\"uniform\"}" 3f531d1d7cd64cce - "__name__"="rpc_durations_seconds_sum" "service"="uniform"
+st 1726839813016
+series "rpc_durations_seconds_count{service=\"uniform\"}" 4026000000000000 - "__name__"="rpc_durations_seconds_count" "service"="uniform"
+st 1726839813016
+help "rpc_requests" "Total number of RPC requests received."
+type "rpc_requests" counter
+series "rpc_requests_total{service=\"exponential\"}" 4036000000000000 - "__name__"="rpc_requests_total" "service"="exponential"
+st 1726839813016
+series "rpc_requests_total{service=\"normal\"}" 402e000000000000 - "__name__"="rpc_requests_total" "service"="normal"
+st 1726839813016
+series "rpc_requests_total{service=\"uniform\"}" 4026000000000000 - "__name__"="rpc_requests_total" "service"="uniform"
+st 1726839813016

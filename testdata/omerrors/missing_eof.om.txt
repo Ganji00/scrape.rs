@@ -1,0 +1,2 @@
+# TYPE a counter
+a_total 1

@@ -1,0 +1,25 @@
+help "go.gc_duration_seconds" "A summary of the GC invocation durations."
+type "go.gc_duration_seconds" summary
+unit "go.gc_duration_seconds" "seconds"
+series "{\"go.gc_duration_seconds\",quantile=\"0\"}" 3f09dfc772bd2e41 - "__name__"="go.gc_duration_seconds" "quantile"="0.0"
+st 1520872607123
+series "{\"go.gc_duration_seconds\",quantile=\"0.25\"}" 3f13763aab07e73c - "__name__"="go.gc_duration_seconds" "quantile"="0.25"
+st 1520872607123
+series "{\"go.gc_duration_seconds\",quantile=\"0.5\",a=\"b\"}" 3f15fa12554226c1 - "__name__"="go.gc_duration_seconds" "a"="b" "quantile"="0.5"
+st 0
+series "{\"http.status\",q=\"0.9\",a=\"b\"}" 3f15fa12554226c1 - "__name__"="http.status" "a"="b" "q"="0.9"
+st 0
+series "{\"http.status\",q=\"0.9\",a=\"b\"}" 3f15fa12554226c1 - "__name__"="http.status" "a"="b" "q"="0.9"
+st 0
+series "{q=\"0.9\",\"http.status\",a=\"b\"}" 3f15fa12554226c1 - "__name__"="http.status" "a"="b" "q"="0.9"
+st 0
+series "{\"go.gc_duration_seconds_sum\"}" 3f71a1599b40a77f - "__name__"="go.gc_duration_seconds_sum"
+st 0
+series "{\"Heizölrückstoßabdämpfung 10€ metric with \\\"interesting\\\" {character\\nchoices}\",\"strange©™\\n'quoted' \\\"name\\\"\"=\"6\"}" 4024000000000000 - "__name__"="Heizölrückstoßabdämpfung 10€ metric with \"interesting\" {character\x0achoices}" "strange©™\x0a'quoted' \"name\""="6"
+st 0
+series "quotedexemplar_count" 3ff0000000000000 - "__name__"="quotedexemplar_count"
+exemplar 4010000000000000 - "id.thing"="histogram-count-test"
+st 0
+series "quotedexemplar2_count" 3ff0000000000000 - "__name__"="quotedexemplar2_count"
+exemplar 4010000000000000 - "id.thing"="histogram-count-test" "other"="hello"
+st 0
