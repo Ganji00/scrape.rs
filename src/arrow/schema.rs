@@ -42,9 +42,6 @@ pub(super) const AGGREGATION_TEMPORALITY_CUMULATIVE: i32 = 2;
 /// OTAP `AttributeValueType::Str` wire value (`1`).
 pub(super) const ATTR_VALUE_TYPE_STR: u8 = 1;
 
-/// OTAP `DataPointFlags::NoRecordedValueMask` wire value (`1`), set on Prometheus `StaleNaN`.
-pub(super) const FLAG_NO_RECORDED_VALUE: u32 = 1;
-
 /// Metric-level metadata attribute key recording the original Prometheus exposition type.
 pub const PROMETHEUS_TYPE_METADATA_KEY: &str = "prometheus.type";
 
@@ -128,14 +125,8 @@ pub(super) fn metric_attrs_type_val_dict() -> ArrayRef {
     Arc::clone(&METRIC_ATTRS_TYPE_VAL_DICT)
 }
 
-fn build_number_dp_schema(
-    has_id: bool,
-    has_time: bool,
-    time_nullable: bool,
-    value_nullable: bool,
-    has_flags: bool,
-) -> SchemaRef {
-    let mut fields = Vec::with_capacity(5);
+fn build_number_dp_schema(has_id: bool, has_time: bool, time_nullable: bool) -> SchemaRef {
+    let mut fields = Vec::with_capacity(4);
     if has_id {
         fields.push(Field::new("id", DataType::UInt32, false).with_metadata(plain_id_metadata()));
     }
@@ -148,41 +139,23 @@ fn build_number_dp_schema(
             time_nullable,
         ));
     }
-    fields.push(Field::new(
-        "double_value",
-        DataType::Float64,
-        value_nullable,
-    ));
-    if has_flags {
-        fields.push(Field::new("flags", DataType::UInt32, false));
-    }
+    fields.push(Field::new("double_value", DataType::Float64, false));
     Arc::new(Schema::new(fields))
 }
 
-static NUMBER_DP_SCHEMAS: LazyLock<[SchemaRef; 32]> = LazyLock::new(|| {
+static NUMBER_DP_SCHEMAS: LazyLock<[SchemaRef; 8]> = LazyLock::new(|| {
     std::array::from_fn(|mask| {
         let has_id = (mask & 1) != 0;
         let has_time = (mask & 2) != 0;
         let time_nullable = (mask & 4) != 0;
-        let value_nullable = (mask & 8) != 0;
-        let has_flags = (mask & 16) != 0;
-        build_number_dp_schema(has_id, has_time, time_nullable, value_nullable, has_flags)
+        build_number_dp_schema(has_id, has_time, time_nullable)
     })
 });
 
 #[inline]
-pub(super) fn number_dp_schema(
-    has_id: bool,
-    has_time: bool,
-    time_nullable: bool,
-    value_nullable: bool,
-    has_flags: bool,
-) -> SchemaRef {
-    let mask = usize::from(has_id)
-        | (usize::from(has_time) << 1)
-        | (usize::from(time_nullable) << 2)
-        | (usize::from(value_nullable) << 3)
-        | (usize::from(has_flags) << 4);
+pub(super) fn number_dp_schema(has_id: bool, has_time: bool, time_nullable: bool) -> SchemaRef {
+    let mask =
+        usize::from(has_id) | (usize::from(time_nullable) << 2) | (usize::from(has_time) << 1);
     Arc::clone(&NUMBER_DP_SCHEMAS[mask])
 }
 

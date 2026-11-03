@@ -121,7 +121,7 @@ fn metric_payload_type_discriminants_match_otap_proto() {
 fn adaptive_schema_variants_match_upstream_otap_schema_definitions() {
     let mut decoder = ArrowDecoder::new();
 
-    // Minimal schema: no description, no counter columns, no dp id, no timestamps, no flags.
+    // Minimal schema: no description, no counter columns, no dp id, no timestamps.
     let minimal = decoder
         .decode(b"bare_gauge 1\n", &Format::TEXT, &DecodeOptions::new())
         .expect("minimal payload decodes");

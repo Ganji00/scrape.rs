@@ -42,14 +42,11 @@ use self::intern::StringInterner;
 pub use self::records::{MetricPayloadType, OtapMetricRecords};
 pub use self::schema::PROMETHEUS_TYPE_METADATA_KEY;
 use self::schema::{
-    AGGREGATION_TEMPORALITY_CUMULATIVE, ATTR_VALUE_TYPE_STR, FLAG_NO_RECORDED_VALUE, KeyEncoding,
-    OTAP_METRIC_TYPE_GAUGE, OTAP_METRIC_TYPE_SUM, UTC_TIME_ZONE, ValEncoding,
-    metric_attrs_key_dict, metric_attrs_schema, metric_attrs_type_val_dict, number_dp_attrs_schema,
-    number_dp_schema, univariate_metrics_schema,
+    AGGREGATION_TEMPORALITY_CUMULATIVE, ATTR_VALUE_TYPE_STR, KeyEncoding, OTAP_METRIC_TYPE_GAUGE,
+    OTAP_METRIC_TYPE_SUM, UTC_TIME_ZONE, ValEncoding, metric_attrs_key_dict, metric_attrs_schema,
+    metric_attrs_type_val_dict, number_dp_attrs_schema, number_dp_schema,
+    univariate_metrics_schema,
 };
-
-/// Bit pattern of Prometheus `value.StaleNaN`, translated to `NoRecordedValueMask` in OTAP.
-const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
 
 /// Options controlling [`ArrowDecoder::decode`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -227,8 +224,6 @@ pub struct ArrowDecoder {
 
     dp_parent_ids: Vec<u16>,
     dp_values: Vec<f64>,
-    dp_value_valid: Vec<bool>,
-    dp_flags: Vec<u32>,
     dp_timestamps: Vec<i64>,
     dp_time_valid: Vec<bool>,
 
@@ -275,8 +270,6 @@ impl ArrowDecoder {
 
             dp_parent_ids: Vec::with_capacity(data_points),
             dp_values: Vec::with_capacity(data_points),
-            dp_value_valid: Vec::new(),
-            dp_flags: Vec::new(),
             dp_timestamps: Vec::new(),
             dp_time_valid: Vec::new(),
 
@@ -305,8 +298,6 @@ impl ArrowDecoder {
             + self.val_interner.retained_memory_bytes()
             + self.dp_parent_ids.capacity() * size_of::<u16>()
             + self.dp_values.capacity() * size_of::<f64>()
-            + self.dp_value_valid.capacity() * size_of::<bool>()
-            + self.dp_flags.capacity() * size_of::<u32>()
             + self.dp_timestamps.capacity() * size_of::<i64>()
             + self.dp_time_valid.capacity() * size_of::<bool>()
             + self.dp_attr_parent_ids.capacity() * size_of::<u32>()
@@ -334,8 +325,8 @@ impl ArrowDecoder {
     ///   trailing `# HELP` lines after samples, so `UnivariateMetrics` descriptions and parent IDs
     ///   are only complete at end-of-scrape.
     /// - OTAP schemas adaptively omit unused optional columns (`description`, `id`,
-    ///   `time_unix_nano`, `flags`) and choose dictionary key widths (`UInt8`, `UInt16`, or plain
-    ///   `Utf8`) from whole-batch cardinality and nullability.
+    ///   `time_unix_nano`) and choose dictionary key widths (`UInt8`, `UInt16`, or plain `Utf8`)
+    ///   from whole-batch cardinality and nullability.
     pub fn decode(
         &mut self,
         input: &[u8],
@@ -375,8 +366,6 @@ impl ArrowDecoder {
 
         self.dp_parent_ids.clear();
         self.dp_values.clear();
-        self.dp_value_valid.clear();
-        self.dp_flags.clear();
         self.dp_timestamps.clear();
         self.dp_time_valid.clear();
 
@@ -661,22 +650,7 @@ impl ArrowDecoder {
     ) -> Result<(), DecodeError> {
         let dp_index = self.dp_parent_ids.len();
         self.dp_parent_ids.push(parent_id);
-
-        if value.to_bits() == STALE_NAN_BITS {
-            if self.dp_flags.is_empty() {
-                self.dp_value_valid.resize(dp_index, true);
-                self.dp_flags.resize(dp_index, 0);
-            }
-            self.dp_values.push(0.0);
-            self.dp_value_valid.push(false);
-            self.dp_flags.push(FLAG_NO_RECORDED_VALUE);
-        } else {
-            self.dp_values.push(value);
-            if !self.dp_flags.is_empty() {
-                self.dp_value_valid.push(true);
-                self.dp_flags.push(0);
-            }
-        }
+        self.dp_values.push(value);
 
         let resolved_ts_ns = match sample_ts_ms {
             Some(ms) => Some(ms_to_ns(ms)?),
@@ -902,10 +876,8 @@ impl ArrowDecoder {
         let has_id = !self.dp_attr_pairs.is_empty();
         let has_time = !self.dp_timestamps.is_empty();
         let time_nullable = has_time && !has_default_ts && !self.dp_time_valid.is_empty();
-        let has_flags = !self.dp_flags.is_empty();
-        let value_nullable = has_flags;
 
-        let schema = number_dp_schema(has_id, has_time, time_nullable, value_nullable, has_flags);
+        let schema = number_dp_schema(has_id, has_time, time_nullable);
         let mut cols: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
 
         if has_id {
@@ -936,24 +908,10 @@ impl ArrowDecoder {
             cols.push(Arc::new(ts_arr));
         }
 
-        let val_nulls = if value_nullable {
-            Some(NullBuffer::new(BooleanBuffer::from_iter(
-                self.dp_value_valid.iter().copied(),
-            )))
-        } else {
-            None
-        };
         cols.push(Arc::new(Float64Array::new(
             scalar_from_slice(&self.dp_values),
-            val_nulls,
+            None,
         )));
-
-        if has_flags {
-            cols.push(Arc::new(UInt32Array::new(
-                scalar_from_slice(&self.dp_flags),
-                None,
-            )));
-        }
 
         Ok(RecordBatch::try_new(schema, cols)?)
     }
@@ -1177,41 +1135,6 @@ mod tests {
                 .data_type(),
             &DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8))
         );
-    }
-
-    #[test]
-    fn stale_nan_sets_no_recorded_value_flag_and_null_double() {
-        let mut dec = ArrowDecoder::new();
-        // Inject a `StaleNaN` sample directly through `append_data_point` after a normal sample.
-        dec.reset();
-        let fam_idx = dec.resolve_family(b"up", 0).unwrap();
-        dec.families[fam_idx as usize].emitted_id = Some(0);
-        dec.emitted_families.push(fam_idx);
-        dec.append_data_point(0, 1.0, Some(1_000), None).unwrap();
-        dec.append_data_point(0, f64::from_bits(STALE_NAN_BITS), Some(2_000), None)
-            .unwrap();
-
-        let records = dec.finish_batches(false).unwrap();
-        let dps = records.number_data_points().unwrap();
-        let vals = dps
-            .column_by_name("double_value")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap();
-        let flags = dps
-            .column_by_name("flags")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .unwrap();
-
-        assert!(!vals.is_null(0));
-        assert_eq!(vals.value(0), 1.0);
-        assert_eq!(flags.value(0), 0);
-
-        assert!(vals.is_null(1));
-        assert_eq!(flags.value(1), FLAG_NO_RECORDED_VALUE);
     }
 
     #[test]
