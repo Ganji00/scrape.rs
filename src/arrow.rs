@@ -547,10 +547,19 @@ impl ArrowDecoder {
         let mut prev_key_id: Option<u32> = None;
         let mut sorted_by_key_id = true;
 
-        for span in label_spans {
+        for (span_idx, span) in label_spans.iter().enumerate() {
             // `PromParser` already validated UTF-8 on every `LabelSpan`.
             let raw_key = &full_input[span.name_start..span.name_end];
             let raw_val = &full_input[span.val_start..span.val_end];
+
+            // Prometheus treats `label=""` as an absent label (`labels.Builder` deletes empty
+            // values). Validate reserved and duplicate label names before skipping so unused keys
+            // and `""` never enter the OTAP attribute dictionaries. `unescape_bytes_into` never
+            // shrinks a non-empty slice to zero bytes, so `raw_val.is_empty()` is exact.
+            if raw_val.is_empty() {
+                self.validate_empty_label(fam_idx, span_idx, label_spans, full_input)?;
+                continue;
+            }
 
             let key = unescape_bytes_into(raw_key, true, &mut self.unescape_buf);
             if key == METRIC_NAME_LABEL.as_bytes() {
@@ -606,6 +615,39 @@ impl ArrowDecoder {
             }
         }
 
+        Ok(())
+    }
+
+    #[cold]
+    fn validate_empty_label(
+        &mut self,
+        fam_idx: u32,
+        span_idx: usize,
+        label_spans: &[LabelSpan],
+        full_input: &[u8],
+    ) -> Result<(), DecodeError> {
+        let span = &label_spans[span_idx];
+        let raw_key = &full_input[span.name_start..span.name_end];
+        let key = unescape_bytes_into(raw_key, true, &mut self.unescape_buf);
+        if key == METRIC_NAME_LABEL.as_bytes() {
+            return Err(DecodeError::DuplicateLabel {
+                metric: self.family_names.get(fam_idx).to_owned(),
+                label: METRIC_NAME_LABEL.to_owned(),
+            });
+        }
+        for (other_idx, other) in label_spans.iter().enumerate() {
+            if other_idx == span_idx {
+                continue;
+            }
+            let other_raw_key = &full_input[other.name_start..other.name_end];
+            let other_key = unescape_bytes_into(other_raw_key, true, &mut self.scratch_bytes);
+            if key == other_key {
+                return Err(DecodeError::DuplicateLabel {
+                    metric: self.family_names.get(fam_idx).to_owned(),
+                    label: String::from_utf8_lossy(key).into_owned(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -1203,11 +1245,16 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, DecodeError::DuplicateOrLateType { ref metric } if metric == "m"));
 
-        // Duplicate label names (both adjacent and non-adjacent) and reserved `__name__`.
+        // Duplicate label names (adjacent, non-adjacent, or empty-valued) and reserved `__name__`.
         for payload in [
             b"m{a=\"1\",a=\"2\"} 1\n" as &[u8],
             b"m{b=\"1\",a=\"2\",b=\"3\"} 1\n",
+            b"m{a=\"\",a=\"\"} 1\n",
+            b"m{a=\"1\",a=\"\"} 1\n",
+            b"m{a=\"\",a=\"1\"} 1\n",
+            b"m{\"a\\nb\"=\"\",\"a\nb\"=\"1\"} 1\n",
             b"m{__name__=\"override\"} 1\n",
+            b"m{__name__=\"\"} 1\n",
         ] {
             let err = dec.decode(payload, &Format::TEXT, &opts).unwrap_err();
             assert!(
@@ -1253,5 +1300,51 @@ mod tests {
                 timestamp_ms: 9_223_372_036_855
             }
         ));
+    }
+
+    #[test]
+    fn empty_label_values_match_missing_labels() {
+        let mut dec = ArrowDecoder::new();
+        let opts = DecodeOptions::default();
+
+        let bare = dec.decode(b"m 1\n", &Format::TEXT, &opts).unwrap();
+        let with_empty = dec
+            .decode(b"m{a=\"\",b=\"\"} 1\n", &Format::TEXT, &opts)
+            .unwrap();
+        assert_eq!(with_empty, bare);
+        assert!(with_empty.number_dp_attrs().is_none());
+
+        let mixed = dec
+            .decode(b"m{a=\"\",b=\"x\"} 1\n", &Format::TEXT, &opts)
+            .unwrap();
+        let dp_attrs = mixed.number_dp_attrs().unwrap();
+        assert_eq!(dp_attrs.num_rows(), 1);
+        let key_dict = dp_attrs
+            .column_by_name("key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt8Type>>()
+            .unwrap();
+        let key_vals = key_dict
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(key_vals.len(), 1);
+        assert_eq!(key_vals.value(0), "b");
+
+        let val_dict = dp_attrs
+            .column_by_name("str")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt16Type>>()
+            .unwrap();
+        let str_vals = val_dict
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(str_vals.len(), 1);
+        assert_eq!(str_vals.value(0), "x");
     }
 }
