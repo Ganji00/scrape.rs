@@ -54,7 +54,12 @@ fn fx_hash(bytes: &[u8]) -> u64 {
     for &b in remainder {
         hash = (hash.rotate_left(5) ^ u64::from(b)).wrapping_mul(FX_SEED);
     }
-    hash
+    // Wrapping multiplication only carries bits from low to high, so changes in the trailing
+    // bytes of the last 8-byte chunk never reach the low bits masked for bucket indexing. Fold
+    // the upper half down bijectively so short IDs differing at the end spread across slots.
+    hash ^= hash >> 32;
+    hash = hash.wrapping_mul(FX_SEED);
+    hash ^ (hash >> 32)
 }
 
 /// Reusable open-addressed string interner backed by a single `Vec<u8>` buffer and `Vec<i32>`
@@ -187,5 +192,45 @@ impl StringInterner {
         // SAFETY-FREE invariant: every interned entry came from a valid `&str`, and `self.offsets`
         // is monotonically non-decreasing starting at `0` and ending at `self.bytes.len()`.
         StringArray::new(offsets, values, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    #[test]
+    fn fx_hash_spreads_8_byte_ids_differing_only_in_trailing_bytes() {
+        let mut interner = StringInterner::with_capacity(4096, 4096 * 8);
+        let mask = interner.buckets.len() - 1;
+        let mut initial_slots = HashSet::with_capacity(4096);
+
+        for i in 0..4096_u32 {
+            let s = format!("h{i:07}");
+            assert_eq!(s.len(), 8);
+            initial_slots.insert((fx_hash(s.as_bytes()) as usize) & mask);
+            assert_eq!(interner.intern(s.as_bytes()), Some(i));
+            assert_eq!(interner.intern(s.as_bytes()), Some(i));
+        }
+        assert!(
+            initial_slots.len() > 3000,
+            "expected >3000 distinct initial slots across 8192 buckets, got {}",
+            initial_slots.len()
+        );
+
+        // Byte 7 (bits 56..63) must also mix down into small 16-slot masks.
+        let byte7_slots: HashSet<usize> = (b'a'..=b'z')
+            .map(|ch| {
+                let s = [b'h', b'o', b's', b't', b'0', b'0', b'0', ch];
+                (fx_hash(&s) as usize) & 15
+            })
+            .collect();
+        assert!(
+            byte7_slots.len() >= 10,
+            "expected byte-7 differences to spread across 16-slot mask, got {}",
+            byte7_slots.len()
+        );
     }
 }
