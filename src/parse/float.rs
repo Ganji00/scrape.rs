@@ -13,30 +13,35 @@
 
 //! Go-compatible float parsing and OpenMetrics float formatting, shared by the text parsers.
 
-use std::borrow::Cow;
 use std::fmt::{self, Write};
 
 /// Go's `strconv.ParseFloat(s, 64)`, without hex float support.
 pub(super) fn parse_go_float(text: &str) -> Option<f64> {
-    let text = if text.contains('_') {
+    if text.contains('_') {
         if !underscores_ok(text.as_bytes()) {
             return None;
         }
-        Cow::Owned(text.replace('_', ""))
-    } else {
-        Cow::Borrowed(text)
-    };
-    let unsigned = text.strip_prefix(['+', '-']).unwrap_or(&text);
-    if unsigned.eq_ignore_ascii_case("inf") || unsigned.eq_ignore_ascii_case("infinity") {
-        return Some(if text.starts_with('-') {
-            f64::NEG_INFINITY
-        } else {
-            f64::INFINITY
-        });
+        return parse_go_float_no_underscore(&text.replace('_', ""));
     }
-    // Go rejects a signed NaN, and reports overflow to infinity as an error.
-    if unsigned.eq_ignore_ascii_case("nan") {
-        return (unsigned.len() == text.len()).then_some(f64::NAN);
+    parse_go_float_no_underscore(text)
+}
+
+/// Fast path for `parse_go_float` when the caller has already verified `text` contains no `'_'`.
+#[inline]
+pub(super) fn parse_go_float_no_underscore(text: &str) -> Option<f64> {
+    let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
+    if matches!(unsigned.as_bytes().first(), Some(b'i' | b'I' | b'n' | b'N')) {
+        if unsigned.eq_ignore_ascii_case("inf") || unsigned.eq_ignore_ascii_case("infinity") {
+            return Some(if text.starts_with('-') {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            });
+        }
+        // Go rejects a signed NaN, and reports overflow to infinity as an error.
+        if unsigned.eq_ignore_ascii_case("nan") {
+            return (unsigned.len() == text.len()).then_some(f64::NAN);
+        }
     }
     text.parse().ok().filter(|value: &f64| value.is_finite())
 }
