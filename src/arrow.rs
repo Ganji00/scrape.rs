@@ -493,11 +493,17 @@ impl ArrowDecoder {
 
         let spans = std::mem::take(&mut self.parser_spans);
         let mut parser = PromParser::with_scratch(input, spans);
-        let parse_res = self.ingest_prom_entries(&mut parser, default_ts_ns);
+        let mut pending_series = false;
+        let mut done = false;
+        let res = self.ingest_prom_entries::<false>(
+            &mut parser,
+            default_ts_ns,
+            0,
+            &mut pending_series,
+            &mut done,
+        );
         self.parser_spans = parser.into_scratch();
-        parse_res?;
-
-        self.finish_batches(default_ts_ns.is_some())
+        Ok(res?.unwrap_or_default())
     }
 
     /// Streams `input` as a sequence of non-empty [`OtapMetricRecords`] chunks bounded by
@@ -684,12 +690,39 @@ impl ArrowDecoder {
         Ok(id)
     }
 
-    fn ingest_prom_entries(
+    // Monomorphizing on `CHUNKED` shares one entry dispatch loop between `decode` (`false`) and
+    // `decode_stream` (`true`) while compiling out chunk-boundary flush checks on single-batch
+    // calls.
+    fn ingest_prom_entries<const CHUNKED: bool>(
         &mut self,
         parser: &mut PromParser<'_>,
         default_ts_ns: Option<i64>,
-    ) -> Result<(), DecodeError> {
-        while let Some(entry) = parser.next_entry().map_err(DecodeError::from_parse)? {
+        max_data_points: usize,
+        pending_series: &mut bool,
+        done: &mut bool,
+    ) -> Result<Option<OtapMetricRecords>, DecodeError> {
+        loop {
+            let entry = if CHUNKED && *pending_series {
+                *pending_series = false;
+                Entry::Series
+            } else {
+                match parser.next_entry().map_err(DecodeError::from_parse)? {
+                    Some(entry) => entry,
+                    None => {
+                        *done = true;
+                        if CHUNKED {
+                            if self.um_metric_types.is_empty() {
+                                return Ok(None);
+                            }
+                            let batch = self.finish_batches(default_ts_ns.is_some())?;
+                            self.reset_batch();
+                            return Ok(Some(batch));
+                        }
+                        return Ok(Some(self.finish_batches(default_ts_ns.is_some())?));
+                    }
+                }
+            };
+
             match entry {
                 // `PromParser` never emits `Entry::Unit` (`# UNIT` is parsed as `Entry::Comment`
                 // in Prometheus text 0.0.4).
@@ -705,6 +738,15 @@ impl ArrowDecoder {
                         name_offset,
                         &mut self.unescape_buf,
                     )?;
+                    if CHUNKED
+                        && self.current_family.batch_id.is_none()
+                        && self.um_metric_types.len() >= MAX_METRICS_PER_BATCH
+                    {
+                        *pending_series = true;
+                        let batch = self.finish_batches(default_ts_ns.is_some())?;
+                        self.reset_batch();
+                        return Ok(Some(batch));
+                    }
                     self.append_current_series(
                         label_spans,
                         full_input,
@@ -712,10 +754,14 @@ impl ArrowDecoder {
                         value,
                         default_ts_ns,
                     )?;
+                    if CHUNKED && self.dp_parent_ids.len() >= max_data_points {
+                        let batch = self.finish_batches(default_ts_ns.is_some())?;
+                        self.reset_batch();
+                        return Ok(Some(batch));
+                    }
                 }
             }
         }
-        Ok(())
     }
 
     #[inline]
@@ -1215,68 +1261,6 @@ pub struct DecodeStream<'dec, 'input> {
     done: bool,
 }
 
-impl DecodeStream<'_, '_> {
-    fn step(&mut self) -> Result<Option<OtapMetricRecords>, DecodeError> {
-        loop {
-            let entry = if self.pending_series {
-                self.pending_series = false;
-                Entry::Series
-            } else {
-                match self.parser.next_entry().map_err(DecodeError::from_parse)? {
-                    Some(entry) => entry,
-                    None => {
-                        self.done = true;
-                        if self.decoder.um_metric_types.is_empty() {
-                            return Ok(None);
-                        }
-                        let batch = self.decoder.finish_batches(self.default_ts_ns.is_some())?;
-                        self.decoder.reset_batch();
-                        return Ok(Some(batch));
-                    }
-                }
-            };
-
-            match entry {
-                // `PromParser` never emits `Entry::Unit` (`# UNIT` is parsed as `Entry::Comment`
-                // in Prometheus text 0.0.4).
-                Entry::Comment | Entry::Unit => {}
-                Entry::Help => self.decoder.ingest_help_entry(&self.parser)?,
-                Entry::Type => self.decoder.ingest_type_entry(&self.parser)?,
-                Entry::Series => {
-                    let (raw_name, label_spans, full_input, sample_ts_ms, value) =
-                        self.parser.raw_series_parts();
-                    let name_offset = self.parser.name_offset();
-                    self.decoder.current_family.transition_if_needed(
-                        raw_name,
-                        name_offset,
-                        &mut self.decoder.unescape_buf,
-                    )?;
-                    if self.decoder.current_family.batch_id.is_none()
-                        && self.decoder.um_metric_types.len() >= MAX_METRICS_PER_BATCH
-                    {
-                        self.pending_series = true;
-                        let batch = self.decoder.finish_batches(self.default_ts_ns.is_some())?;
-                        self.decoder.reset_batch();
-                        return Ok(Some(batch));
-                    }
-                    self.decoder.append_current_series(
-                        label_spans,
-                        full_input,
-                        sample_ts_ms,
-                        value,
-                        self.default_ts_ns,
-                    )?;
-                    if self.decoder.dp_parent_ids.len() >= self.max_data_points {
-                        let batch = self.decoder.finish_batches(self.default_ts_ns.is_some())?;
-                        self.decoder.reset_batch();
-                        return Ok(Some(batch));
-                    }
-                }
-            }
-        }
-    }
-}
-
 impl Iterator for DecodeStream<'_, '_> {
     type Item = Result<OtapMetricRecords, DecodeError>;
 
@@ -1288,12 +1272,15 @@ impl Iterator for DecodeStream<'_, '_> {
             self.done = true;
             return Some(Err(err));
         }
-        match self.step() {
+        match self.decoder.ingest_prom_entries::<true>(
+            &mut self.parser,
+            self.default_ts_ns,
+            self.max_data_points,
+            &mut self.pending_series,
+            &mut self.done,
+        ) {
             Ok(Some(batch)) => Some(Ok(batch)),
-            Ok(None) => {
-                self.done = true;
-                None
-            }
+            Ok(None) => None,
             Err(err) => {
                 self.done = true;
                 self.decoder.reset_scrape();
