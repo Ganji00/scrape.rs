@@ -77,6 +77,7 @@ fn bench_arrow_decode(c: &mut Criterion) {
     let typed_simple = filter_counter_gauge_families(&full);
 
     let opts = DecodeOptions::new().with_timestamp_ms(0);
+    let stream_256_opts = opts.with_max_data_points_per_batch(256);
     let mut group = c.benchmark_group("ParsePromText");
 
     group.throughput(Throughput::Bytes(nometa.len() as u64));
@@ -89,6 +90,23 @@ fn bench_arrow_decode(c: &mut Criterion) {
             black_box(records);
         });
     });
+    group.bench_function("alltypes.237mfs.nometa.stream_16k", |b| {
+        let mut decoder = ArrowDecoder::new();
+        b.iter(|| {
+            for chunk in decoder.decode_stream(black_box(&nometa), &Format::TEXT, &opts) {
+                black_box(chunk.unwrap());
+            }
+        });
+    });
+    group.bench_function("alltypes.237mfs.nometa.stream_256", |b| {
+        let mut decoder = ArrowDecoder::new();
+        b.iter(|| {
+            for chunk in decoder.decode_stream(black_box(&nometa), &Format::TEXT, &stream_256_opts)
+            {
+                black_box(chunk.unwrap());
+            }
+        });
+    });
 
     group.throughput(Throughput::Bytes(typed_simple.len() as u64));
     group.bench_function("alltypes.209mfs.counter_gauge", |b| {
@@ -98,6 +116,24 @@ fn bench_arrow_decode(c: &mut Criterion) {
                 .decode(black_box(&typed_simple), &Format::TEXT, &opts)
                 .unwrap();
             black_box(records);
+        });
+    });
+    group.bench_function("alltypes.209mfs.counter_gauge.stream_16k", |b| {
+        let mut decoder = ArrowDecoder::new();
+        b.iter(|| {
+            for chunk in decoder.decode_stream(black_box(&typed_simple), &Format::TEXT, &opts) {
+                black_box(chunk.unwrap());
+            }
+        });
+    });
+    group.bench_function("alltypes.209mfs.counter_gauge.stream_256", |b| {
+        let mut decoder = ArrowDecoder::new();
+        b.iter(|| {
+            for chunk in
+                decoder.decode_stream(black_box(&typed_simple), &Format::TEXT, &stream_256_opts)
+            {
+                black_box(chunk.unwrap());
+            }
         });
     });
 

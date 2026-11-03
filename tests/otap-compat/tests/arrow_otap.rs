@@ -18,7 +18,8 @@ use std::fs;
 use std::path::Path;
 
 use expfmt::arrow::{
-    ArrowDecoder, DecodeOptions, MetricPayloadType, OtapMetricRecords, PROMETHEUS_TYPE_METADATA_KEY,
+    ArrowDecoder, DecodeError, DecodeOptions, MetricPayloadType, OtapMetricRecords,
+    PROMETHEUS_TYPE_METADATA_KEY,
 };
 use expfmt::format::Format;
 use otel_arrow_dfe_pdata::otap::{Metrics, OtapArrowRecords, OtapBatchStore};
@@ -155,9 +156,10 @@ fn counter_gauge_and_untyped_round_trip_through_otap_and_otlp() {
         "# TYPE http_requests_total counter\n",
         "http_requests_total{status=\"200\",method=\"GET\"} 42 1700000000123\n",
         "http_requests_total{method=\"POST\",status=\"500\",empty=\"\"} 3\n",
+        "http_requests_total{method=\"DELETE\",status=\"204\"} 1 1700000000999\n",
+        "# HELP memory_bytes Resident memory in bytes.\n",
         "# TYPE memory_bytes gauge\n",
         "memory_bytes{empty=\"\"} 1048576\n",
-        "# HELP memory_bytes Late help after gauge sample is allowed.\n",
         "# HELP bare_empty_help\n",
         "# HELP bare_empty_help \n",
         "# TYPE explicit_untyped untyped\n",
@@ -166,8 +168,6 @@ fn counter_gauge_and_untyped_round_trip_through_otap_and_otlp() {
         "# HELP \"utf8.metric\\\"name\\\\\\n\" Quoted UTF-8 metric with escapes.\n",
         "# TYPE \"utf8.metric\\\"name\\\\\\n\" counter\n",
         "{ \"utf8.metric\\\"name\\\\\\n\", \"k.1©\\\"\"=\"v\\\"\\\\\\n1\" } 7.5\n",
-        // Interleaved additional sample for the first metric family.
-        "http_requests_total{method=\"DELETE\",status=\"204\"} 1 1700000000999\n",
         // Metadata-only family with zero samples must be omitted.
         "# HELP zero_samples_total Unused family.\n",
         "# TYPE zero_samples_total counter\n",
@@ -223,7 +223,7 @@ fn counter_gauge_and_untyped_round_trip_through_otap_and_otlp() {
         },
         Metric {
             name: "memory_bytes".to_owned(),
-            description: "Late help after gauge sample is allowed.".to_owned(),
+            description: "Resident memory in bytes.".to_owned(),
             unit: String::new(),
             metadata: vec![kv_str(PROMETHEUS_TYPE_METADATA_KEY, "gauge")],
             data: Some(metric::Data::Gauge(Gauge {
@@ -388,4 +388,83 @@ fn decodes_upstream_237mfs_fixtures_into_valid_otap() {
         .decode_transport_optimized_ids()
         .expect("typed transport decode IDs succeeds");
     let _ = otap_to_otlp(&typed_otap);
+}
+
+#[test]
+fn decode_stream_chunks_validate_in_otap_and_handle_more_than_u16_max_metrics() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/textparse");
+    let full = fs::read_to_string(root.join("alltypes.237mfs.prom.txt")).unwrap();
+    let typed_simple = filter_counter_gauge_families(&full);
+
+    let mut decoder = ArrowDecoder::new();
+    let single_opts = DecodeOptions::new().with_timestamp_ms(1_700_000_000_000);
+    let single = decoder
+        .decode(&typed_simple, &Format::TEXT, &single_opts)
+        .expect("single-batch decode succeeds");
+    let single_otlp = otap_to_otlp(&to_otap_arrow_records(&single));
+
+    // Stream the same payload in 64-point chunks and verify semantic equivalence with single-batch.
+    let stream_opts = single_opts.with_max_data_points_per_batch(64);
+    let mut chunk_count = 0usize;
+    let mut streamed_dps = 0usize;
+    let mut streamed_otlp = Vec::new();
+    for chunk_res in decoder.decode_stream(&typed_simple, &Format::TEXT, &stream_opts) {
+        let chunk = chunk_res.expect("streamed chunk decodes");
+        assert!(!chunk.is_empty());
+        assert!(chunk.num_data_points() <= 64);
+        chunk_count += 1;
+        streamed_dps += chunk.num_data_points();
+
+        let mut otap = to_otap_arrow_records(&chunk);
+        otap.encode_transport_optimized()
+            .expect("chunk transport optimize succeeds");
+        otap.decode_transport_optimized_ids()
+            .expect("chunk transport decode IDs succeeds");
+        streamed_otlp.push(otap_to_otlp(&otap));
+    }
+    assert!(chunk_count > 5);
+    assert_eq!(streamed_dps, single.num_data_points());
+    assert_equivalent(&[single_otlp], &streamed_otlp);
+
+    // 70,000 metric families exceed OTAP's `u16` per-batch metric ID limit in single-batch
+    // `decode`, whereas `decode_stream` splits cleanly at 65,536 metrics while preserving metadata
+    // declared right across the flush boundary.
+    let mut huge = String::with_capacity(70_000 * 16);
+    for i in 0..70_000usize {
+        if i == 65_536 {
+            huge.push_str("# HELP m_65536 Boundary counter across u16 batch split.\n");
+            huge.push_str("# TYPE m_65536 counter\n");
+        }
+        huge.push_str(&format!("m_{i} {i}\n"));
+    }
+
+    let err = decoder
+        .decode(huge.as_bytes(), &Format::TEXT, &single_opts)
+        .expect_err("single-batch decode must reject >65,536 metrics");
+    assert!(matches!(err, DecodeError::CapacityOverflow { .. }));
+
+    let large_batch_opts = single_opts.with_max_data_points_per_batch(100_000);
+    let chunks: Vec<OtapMetricRecords> = decoder
+        .decode_stream(huge.as_bytes(), &Format::TEXT, &large_batch_opts)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("decode_stream splits >65,536 metrics across OTAP batches");
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].num_metrics(), 65_536);
+    assert_eq!(chunks[0].num_data_points(), 65_536);
+    assert_eq!(chunks[1].num_metrics(), 70_000 - 65_536);
+    assert_eq!(chunks[1].num_data_points(), 70_000 - 65_536);
+    assert_matches_otap_schema(&chunks[0]);
+    assert_matches_otap_schema(&chunks[1]);
+
+    let second_otap = to_otap_arrow_records(&chunks[1]);
+    let OtlpProtoMessage::Metrics(second_otlp) = otap_to_otlp(&second_otap) else {
+        panic!("expected OTLP MetricsData");
+    };
+    let boundary_metric = &second_otlp.resource_metrics[0].scope_metrics[0].metrics[0];
+    assert_eq!(boundary_metric.name, "m_65536");
+    assert_eq!(
+        boundary_metric.description,
+        "Boundary counter across u16 batch split."
+    );
+    assert!(matches!(boundary_metric.data, Some(metric::Data::Sum(_))));
 }
