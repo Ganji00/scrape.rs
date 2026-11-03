@@ -313,6 +313,10 @@ impl CurrentFamily {
             return Ok(());
         }
 
+        // NOTE: Previously seen family names are intentionally not tracked across transitions so
+        // `decode_stream` stays `O(chunk)` in memory and untyped `.nometa` scrapes with interleaved
+        // `_sum` and `_count` lines still decode. A non-contiguous repetition of an earlier name
+        // starts a fresh untyped family run unless preceded by its own `# TYPE` or `# HELP`.
         self.active = true;
         self.raw_name.clear();
         self.raw_name.extend_from_slice(raw_name);
@@ -462,6 +466,8 @@ impl ArrowDecoder {
     /// columnar staging vectors and label string interners without materializing intermediate
     /// per-sample structs or per-string allocations. Metric families are decoded as contiguous
     /// runs, with `# HELP` and `# TYPE` lines appearing before that family's samples.
+    /// Non-contiguous repetitions of an earlier metric name are not reassembled or rejected; each
+    /// run starts with fresh `untyped` metadata unless preceded by its own `# HELP` or `# TYPE`.
     ///
     /// `decode` finalizes `input` into a single [`OtapMetricRecords`] batch set, adaptively
     /// omitting unused optional OTAP columns (`description`, `id`, `time_unix_nano`) and
@@ -1747,5 +1753,57 @@ mod tests {
             Some(Err(DecodeError::UnsupportedFormat(_)))
         ));
         assert!(bad_fmt.next().is_none());
+    }
+
+    #[test]
+    fn interleaved_family_starts_fresh_untyped_run() {
+        let mut dec = ArrowDecoder::new();
+        let opts = DecodeOptions::default();
+        let payload = b"# TYPE a counter\na{x=\"1\"} 1\nb 2\na{x=\"2\"} 3\n";
+
+        let records = dec.decode(payload, &Format::TEXT, &opts).unwrap();
+        assert_eq!(records.num_metrics(), 3);
+        assert_eq!(records.num_data_points(), 3);
+
+        let um = records.univariate_metrics().unwrap();
+        let names = um
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let metric_types = um
+            .column_by_name("metric_type")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .unwrap();
+        let is_monotonic = um
+            .column_by_name("is_monotonic")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+
+        assert_eq!(names.value(0), "a");
+        assert_eq!(metric_types.value(0), OTAP_METRIC_TYPE_SUM);
+        assert!(!is_monotonic.is_null(0));
+        assert!(is_monotonic.value(0));
+
+        assert_eq!(names.value(1), "b");
+        assert_eq!(metric_types.value(1), OTAP_METRIC_TYPE_GAUGE);
+        assert!(is_monotonic.is_null(1));
+
+        // The second run of `a` is non-contiguous and has no `# TYPE` of its own, so it decodes as
+        // a separate untyped (`Gauge`) metric rather than failing the scrape.
+        assert_eq!(names.value(2), "a");
+        assert_eq!(metric_types.value(2), OTAP_METRIC_TYPE_GAUGE);
+        assert!(is_monotonic.is_null(2));
+
+        let streamed: Vec<_> = dec
+            .decode_stream(payload, &Format::TEXT, &opts)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(streamed, vec![records]);
     }
 }
