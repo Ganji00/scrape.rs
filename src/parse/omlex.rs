@@ -230,7 +230,7 @@ impl<'a> Lexer<'a> {
             return self.emit(State::Meta1, token);
         }
         if self.next() == b'\n' {
-            return self.emit(State::Init, token);
+            self.next();
         }
         self.state = State::Init;
         token

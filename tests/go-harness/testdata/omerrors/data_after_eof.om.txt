@@ -1,0 +1,4 @@
+# TYPE a counter
+a_total 1
+# EOF
+a_total 2

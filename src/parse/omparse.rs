@@ -49,12 +49,12 @@ pub struct OpenMetricsParser<'a> {
     metric_type: MetricType,
     value: f64,
     timestamp: Option<i64>,
-    /// Escaped label names and values, without quotes. Values are already checked to be UTF-8.
-    labels: Vec<(&'a [u8], &'a [u8])>,
+    /// Escaped label names and values, without quotes.
+    labels: Vec<(&'a [u8], &'a str)>,
     exemplar: Option<(f64, Option<i64>)>,
-    exemplar_labels: Vec<(&'a [u8], &'a [u8])>,
+    exemplar_labels: Vec<(&'a [u8], &'a str)>,
     /// Labels buffer lent to the start timestamp lookahead, so it does not allocate per call.
-    peek_labels: Vec<(&'a [u8], &'a [u8])>,
+    peek_labels: Vec<(&'a [u8], &'a str)>,
     /// Go's start timestamp cache: the series key and start timestamp of the last hit.
     start_timestamp_key: Vec<u8>,
     start_timestamp: Option<i64>,
@@ -165,13 +165,13 @@ impl<'a> OpenMetricsParser<'a> {
     fn parse_label_values(&mut self, exemplar: bool) -> Result<(), ParseError> {
         let mut token = self.lexer.lex();
         loop {
-            let (mut start, mut end) = (self.lexer.token_start, self.lexer.pos);
-            let quoted = match token {
+            let (start, end) = match token {
                 Token::BraceClose => return Ok(()),
-                Token::LName => false,
-                Token::QString => true,
+                Token::LName => (self.lexer.token_start, self.lexer.pos),
+                Token::QString => (self.lexer.token_start + 1, self.lexer.pos - 1),
                 _ => return Err(self.unexpected("expected label name")),
             };
+            let quoted = token == Token::QString;
             token = self.lexer.lex();
             if quoted && matches!(token, Token::Comma | Token::BraceClose) {
                 if exemplar {
@@ -182,16 +182,12 @@ impl<'a> OpenMetricsParser<'a> {
                         offset: self.line_start,
                     });
                 }
-                self.name = Some((start + 1, end - 1));
+                self.name = Some((start, end));
                 if token == Token::BraceClose {
                     return Ok(());
                 }
                 token = self.lexer.lex();
                 continue;
-            }
-            if quoted {
-                start += 1;
-                end -= 1;
             }
             if token != Token::Equal {
                 return Err(self.unexpected("expected equal"));
@@ -199,15 +195,14 @@ impl<'a> OpenMetricsParser<'a> {
             if self.lexer.lex() != Token::LValue {
                 return Err(self.unexpected("expected label value"));
             }
-            let value = self.lexer.token();
-            if std::str::from_utf8(value).is_err() {
-                return Err(ParseError::InvalidUtf8 {
+            let value =
+                std::str::from_utf8(self.lexer.token()).map_err(|_| ParseError::InvalidUtf8 {
                     offset: self.lexer.token_start,
-                });
-            }
+                })?;
             // The token can end in NUL bytes after the closing quote. Go drops only the last
-            // byte, so it keeps the quote and all but the last NUL in the value.
-            let close = value.iter().rposition(|&byte| byte == b'"').unwrap_or(0);
+            // byte, so it keeps the quote and all but the last NUL in the value. We cut at the
+            // quote.
+            let close = value.rfind('"').unwrap_or(0);
             let label = (&self.lexer.input[start..end], &value[1..close.max(1)]);
             if exemplar {
                 self.exemplar_labels.push(label);
@@ -325,7 +320,7 @@ impl<'a> OpenMetricsParser<'a> {
         self.labels
             .iter()
             .filter(|(name, _)| !is_float_label(self.metric_type, name))
-            .flat_map(|(name, value)| name.iter().chain(value.iter()))
+            .flat_map(|(name, value)| name.iter().chain(value.as_bytes()))
             .chain(family)
             .copied()
     }
@@ -349,10 +344,8 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
             self.line_start = self.lexer.pos;
             self.name = None;
             self.labels.clear();
-            if !self.ignore_exemplar {
-                self.exemplar = None;
-                self.exemplar_labels.clear();
-            }
+            self.exemplar = None;
+            self.exemplar_labels.clear();
             let entry = match self.lexer.lex() {
                 Token::EofWord => {
                     if self.lexer.lex() != Token::Eof {
@@ -399,10 +392,10 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
         buf.clear();
         buf.push(
             Cow::Borrowed(METRIC_NAME_LABEL),
-            unescape_label(self.metric_name()),
+            unescape_name(self.metric_name()),
         );
         for &(name, value) in &self.labels {
-            let name = unescape_label(name);
+            let name = unescape_name(name);
             let value = normalize_float_label(self.metric_type, &name, unescape_label(value));
             buf.push(name, value);
         }
@@ -414,10 +407,7 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
         let exemplar = self.exemplar.take()?;
         // Go keeps exemplar labels escaped.
         for &(name, value) in &self.exemplar_labels {
-            buf.push(
-                String::from_utf8_lossy(name),
-                String::from_utf8_lossy(value),
-            );
+            buf.push(String::from_utf8_lossy(name), Cow::Borrowed(value));
         }
         buf.sort();
         Some(exemplar)
@@ -550,11 +540,19 @@ fn unescape(raw: &[u8]) -> Cow<'_, [u8]> {
     Cow::Owned(out)
 }
 
-/// Unescapes a label name or value. Go does not check that names are UTF-8, so invalid
+/// Unescapes a metric or label name. Go does not check that names are UTF-8, so invalid
 /// bytes become U+FFFD here instead of failing the parse.
-fn unescape_label(raw: &[u8]) -> Cow<'_, str> {
-    match unescape(raw) {
-        Cow::Borrowed(raw) => String::from_utf8_lossy(raw),
+fn unescape_name(raw: &[u8]) -> Cow<'_, str> {
+    match String::from_utf8_lossy(raw) {
+        Cow::Borrowed(name) => unescape_label(name),
+        Cow::Owned(name) => Cow::Owned(unescape_label(&name).into_owned()),
+    }
+}
+
+fn unescape_label(raw: &str) -> Cow<'_, str> {
+    match unescape(raw.as_bytes()) {
+        Cow::Borrowed(_) => Cow::Borrowed(raw),
+        // Replacing ASCII escapes keeps valid UTF-8 valid, so nothing is lost here.
         Cow::Owned(bytes) => Cow::Owned(
             String::from_utf8(bytes)
                 .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()),
@@ -657,7 +655,6 @@ mod tests {
             &b"# TYPE a counter\na_total 1\na_created NaN\n# EOF\n"[..],
             b"# TYPE a counter\na_total 1\na_created +Inf\n# EOF\n",
         ] {
-            let input: &'static [u8] = input;
             assert_eq!(first_start_timestamp(input), None);
         }
     }

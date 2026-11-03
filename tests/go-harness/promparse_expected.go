@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/prometheus/prometheus/model/exemplar"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/textparse"
 )
@@ -42,25 +43,37 @@ var promParseInputs = []string{
 func writePromParseExpected(outRoot string) ([]string, error) {
 	var written []string
 	for _, input := range promParseInputs {
-		data, err := os.ReadFile(filepath.Join(outRoot, input))
+		err := writeExpected(outRoot, "promparse", input, func(data []byte) string {
+			return renderEntries(textparse.NewPromParser(data, labels.NewSymbolTable(), false), false)
+		})
 		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", input, err)
-		}
-		dstPath := filepath.Join(outRoot, "promparse", input)
-		if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
-			return nil, fmt.Errorf("mkdir %s: %w", filepath.Dir(dstPath), err)
-		}
-		if err := os.WriteFile(dstPath, []byte(renderPromParse(data)), 0o644); err != nil {
-			return nil, fmt.Errorf("write %s: %w", dstPath, err)
+			return nil, err
 		}
 		written = append(written, "promparse/"+input)
 	}
 	return written, nil
 }
 
-func renderPromParse(data []byte) string {
+// writeExpected renders testdata/<input> and writes it to testdata/<outDir>/<input>.
+func writeExpected(outRoot, outDir, input string, render func([]byte) string) error {
+	data, err := os.ReadFile(filepath.Join(outRoot, input))
+	if err != nil {
+		return fmt.Errorf("read %s: %w", input, err)
+	}
+	dstPath := filepath.Join(outRoot, outDir, input)
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", filepath.Dir(dstPath), err)
+	}
+	if err := os.WriteFile(dstPath, []byte(render(data)), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", dstPath, err)
+	}
+	return nil
+}
+
+// renderEntries writes one line per entry, plus an st line per series when
+// startTimestamps is set. src/parse/go_diff_tests.rs writes the same format.
+func renderEntries(parser textparse.Parser, startTimestamps bool) string {
 	var out strings.Builder
-	parser := textparse.NewPromParser(data, labels.NewSymbolTable(), false)
 	var labelSet labels.Labels
 	for {
 		entry, err := parser.Next()
@@ -78,22 +91,48 @@ func renderPromParse(data []byte) string {
 		case textparse.EntryType:
 			name, metricType := parser.Type()
 			fmt.Fprintf(&out, "type %s %s\n", quote(name), metricType)
+		case textparse.EntryUnit:
+			name, unit := parser.Unit()
+			fmt.Fprintf(&out, "unit %s %s\n", quote(name), quote(unit))
 		case textparse.EntryComment:
 			fmt.Fprintf(&out, "comment %s\n", quote(parser.Comment()))
 		case textparse.EntrySeries:
 			series, timestampMillis, value := parser.Series()
-			timestamp := "-"
-			if timestampMillis != nil {
-				timestamp = strconv.FormatInt(*timestampMillis, 10)
-			}
-			fmt.Fprintf(&out, "series %s %016x %s", quote(series), math.Float64bits(value), timestamp)
+			fmt.Fprintf(&out, "series %s %016x %s", quote(series), math.Float64bits(value), formatTimestamp(timestampMillis))
 			parser.Labels(&labelSet)
-			labelSet.Range(func(label labels.Label) {
-				fmt.Fprintf(&out, " %s=%s", quote([]byte(label.Name)), quote([]byte(label.Value)))
-			})
-			out.WriteString("\n")
+			writeLabels(&out, labelSet)
+			var ex exemplar.Exemplar
+			if parser.Exemplar(&ex) {
+				var exemplarTimestamp *int64
+				if ex.HasTs {
+					exemplarTimestamp = &ex.Ts
+				}
+				fmt.Fprintf(&out, "exemplar %016x %s", math.Float64bits(ex.Value), formatTimestamp(exemplarTimestamp))
+				writeLabels(&out, ex.Labels)
+			}
+			// StartTimestamp peeks ahead and overwrites the series, offsets and
+			// value, so it runs last. Without WithOMParserSTSeriesSkipped it
+			// also turns on _created skipping, so it only runs in st mode.
+			if startTimestamps {
+				fmt.Fprintf(&out, "st %d\n", parser.StartTimestamp())
+			}
 		}
 	}
+}
+
+func formatTimestamp(millis *int64) string {
+	if millis == nil {
+		return "-"
+	}
+	return strconv.FormatInt(*millis, 10)
+}
+
+// writeLabels ends the current line.
+func writeLabels(out *strings.Builder, labelSet labels.Labels) {
+	labelSet.Range(func(label labels.Label) {
+		fmt.Fprintf(out, " %s=%s", quote([]byte(label.Name)), quote([]byte(label.Value)))
+	})
+	out.WriteString("\n")
 }
 
 // quote escapes bytes instead of runes so Rust can reproduce it without Go's

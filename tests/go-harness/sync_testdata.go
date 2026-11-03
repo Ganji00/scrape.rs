@@ -69,8 +69,8 @@ func run() error {
 	}
 
 	outRoot := filepath.Clean(filepath.Join("..", "..", "testdata"))
-	if err := cleanOutRoot(outRoot); err != nil {
-		return err
+	if err := os.RemoveAll(outRoot); err != nil {
+		return fmt.Errorf("clean %s: %w", outRoot, err)
 	}
 
 	var synced []string
@@ -90,6 +90,12 @@ func run() error {
 		return err
 	}
 	synced = append(synced, textparseFiles...)
+
+	omErrorFiles, err := copyDirFiles(filepath.Join("testdata", "omerrors"), filepath.Join(outRoot, "omerrors"), outRoot)
+	if err != nil {
+		return err
+	}
+	synced = append(synced, omErrorFiles...)
 
 	astExtracts := []struct {
 		srcFile  string
@@ -158,27 +164,6 @@ func run() error {
 		return fmt.Errorf("write manifest.json: %w", err)
 	}
 
-	return nil
-}
-
-// handWrittenDirs are testdata/ subdirectories that are not generated, so the
-// clean step keeps them.
-var handWrittenDirs = map[string]bool{"omerrors": true}
-
-// cleanOutRoot removes everything in outRoot except handWrittenDirs.
-func cleanOutRoot(outRoot string) error {
-	entries, err := os.ReadDir(outRoot)
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("readdir %s: %w", outRoot, err)
-	}
-	for _, entry := range entries {
-		if handWrittenDirs[entry.Name()] {
-			continue
-		}
-		if err := os.RemoveAll(filepath.Join(outRoot, entry.Name())); err != nil {
-			return fmt.Errorf("clean %s: %w", outRoot, err)
-		}
-	}
 	return nil
 }
 
