@@ -1,6 +1,6 @@
-# `expfmt-rs` specification and implementation plan
+# `expfmt` specification and implementation plan
 
-`expfmt-rs` provides official Rust decoders for Prometheus and OpenMetrics wire exposition formats.
+The `expfmt` crate in `scrape.rs` provides official Rust decoders for Prometheus and OpenMetrics wire exposition formats.
 
 ## Background and goals
 
@@ -25,7 +25,7 @@ The `format` module mirrors [`prometheus/common/expfmt/expfmt.go`](https://githu
 ### ABNF-driven OpenMetrics parsing
 
 OpenMetrics 1.0 defines a normative [ABNF grammar](https://github.com/prometheus/OpenMetrics/blob/main/specification/OpenMetrics.md#abnf) that takes precedence over the prose specification.
-- We will store machine-readable ABNF grammar files in the repository under `specs/openmetrics_1_0.abnf` and `specs/openmetrics_2_0.abnf`.
+- We will store machine-readable ABNF grammar files in the repository under `specs/expfmt/openmetrics_1_0.abnf` and `specs/expfmt/openmetrics_2_0.abnf`.
 - We will either generate the OpenMetrics parser state tables directly from the ABNF or validate a hand-written zero-copy lexer against an ABNF reference parser in tests and fuzzers.
 
 ## Decoding architecture and APIs
@@ -171,14 +171,14 @@ To verify that `ArrowDecoder` meets the [`open-telemetry/otel-arrow#3277`](https
 - Add the `go generate` fixture sync tool in `tests/go-harness` and generate initial `testdata/` fixtures from [`prometheus/prometheus/model/textparse`](https://github.com/prometheus/prometheus/tree/main/model/textparse) and [`prometheus/common/expfmt`](https://github.com/prometheus/common/tree/main/expfmt), verified in CI with `git diff --exit-code`.
 
 ### Phase 2: Prometheus Text 0.0.4 and OpenMetrics 1.0 across Layer 0, Layer 1, and Layer 2
-- Add `specs/openmetrics_1_0.abnf` from the [OpenMetrics 1.0 specification](https://github.com/prometheus/OpenMetrics/blob/main/specification/OpenMetrics.md#abnf).
+- Add `specs/expfmt/openmetrics_1_0.abnf` from the [OpenMetrics 1.0 specification](https://github.com/prometheus/OpenMetrics/blob/main/specification/OpenMetrics.md#abnf).
 - Implement Layer 0 `Parser` for Prometheus Text 0.0.4 and OpenMetrics 1.0, including UTF-8 quoting and unescaping, exemplars, `_created` timestamps, `# UNIT`, and `# EOF` validation.
 - Implement Layer 1 `arrow::ArrowDecoder` targeting [`open-telemetry/otel-arrow#3277`](https://github.com/open-telemetry/otel-arrow/issues/3277), assembling classic histograms, summaries, counters, gauges, untyped, info, and stateset metrics into OTAP Arrow `RecordBatch` tables.
 - Implement Layer 2 `dto::decode_to_metric_families` and `dto::arrow_to_metric_families` on top of `ArrowDecoder`.
 - Wire up the Go `prometheus/common/expfmt` encoder harness and [`otel-arrow-dfe-pdata`](https://github.com/open-telemetry/otel-arrow/blob/main/rust/otap-dataflow/crates/pdata/Cargo.toml) validation in CI for round-trip differential and OTAP schema testing across Prometheus Text and OpenMetrics 1.0.
 
 ### Phase 3: OpenMetrics 2.0 and Prometheus protobuf decoding
-- Implement Layer 0, Layer 1, and Layer 2 support for OpenMetrics 2.0 matching [`openmetrics2parse.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/openmetrics2parse.go) (native histograms in text format, `st@` start timestamps, composite values) and add `specs/openmetrics_2_0.abnf`.
+- Implement Layer 0, Layer 1, and Layer 2 support for OpenMetrics 2.0 matching [`openmetrics2parse.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/openmetrics2parse.go) (native histograms in text format, `st@` start timestamps, composite values) and add `specs/expfmt/openmetrics_2_0.abnf`.
 - Implement delimited and text protobuf decoding (`FmtProtoDelim`, `FmtProtoText`, `FmtProtoCompact`), including native sparse histograms and NHCB conversion matching [`protobufparse.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/protobufparse.go) and [`nhcbparse.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/nhcbparse.go).
 - Extend the Go `expfmt` encoder harness to cover `FmtOpenMetrics_2_0_0` and `FmtProtoDelim`.
 
