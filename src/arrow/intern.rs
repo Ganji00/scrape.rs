@@ -74,12 +74,6 @@ pub(super) struct StringInterner {
     buckets: Vec<Bucket>,
 }
 
-impl Default for StringInterner {
-    fn default() -> Self {
-        Self::with_capacity(64, 1024)
-    }
-}
-
 impl StringInterner {
     pub(super) fn with_capacity(strings: usize, byte_cap: usize) -> Self {
         let bucket_cap = (strings.saturating_mul(2)).next_power_of_two().max(16);
