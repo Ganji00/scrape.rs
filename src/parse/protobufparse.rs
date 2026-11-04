@@ -255,11 +255,11 @@ impl<'a> ProtobufParser<'a> {
             // A FloatBuf fits every f64.
             let _ = format_openmetrics_float(value, &mut magic_value);
         }
-        // TODO: collects the labels per series to sort them, reuse a buffer if it shows up
-        // in profiles.
+        // TODO: collects the labels per series to sort them, measure with the Phase 4 benchmarks.
+        let mut entry_bytes = std::mem::take(&mut self.entry_bytes);
+        entry_bytes.clear();
         let mut pairs: Vec<(&str, &str)> = self.label_pairs(&magic_value).collect();
         pairs.sort_by(|left, right| left.0.cmp(right.0));
-        let mut entry_bytes = Vec::new();
         for (name, value) in pairs {
             if name == METRIC_NAME_LABEL {
                 entry_bytes.extend_from_slice(value.as_bytes());
@@ -310,15 +310,18 @@ impl<'a> ProtobufParser<'a> {
             .get(self.metric_index)
             .and_then(|metric| metric.histogram.as_ref())
             .unwrap_or(&EMPTY_DTO_HISTOGRAM);
+        let name = self.family.name.as_str();
         self.redo_classic = self.parse_classic_histograms && !source.bucket.is_empty();
         self.is_float_histogram = source.sample_count_float > 0.0 || source.zero_count_float > 0.0;
         if self.is_float_histogram {
             check_span_buckets(
+                name,
                 "positive",
                 &source.positive_span,
                 source.positive_count.len(),
             )?;
             check_span_buckets(
+                name,
                 "negative",
                 &source.negative_span,
                 source.negative_count.len(),
@@ -326,16 +329,22 @@ impl<'a> ProtobufParser<'a> {
             let target = &mut self.float_histogram;
             target.count = source.sample_count_float;
             target.zero_count = source.zero_count_float;
-            copy_buckets(&mut target.positive_buckets, &source.positive_count);
-            copy_buckets(&mut target.negative_buckets, &source.negative_count);
+            source
+                .positive_count
+                .clone_into(&mut target.positive_buckets);
+            source
+                .negative_count
+                .clone_into(&mut target.negative_buckets);
             fill_histogram(target, source, counter_reset_hint);
         } else {
             check_span_buckets(
+                name,
                 "positive",
                 &source.positive_span,
                 source.positive_delta.len(),
             )?;
             check_span_buckets(
+                name,
                 "negative",
                 &source.negative_span,
                 source.negative_delta.len(),
@@ -343,8 +352,12 @@ impl<'a> ProtobufParser<'a> {
             let target = &mut self.int_histogram;
             target.count = source.sample_count;
             target.zero_count = source.zero_count;
-            copy_buckets(&mut target.positive_buckets, &source.positive_delta);
-            copy_buckets(&mut target.negative_buckets, &source.negative_delta);
+            source
+                .positive_delta
+                .clone_into(&mut target.positive_buckets);
+            source
+                .negative_delta
+                .clone_into(&mut target.negative_buckets);
             fill_histogram(target, source, counter_reset_hint);
         }
         Ok(())
@@ -494,7 +507,7 @@ impl<'a> Parser<'a> for ProtobufParser<'a> {
         (&self.entry_bytes, self.family.unit.as_bytes())
     }
 
-    fn comment(&self) -> &[u8] {
+    fn comment(&self) -> &'a [u8] {
         b""
     }
 
@@ -663,6 +676,7 @@ fn timestamp_millis(timestamp: &prost_types::Timestamp) -> i64 {
 
 /// Go's `checkProtoSpanBucketConsistency`, which keeps malformed spans out of compaction.
 fn check_span_buckets(
+    name: &str,
     side: &str,
     spans: &[dto::BucketSpan],
     buckets: usize,
@@ -670,15 +684,10 @@ fn check_span_buckets(
     let total: u64 = spans.iter().map(|span| u64::from(span.length)).sum();
     if total != buckets as u64 {
         return Err(ParseError::InvalidProtobuf(format!(
-            "{side} side: spans require {total} buckets, have {buckets}"
+            "histogram {name:?}: {side} side: spans require {total} buckets, have {buckets}"
         )));
     }
     Ok(())
-}
-
-fn copy_buckets<B: Copy>(target: &mut Vec<B>, source: &[B]) {
-    target.clear();
-    target.extend_from_slice(source);
 }
 
 /// Copies the shared fields and spans, then compacts like Go's `Compact(0)`.
@@ -922,7 +931,7 @@ mod tests {
         family.metric.extend(second_bad.metric);
         assert!(matches!(
             parse_all(&delimited(&[family])),
-            Err(ParseError::InvalidProtobuf(_))
+            Err(ParseError::InvalidProtobuf(message)) if message.starts_with("histogram \"h\": ")
         ));
 
         assert!(matches!(

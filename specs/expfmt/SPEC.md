@@ -83,7 +83,7 @@ pub trait Parser<'a> {
     fn help(&self) -> (&[u8], Cow<'_, [u8]>);
     fn metric_type(&self) -> (&[u8], MetricType);
     fn unit(&self) -> (&[u8], &[u8]);
-    fn comment(&self) -> &[u8];
+    fn comment(&self) -> &'a [u8];
 
     /// Returns the raw series bytes, optional sample timestamp in ms, and float64 value.
     fn series(&self) -> (&[u8], Option<i64>, f64);
@@ -91,14 +91,17 @@ pub trait Parser<'a> {
     /// Returns the raw series bytes, optional timestamp in ms, and parsed native histogram.
     fn histogram(&self) -> (&[u8], Option<i64>, HistogramRef<'_>);
 
-    /// Returns the start timestamp in ms if present via `st@...` or `_created`.
-    fn start_timestamp(&self) -> Option<i64>;
+    /// Returns the start timestamp in ms if present via `st@...`, `_created`, or the protobuf
+    /// `start_timestamp` field.
+    fn start_timestamp(&mut self) -> Option<i64>;
 
     /// Populates the caller's reusable label buffer for the current sample.
     fn labels(&self, buf: &mut LabelsBuffer<'a>);
 
-    /// Iterates over exemplars attached to the current sample.
-    fn exemplars(&self, buf: &mut ExemplarsBuffer<'a>) -> Result<(), ParseError>;
+    /// Fills `buf` with the labels of the next exemplar of the current sample and returns its
+    /// value and optional timestamp in ms. A native histogram can have several exemplars, so
+    /// call it until it returns `None`.
+    fn exemplar(&mut self, buf: &mut LabelsBuffer<'a>) -> Option<(f64, Option<i64>)>;
 }
 ```
 

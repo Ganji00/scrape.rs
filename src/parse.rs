@@ -15,7 +15,6 @@
 //! [`prometheus/prometheus/model/textparse`](https://github.com/prometheus/prometheus/tree/main/model/textparse).
 
 use std::borrow::Cow;
-use std::sync::LazyLock;
 
 mod float;
 #[cfg(test)]
@@ -120,7 +119,18 @@ pub enum HistogramRef<'h> {
     Float(&'h Histogram<f64, f64>),
 }
 
-static EMPTY_HISTOGRAM: LazyLock<Histogram<u64, i64>> = LazyLock::new(Histogram::default);
+static EMPTY_HISTOGRAM: Histogram<u64, i64> = Histogram {
+    counter_reset_hint: CounterResetHint::Unknown,
+    schema: 0,
+    zero_threshold: 0.0,
+    zero_count: 0,
+    count: 0,
+    sum: 0.0,
+    positive_spans: Vec::new(),
+    positive_buckets: Vec::new(),
+    negative_spans: Vec::new(),
+    negative_buckets: Vec::new(),
+};
 
 /// Metric type declared by a `# TYPE` line.
 ///
@@ -292,8 +302,8 @@ impl<'a> LabelsBuffer<'a> {
 ///
 /// Accessors return unspecified values when called for a different [`Entry`] kind.
 ///
-/// Byte slices returned by the metadata, series, and histogram accessors borrow from the
-/// parser, because the protobuf parser builds them. Text parsers return slices of the input.
+/// Byte slices returned by the help, type, unit, series, and histogram accessors borrow from
+/// the parser, because the protobuf parser builds them. Text parsers return slices of the input.
 pub trait Parser<'a> {
     /// Advances to the next entry in the exposition stream, returning `Ok(None)` at EOF.
     fn next_entry(&mut self) -> Result<Option<Entry>, ParseError>;
@@ -308,7 +318,7 @@ pub trait Parser<'a> {
     fn metric_type(&self) -> (&[u8], MetricType);
 
     /// Returns the text of the current [`Entry::Comment`], including the leading `#`.
-    fn comment(&self) -> &[u8];
+    fn comment(&self) -> &'a [u8];
 
     /// Returns the metric name and unit of the current [`Entry::Unit`].
     fn unit(&self) -> (&[u8], &[u8]) {
