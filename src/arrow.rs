@@ -1953,7 +1953,9 @@ impl ArrowDecoder {
             _ => false,
         };
         if is_dropped {
-            self.extract_series_labels_into_temp(label_spans, full_input, None)?;
+            for span_idx in 0..label_spans.len() {
+                self.validate_empty_label(span_idx, &label_spans[..=span_idx], full_input)?;
+            }
             self.current_family.has_samples = true;
             return Ok(());
         }
@@ -3957,6 +3959,39 @@ mod tests {
             .unwrap();
         assert_eq!(str_vals.len(), 1);
         assert_eq!(str_vals.value(0), "x");
+
+        // Dropped families (`UntypedPolicy::Drop`) validate duplicate/reserved labels without
+        // interning their keys or values into `NumberDpAttrs` dictionaries.
+        let drop_opts = DecodeOptions::new().with_untyped_policy(UntypedPolicy::Drop);
+        let with_dropped = dec
+            .decode(
+                b"dropped_metric{dropped_k=\"dropped_v\"} 1\n# TYPE kept gauge\nkept{b=\"x\"} 2\n",
+                &Format::TEXT,
+                &drop_opts,
+            )
+            .unwrap();
+        let kept_attrs = with_dropped.number_dp_attrs().unwrap();
+        let kept_keys = kept_attrs
+            .column_by_name("key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt8Type>>()
+            .unwrap()
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(kept_keys.len(), 1);
+        assert_eq!(kept_keys.value(0), "b");
+
+        let dup_dropped = dec
+            .decode(
+                b"dropped_metric{a=\"1\",a=\"2\"} 1\n",
+                &Format::TEXT,
+                &drop_opts,
+            )
+            .unwrap_err();
+        assert!(matches!(dup_dropped, DecodeError::DuplicateLabel { .. }));
     }
 
     #[test]
