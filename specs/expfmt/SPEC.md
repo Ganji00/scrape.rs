@@ -20,7 +20,7 @@ The `format` module mirrors [`prometheus/common/expfmt/expfmt.go`](https://githu
 | Prometheus Text 0.0.4 | `text/plain; version=0.0.4; charset=utf-8` | Classic text exposition, `# HELP` and `# TYPE`, classic histograms and summaries, optional timestamps, UTF-8 quoted metric and label names. |
 | OpenMetrics 1.0 | `application/openmetrics-text; version=1.0.0; charset=utf-8` and `0.0.1` | Strict grammar per the [OpenMetrics 1.0 ABNF specification](https://github.com/prometheus/OpenMetrics/blob/main/specification/OpenMetrics.md#abnf) in RFC 5234, `# UNIT`, `_created` lines, exemplars, `info`, `stateset`, `gaugehistogram`, and mandatory `# EOF`. |
 | OpenMetrics 2.0 | `application/openmetrics-text; version=2.0.0; charset=utf-8` and `2.0.0-rc` | Native histograms in text format, inline start timestamps `st@...`, UTF-8 names, and composite values matching [`model/textparse/openmetrics2parse.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/openmetrics2parse.go). |
-| Prometheus Protobuf | `application/vnd.google.protobuf; proto=io.prometheus.client.MetricFamily; encoding=delimited` plus `text` and `compact-text` | Varint length-delimited `MetricFamily` messages from [`prompb/io/prometheus/client/metrics.proto`](https://github.com/prometheus/prometheus/blob/main/prompb/io/prometheus/client/metrics.proto), native sparse exponential histograms, and custom-bucket native histograms. |
+| Prometheus Protobuf | `application/vnd.google.protobuf; proto=io.prometheus.client.MetricFamily; encoding=delimited` | Varint length-delimited `MetricFamily` messages from [`prompb/io/prometheus/client/metrics.proto`](https://github.com/prometheus/prometheus/blob/main/prompb/io/prometheus/client/metrics.proto) and native sparse exponential histograms. |
 
 ### ABNF-driven OpenMetrics parsing
 
@@ -79,16 +79,17 @@ pub trait Parser<'a> {
     /// Advances to the next entry in the exposition stream, returning `Ok(None)` at EOF.
     fn next_entry(&mut self) -> Result<Option<Entry>, ParseError>;
 
-    fn help(&self) -> (&'a [u8], Cow<'a, [u8]>);
-    fn metric_type(&self) -> (&'a [u8], MetricType);
-    fn unit(&self) -> (&'a [u8], &'a [u8]);
-    fn comment(&self) -> &'a [u8];
+    // These slices borrow from the parser, because the protobuf parser builds them.
+    fn help(&self) -> (&[u8], Cow<'_, [u8]>);
+    fn metric_type(&self) -> (&[u8], MetricType);
+    fn unit(&self) -> (&[u8], &[u8]);
+    fn comment(&self) -> &[u8];
 
     /// Returns the raw series bytes, optional sample timestamp in ms, and float64 value.
-    fn series(&self) -> (&'a [u8], Option<i64>, f64);
+    fn series(&self) -> (&[u8], Option<i64>, f64);
 
     /// Returns the raw series bytes, optional timestamp in ms, and parsed native histogram.
-    fn histogram(&self) -> (&'a [u8], Option<i64>, HistogramRef<'a>);
+    fn histogram(&self) -> (&[u8], Option<i64>, HistogramRef<'_>);
 
     /// Returns the start timestamp in ms if present via `st@...` or `_created`.
     fn start_timestamp(&self) -> Option<i64>;
@@ -179,7 +180,8 @@ To verify that `ArrowDecoder` meets the [`open-telemetry/otel-arrow#3277`](https
 
 ### Phase 3: OpenMetrics 2.0 and Prometheus protobuf decoding
 - Implement Layer 0, Layer 1, and Layer 2 support for OpenMetrics 2.0 matching [`openmetrics2parse.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/openmetrics2parse.go) (native histograms in text format, `st@` start timestamps, composite values) and add `specs/expfmt/openmetrics_2_0.abnf`.
-- Implement delimited and text protobuf decoding (`FmtProtoDelim`, `FmtProtoText`, `FmtProtoCompact`), including native sparse histograms and NHCB conversion matching [`protobufparse.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/protobufparse.go) and [`nhcbparse.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/nhcbparse.go).
+- Implement delimited protobuf decoding (`FmtProtoDelim`), including native sparse histograms, start timestamps, and exemplars, matching [`protobufparse.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/protobufparse.go).
+- Out of scope: `FmtProtoText` and `FmtProtoCompact`, because Prometheus only scrapes `encoding=delimited` ([config.go#L584](https://github.com/prometheus/prometheus/blob/v0.315.1/config/config.go#L584)), and NHCB conversion, because it is opt-in in Prometheus ([interface.go#L209-L228](https://github.com/prometheus/prometheus/blob/v0.315.1/model/textparse/interface.go#L209-L228)).
 - Extend the Go `expfmt` encoder harness to cover `FmtOpenMetrics_2_0_0` and `FmtProtoDelim`.
 
 ### Phase 4: Relabeling hooks, pooling, benchmarks, fuzzing, and initial release

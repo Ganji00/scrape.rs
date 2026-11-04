@@ -261,6 +261,8 @@ impl DecodeError {
             ParseError::MissingEof => Self::MissingEof,
             ParseError::DataAfterEof { offset } => Self::DataAfterEof { offset },
             ParseError::InvalidUnit { metric, unit } => Self::InvalidUnit { metric, unit },
+            // `ArrowDecoder` only runs `PromParser`; protobuf input arrives with #22.
+            ParseError::InvalidProtobuf(_) => unreachable!("PromParser returned a protobuf error"),
         }
     }
 }

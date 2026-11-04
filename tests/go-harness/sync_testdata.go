@@ -20,7 +20,9 @@
 // It also writes the entries textparse.NewPromParser returns for each Prometheus
 // text fixture to testdata/promparse/, and the entries
 // textparse.NewOpenMetricsParser returns for each OpenMetrics fixture to
-// testdata/omparse/.
+// testdata/omparse/. It also marshals the createTestProtoBuf inputs from
+// protobufparse_test.go into testdata/textparse/TestProtobufParse.pb and writes
+// the entries textparse.NewProtobufParser returns to testdata/protobufparse/.
 package main
 
 import (
@@ -140,6 +142,12 @@ func run() error {
 		synced = append(synced, filepath.ToSlash(rel))
 	}
 
+	protobufInput, err := writeProtobufParseInput(outRoot, filepath.Join(promMod.Dir, "model", "textparse", "protobufparse_test.go"))
+	if err != nil {
+		return err
+	}
+	synced = append(synced, protobufInput)
+
 	promParseFiles, err := writePromParseExpected(outRoot)
 	if err != nil {
 		return err
@@ -151,6 +159,12 @@ func run() error {
 		return err
 	}
 	synced = append(synced, omParseFiles...)
+
+	protobufParseFiles, err := writeProtobufParseExpected(outRoot)
+	if err != nil {
+		return err
+	}
+	synced = append(synced, protobufParseFiles...)
 
 	sort.Strings(synced)
 	m := manifest{
@@ -298,4 +312,43 @@ func evalStringExpr(expr ast.Expr) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+// extractFuncStringSlice returns the elements of the []string literal assigned to
+// varName at the top level of funcName.
+func extractFuncStringSlice(srcFile, funcName, varName string) ([]string, error) {
+	fset := token.NewFileSet()
+	fileNode, err := parser.ParseFile(fset, srcFile, nil, 0)
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: %w", srcFile, err)
+	}
+	for _, decl := range fileNode.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != funcName || fn.Body == nil {
+			continue
+		}
+		for _, stmt := range fn.Body.List {
+			assign, ok := stmt.(*ast.AssignStmt)
+			if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+				continue
+			}
+			if ident, ok := assign.Lhs[0].(*ast.Ident); !ok || ident.Name != varName {
+				continue
+			}
+			lit, ok := assign.Rhs[0].(*ast.CompositeLit)
+			if !ok {
+				return nil, fmt.Errorf("%s: %s is not a composite literal", fset.Position(assign.Pos()), varName)
+			}
+			var out []string
+			for _, elt := range lit.Elts {
+				val, ok := evalStringExpr(elt)
+				if !ok {
+					return nil, fmt.Errorf("%s: non-literal element in %s", fset.Position(elt.Pos()), varName)
+				}
+				out = append(out, val)
+			}
+			return out, nil
+		}
+	}
+	return nil, fmt.Errorf("could not find %s in %s (%s)", varName, funcName, srcFile)
 }

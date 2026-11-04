@@ -1219,6 +1219,7 @@ mod tests {
                     }
                     Entry::Series => {
                         let (s, ts, val) = parser.series();
+                        let s = lossy(s);
                         let st = parser.start_timestamp();
                         parser.labels(&mut buf);
                         let labels = buf
@@ -1232,18 +1233,12 @@ mod tests {
                                 .collect();
                             (ev.to_bits(), ets, elabels)
                         });
-                        (
-                            entry,
-                            lossy(s),
-                            None,
-                            Some((ts, val.to_bits(), st)),
-                            labels,
-                            ex,
-                        )
+                        (entry, s, None, Some((ts, val.to_bits(), st)), labels, ex)
                     }
                     Entry::Comment => {
                         (entry, lossy(parser.comment()), None, None, Vec::new(), None)
                     }
+                    Entry::Histogram => unreachable!("OpenMetrics 1.0 has no native histograms"),
                 };
                 out.push(snap);
             }
@@ -1300,6 +1295,7 @@ mod tests {
                 }
                 Entry::Series => {
                     let (s, ts, val) = parser.series();
+                    let s = lossy(s);
                     let st = parser.start_timestamp();
                     parser.labels(&mut buf);
                     let labels = buf
@@ -1313,16 +1309,10 @@ mod tests {
                             .collect();
                         (ev.to_bits(), ets, elabels)
                     });
-                    (
-                        entry,
-                        lossy(s),
-                        None,
-                        Some((ts, val.to_bits(), st)),
-                        labels,
-                        ex,
-                    )
+                    (entry, s, None, Some((ts, val.to_bits(), st)), labels, ex)
                 }
                 Entry::Comment => (entry, lossy(parser.comment()), None, None, Vec::new(), None),
+                Entry::Histogram => unreachable!("OpenMetrics 1.0 has no native histograms"),
             };
             got.push(snap);
             state = parser.into_state();

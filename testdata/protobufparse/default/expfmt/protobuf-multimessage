@@ -1,0 +1,24 @@
+help "swap_free" "Telegraf collected metric"
+type "swap_free" gauge
+series "swap_freeÿhostÿomsk" 41cd24e000000000 - "__name__"="swap_free" "host"="omsk"
+st 0
+help "swap_in" "Telegraf collected metric"
+type "swap_in" counter
+series "swap_inÿhostÿomsk" 413f000000000000 - "__name__"="swap_in" "host"="omsk"
+st 0
+help "swap_out" "Telegraf collected metric"
+type "swap_out" counter
+series "swap_outÿhostÿomsk" 416e1e0000000000 - "__name__"="swap_out" "host"="omsk"
+st 0
+help "swap_total" "Telegraf collected metric"
+type "swap_total" gauge
+series "swap_totalÿhostÿomsk" 41cd996800000000 - "__name__"="swap_total" "host"="omsk"
+st 0
+help "swap_used" "Telegraf collected metric"
+type "swap_used" gauge
+series "swap_usedÿhostÿomsk" 416d220000000000 - "__name__"="swap_used" "host"="omsk"
+st 0
+help "swap_used_percent" "Telegraf collected metric"
+type "swap_used_percent" gauge
+series "swap_used_percentÿhostÿomsk" 3ff89b25c5b4ea6d - "__name__"="swap_used_percent" "host"="omsk"
+st 0

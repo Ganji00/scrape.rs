@@ -94,7 +94,7 @@ impl<'input> ActiveParser<'input> {
     }
 
     #[inline]
-    fn metric_type(&self) -> (&'input [u8], MetricType) {
+    fn metric_type(&self) -> (&[u8], MetricType) {
         match self {
             Self::Prom(p) => p.metric_type(),
             Self::OpenMetrics(p) => p.metric_type(),
@@ -103,7 +103,7 @@ impl<'input> ActiveParser<'input> {
     }
 
     #[inline]
-    fn unit(&self) -> (&'input [u8], &'input [u8]) {
+    fn unit(&self) -> (&[u8], &[u8]) {
         match self {
             Self::Prom(p) => p.unit(),
             Self::OpenMetrics(p) => p.unit(),
@@ -453,7 +453,8 @@ impl ArrowDecoder {
             };
 
             match entry {
-                Entry::Comment => {}
+                // `Entry::Histogram` arrives with #22.
+                Entry::Comment | Entry::Histogram => {}
                 Entry::Help => self.ingest_help_entry(parser, opts, default_ts_ns)?,
                 Entry::Type => self.ingest_type_entry(parser, opts, default_ts_ns)?,
                 Entry::Unit => self.ingest_unit_entry(parser, opts, default_ts_ns)?,
