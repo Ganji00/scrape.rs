@@ -545,6 +545,7 @@ struct PendingDpGroup {
     attr_start: u32,
     attr_len: u32,
     start_ts_ns: Option<i64>,
+    start_ts_checked: bool,
     ts_ns: Option<i64>,
     count: Option<u64>,
     sum: Option<f64>,
@@ -2046,30 +2047,35 @@ impl ArrowDecoder {
         role: SeriesRole,
         default_ts_ns: Option<i64>,
     ) -> Result<(), DecodeError> {
-        let om_start_ts_ms = if parser.is_openmetrics() {
-            parser.start_timestamp()
-        } else {
-            None
-        };
-        let (_, label_spans, full_input, sample_ts_ms, value) = parser.raw_series_parts();
-        let exemplar_parts = parser.raw_exemplar_parts();
-
         let special_label = match role {
             SeriesRole::HistogramBucket => Some(b"le" as &[u8]),
             SeriesRole::SummaryQuantile => Some(b"quantile" as &[u8]),
             _ => None,
         };
-        let special_bound =
-            self.extract_series_labels_into_temp(label_spans, full_input, special_label)?;
+        let (sample_ts_ms, value, special_bound) = {
+            let (_, label_spans, full_input, sample_ts_ms, value) = parser.raw_series_parts();
+            let bound =
+                self.extract_series_labels_into_temp(label_spans, full_input, special_label)?;
+            (sample_ts_ms, value, bound)
+        };
 
         let group_idx = self.find_or_create_pending_group();
         let sample_ts_ns = match sample_ts_ms {
             Some(ms) => Some(ms_to_ns(ms)?),
             None => None,
         };
-        let om_start_ts_ns = match om_start_ts_ms {
-            Some(ms) => Some(ms_to_ns(ms)?),
-            None => None,
+        let om_start_ts_ns = if !self.pending_groups[group_idx].start_ts_checked {
+            self.pending_groups[group_idx].start_ts_checked = true;
+            match if parser.is_openmetrics() {
+                parser.start_timestamp()
+            } else {
+                None
+            } {
+                Some(ms) => Some(ms_to_ns(ms)?),
+                None => None,
+            }
+        } else {
+            None
         };
 
         let group = &mut self.pending_groups[group_idx];
@@ -2106,8 +2112,9 @@ impl ArrowDecoder {
         if matches!(
             self.current_family.metric_type,
             MetricType::Histogram | MetricType::GaugeHistogram
-        ) && let Some((ex_val, ex_ts_ms, ex_spans)) = exemplar_parts
+        ) && let Some((ex_val, ex_ts_ms, ex_spans)) = parser.raw_exemplar_parts()
         {
+            let full_input = parser.raw_series_parts().2;
             self.stage_pending_histogram_exemplar(
                 group_idx as u32,
                 ex_val,
