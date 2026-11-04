@@ -1016,13 +1016,26 @@ impl ArrowDecoder {
             univariate_metrics,
             metric_attrs,
             number_data_points,
+            summary_data_points: None,
+            histogram_data_points: None,
             number_dp_attrs,
+            summary_dp_attrs: None,
+            histogram_dp_attrs: None,
+            number_dp_exemplars: None,
+            histogram_dp_exemplars: None,
+            number_dp_exemplar_attrs: None,
+            histogram_dp_exemplar_attrs: None,
         })
     }
 
     fn build_univariate_metrics(&mut self) -> Result<RecordBatch, DecodeError> {
         let num_metrics = self.um_metric_types.len();
-        let schema = univariate_metrics_schema(self.um_any_help, self.um_any_counter);
+        let schema = univariate_metrics_schema(
+            self.um_any_help,
+            false,
+            self.um_any_counter,
+            self.um_any_counter,
+        );
         let mut cols: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
 
         self.scratch_u16.clear();
@@ -1125,7 +1138,7 @@ impl ArrowDecoder {
         let has_time = !self.dp_timestamps.is_empty();
         let time_nullable = has_time && !has_default_ts && !self.dp_time_valid.is_empty();
 
-        let schema = number_dp_schema(has_id, has_time, time_nullable);
+        let schema = number_dp_schema(has_id, false, false, has_time, time_nullable);
         let mut cols: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
 
         if has_id {
