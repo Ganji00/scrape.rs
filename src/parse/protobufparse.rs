@@ -58,6 +58,8 @@ pub struct ProtobufParser<'a> {
     /// The `quantile` or `le` label of the current series.
     magic_label: Option<(&'static str, FloatBuf)>,
     entry_bytes: Vec<u8>,
+    /// Indexes into `label_at`, sorted by label name.
+    label_order: Vec<usize>,
     int_histogram: Histogram<u64, i64>,
     float_histogram: Histogram<f64, f64>,
     is_float_histogram: bool,
@@ -89,6 +91,7 @@ impl<'a> ProtobufParser<'a> {
             series_name: String::new(),
             magic_label: None,
             entry_bytes: Vec::new(),
+            label_order: Vec::new(),
             int_histogram: Histogram::default(),
             float_histogram: Histogram::default(),
             is_float_histogram: false,
@@ -246,12 +249,13 @@ impl<'a> ProtobufParser<'a> {
         }
         self.update_magic_label();
 
-        // TODO: collects the labels per series to sort them, measure with the Phase 4 benchmarks.
         let mut entry_bytes = std::mem::take(&mut self.entry_bytes);
         entry_bytes.clear();
-        let mut pairs: Vec<(&str, &str)> = self.label_pairs().collect();
-        pairs.sort_by(|left, right| left.0.cmp(right.0));
-        for (name, value) in pairs {
+        let mut order = std::mem::take(&mut self.label_order);
+        order.clear();
+        order.extend(0..self.label_count());
+        order.sort_by(|&left, &right| self.label_at(left).0.cmp(self.label_at(right).0));
+        for (name, value) in order.iter().map(|&index| self.label_at(index)) {
             if name == METRIC_NAME_LABEL {
                 entry_bytes.extend_from_slice(value.as_bytes());
                 continue;
@@ -262,6 +266,7 @@ impl<'a> ProtobufParser<'a> {
             entry_bytes.extend_from_slice(value.as_bytes());
         }
         self.entry_bytes = entry_bytes;
+        self.label_order = order;
 
         if self.state == Some(Entry::Histogram) {
             self.load_histogram()?;
@@ -269,20 +274,25 @@ impl<'a> ProtobufParser<'a> {
         Ok(())
     }
 
-    /// Labels of the current series in Go's insertion order, before sorting.
-    fn label_pairs(&self) -> impl Iterator<Item = (&str, &str)> {
-        std::iter::once((METRIC_NAME_LABEL, self.series_name.as_str()))
-            .chain(
-                self.metric()
-                    .label
-                    .iter()
-                    .map(|label| (label.name.as_str(), label.value.as_str())),
-            )
-            .chain(
-                self.magic_label
-                    .as_ref()
-                    .map(|(name, value)| (*name, value.as_str())),
-            )
+    fn label_count(&self) -> usize {
+        1 + self.metric().label.len() + usize::from(self.magic_label.is_some())
+    }
+
+    /// Label `index` of the current series in Go's insertion order: the metric name, the
+    /// protobuf labels, then the `quantile` or `le` label.
+    fn label_at(&self, index: usize) -> (&str, &str) {
+        let labels = &self.metric().label;
+        match index {
+            0 => (METRIC_NAME_LABEL, self.series_name.as_str()),
+            index if index <= labels.len() => {
+                let label = &labels[index - 1];
+                (label.name.as_str(), label.value.as_str())
+            }
+            _ => self
+                .magic_label
+                .as_ref()
+                .map_or(("", ""), |(name, value)| (*name, value.as_str())),
+        }
     }
 
     /// Go's `Histogram`, run when the parser reaches a native histogram.
@@ -522,10 +532,10 @@ impl<'a> Parser<'a> for ProtobufParser<'a> {
     // in the input. A borrowing decoder like Go's would make this zero-copy.
     fn labels(&self, buf: &mut LabelsBuffer<'a>) {
         buf.clear();
-        for (name, value) in self.label_pairs() {
+        for &index in &self.label_order {
+            let (name, value) = self.label_at(index);
             buf.push(Cow::Owned(name.to_owned()), Cow::Owned(value.to_owned()));
         }
-        buf.sort();
     }
 
     /// Go's `Exemplar`. A native histogram returns its exemplars with timestamps one per call,
