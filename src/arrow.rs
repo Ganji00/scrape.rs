@@ -1792,10 +1792,11 @@ impl ArrowDecoder {
                     };
 
                     if CHUNKED
-                        && self.current_family.batch_id.is_none()
                         && self.pending_groups.is_empty()
-                        && (self.um_metric_types.len() >= MAX_METRICS_PER_BATCH
-                            || self.total_data_points() >= max_data_points)
+                        && role != SeriesRole::CounterCreated
+                        && (self.total_data_points() >= max_data_points
+                            || (self.current_family.batch_id.is_none()
+                                && self.um_metric_types.len() >= MAX_METRICS_PER_BATCH))
                     {
                         *pending_series = true;
                         let batch = self.finish_batches(default_ts_ns.is_some())?;
@@ -1805,9 +1806,15 @@ impl ArrowDecoder {
 
                     self.ingest_series_entry(parser, role, opts, default_ts_ns)?;
 
+                    // In Prometheus text format, a counter's optional `_created` line immediately
+                    // follows its `_total` sample, so defer flushing at the chunk boundary until
+                    // the next entry is inspected.
                     if CHUNKED
                         && self.pending_groups.is_empty()
                         && self.total_data_points() >= max_data_points
+                        && (self.current_family.metric_type != MetricType::Counter
+                            || parser.is_openmetrics()
+                            || role == SeriesRole::CounterCreated)
                     {
                         let batch = self.finish_batches(default_ts_ns.is_some())?;
                         self.reset_batch();
@@ -2007,6 +2014,7 @@ impl ArrowDecoder {
     ) -> Result<(), DecodeError> {
         let (_, label_spans, full_input, _, value) = parser.raw_series_parts();
         self.extract_series_labels_into_temp(label_spans, full_input, None)?;
+        self.current_family.has_samples = true;
         if !value.is_finite() {
             return Ok(());
         }
@@ -3845,11 +3853,16 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, DecodeError::DuplicateOrLateHelp { ref metric } if metric == "m"));
 
-        // `# HELP` appearing after a sample has already been emitted for the family.
-        let err = dec
-            .decode(b"m 1\n# HELP m late\n", &Format::TEXT, &opts)
-            .unwrap_err();
-        assert!(matches!(err, DecodeError::DuplicateOrLateHelp { ref metric } if metric == "m"));
+        // `# HELP` appearing after a sample (or counter `_created` line) has already been emitted.
+        for payload in [
+            b"m 1\n# HELP m late\n" as &[u8],
+            b"# TYPE m counter\nm_created 1700000000\n# HELP m late\nm_total 1\n",
+        ] {
+            let err = dec.decode(payload, &Format::TEXT, &opts).unwrap_err();
+            assert!(
+                matches!(err, DecodeError::DuplicateOrLateHelp { ref metric } if metric == "m")
+            );
+        }
 
         // Duplicate `# TYPE`.
         let err = dec
@@ -4118,6 +4131,34 @@ mod tests {
         assert!(assembled_chunks[0].histogram_data_points().is_some());
         assert_eq!(assembled_chunks[1].num_data_points(), 1);
         assert!(assembled_chunks[1].summary_data_points().is_some());
+
+        // Counter `_created` lines in Prometheus text stay attached to their preceding `_total`
+        // row even when `max_data_points_per_batch = 1`.
+        let counter_created_stream = concat!(
+            "# TYPE c counter\n",
+            "c_total{id=\"1\"} 10\n",
+            "c_created{id=\"1\"} 1700000000\n",
+            "c_total{id=\"2\"} 20\n",
+            "c_created{id=\"2\"} 1700000001\n",
+        );
+        let counter_chunks: Vec<_> = dec
+            .decode_stream(counter_created_stream.as_bytes(), &Format::TEXT, &zero_opts)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(counter_chunks.len(), 2);
+        for (idx, expected_start_ns) in [1_700_000_000_000_000_000i64, 1_700_000_001_000_000_000]
+            .into_iter()
+            .enumerate()
+        {
+            let ndp = counter_chunks[idx].number_data_points().unwrap();
+            let start_col = ndp
+                .column_by_name("start_time_unix_nano")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap();
+            assert_eq!(start_col.value(0), expected_start_ns);
+        }
 
         // Init errors surface on the first `next()` and fuse the iterator.
         let mut bad_fmt = dec.decode_stream(b"m 1\n", &Format::UNKNOWN, &opts);
