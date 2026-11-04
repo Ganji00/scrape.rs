@@ -2089,7 +2089,8 @@ impl ArrowDecoder {
         match role {
             SeriesRole::HistogramBucket | SeriesRole::SummaryQuantile => {
                 if let Some(bound) = special_bound
-                    && !bound.is_nan()
+                    && (bound.is_finite()
+                        || (role == SeriesRole::HistogramBucket && bound == f64::INFINITY))
                 {
                     self.pending_points.push((group_idx as u32, bound, value));
                 }
