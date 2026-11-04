@@ -468,6 +468,236 @@ fn histograms_summaries_exemplars_and_openmetrics_types_round_trip_through_otlp(
 }
 
 #[test]
+fn gaugehistogram_text_created_unsorted_bounds_nullable_sums_and_exemplar_nulls_validate_in_otap() {
+    // 1. OpenMetrics `gaugehistogram` with `_bucket`, `_gsum`, `_gcount`, `_created`, unsorted
+    //    `le` buckets, ignored `le="-Inf"`, multiple exemplars with mixed `span_id`/`trace_id`
+    //    presence and uppercase hex digits, plus a second series omitting `_gsum` so
+    //    `histogram_sum` is nullable.
+    let om_payload = concat!(
+        "# TYPE queue_bytes gaugehistogram\n",
+        "queue_bytes_bucket{shard=\"0\",le=\"10\"} 5 1710000000.0 # {trace_id=\"0102030405060708090A0B0C0D0E0F10\",k=\"v1\"} 8.0 1709999999.0\n",
+        "queue_bytes_bucket{shard=\"0\",le=\"1\"} 2 1710000000.0 # {span_id=\"ABCDEF0123456789\",k=\"v2\"} 0.5 1709999998.0\n",
+        "queue_bytes_bucket{shard=\"0\",le=\"-Inf\"} 99 1710000000.0\n",
+        "queue_bytes_bucket{shard=\"0\",le=\"+Inf\"} 6 1710000000.0\n",
+        "queue_bytes_gsum{shard=\"0\"} 42.0 1710000000.0\n",
+        "queue_bytes_gcount{shard=\"0\"} 6 1710000000.0\n",
+        "queue_bytes_created{shard=\"0\"} 1709000000.0\n",
+        "queue_bytes_bucket{shard=\"1\",le=\"+Inf\"} 3 1710000000.0\n",
+        "# EOF\n",
+    );
+
+    let mut decoder = ArrowDecoder::new();
+    let opts = DecodeOptions::new();
+    let om_records = decoder
+        .decode(om_payload.as_bytes(), &Format::OPEN_METRICS_1_0_0, &opts)
+        .expect("gaugehistogram OpenMetrics payload decodes");
+
+    assert_eq!(om_records.num_metrics(), 1);
+    assert_eq!(om_records.num_data_points(), 2);
+
+    let mut om_otap = to_otap_arrow_records(&om_records);
+    let om_plain = otap_to_otlp(&om_otap);
+    om_otap
+        .encode_transport_optimized()
+        .expect("gaugehistogram transport optimize succeeds");
+    om_otap
+        .decode_transport_optimized_ids()
+        .expect("gaugehistogram transport decode succeeds");
+    let om_round_tripped = otap_to_otlp(&om_otap);
+
+    let ts_ns = 1_710_000_000_000_000_000_u64;
+    let start_ns = 1_709_000_000_000_000_000_u64;
+    let om_expected = OtlpProtoMessage::Metrics(to_metrics_data(vec![Metric {
+        name: "queue_bytes".to_owned(),
+        description: String::new(),
+        unit: String::new(),
+        metadata: vec![kv_str(PROMETHEUS_TYPE_METADATA_KEY, "gaugehistogram")],
+        data: Some(metric::Data::Histogram(Histogram {
+            aggregation_temporality: AggregationTemporality::Cumulative as i32,
+            data_points: vec![
+                HistogramDataPoint {
+                    attributes: vec![kv_str("shard", "0")],
+                    start_time_unix_nano: start_ns,
+                    time_unix_nano: ts_ns,
+                    count: 6,
+                    sum: Some(42.0),
+                    bucket_counts: vec![2, 3, 1],
+                    explicit_bounds: vec![1.0, 10.0],
+                    exemplars: vec![
+                        Exemplar {
+                            filtered_attributes: vec![kv_str("k", "v1")],
+                            time_unix_nano: 1_709_999_999_000_000_000,
+                            span_id: Vec::new(),
+                            trace_id: vec![
+                                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
+                                0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+                            ],
+                            value: Some(exemplar::Value::AsDouble(8.0)),
+                        },
+                        Exemplar {
+                            filtered_attributes: vec![kv_str("k", "v2")],
+                            time_unix_nano: 1_709_999_998_000_000_000,
+                            span_id: vec![0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89],
+                            trace_id: Vec::new(),
+                            value: Some(exemplar::Value::AsDouble(0.5)),
+                        },
+                    ],
+                    flags: 0,
+                    min: None,
+                    max: None,
+                },
+                HistogramDataPoint {
+                    attributes: vec![kv_str("shard", "1")],
+                    start_time_unix_nano: 0,
+                    time_unix_nano: ts_ns,
+                    count: 3,
+                    sum: None,
+                    bucket_counts: vec![3],
+                    explicit_bounds: Vec::new(),
+                    exemplars: Vec::new(),
+                    flags: 0,
+                    min: None,
+                    max: None,
+                },
+            ],
+        })),
+    }]));
+    assert_equivalent(std::slice::from_ref(&om_expected), &[om_plain]);
+    assert_equivalent(&[om_expected], &[om_round_tripped]);
+
+    // 2. Prometheus text format (`Format::TEXT`) with `_created` lines across counters,
+    //    histograms, and summaries (mixed presence across series), unsorted summary quantiles,
+    //    ignored non-finite quantile bounds (`+Inf`, `-Inf`, `NaN`), and attribute-free exemplars
+    //    in OpenMetrics (`has_id = false` on `NumberDpExemplars`).
+    let text_payload = concat!(
+        "# TYPE c counter\n",
+        "c_total{id=\"a\"} 10 1710000000000\n",
+        "c_created{id=\"a\"} 1709000000.0\n",
+        "c_total{id=\"b\"} 20 1710000000000\n",
+        "# TYPE h histogram\n",
+        "h_bucket{id=\"a\",le=\"5\"} 4 1710000000000\n",
+        "h_bucket{id=\"a\",le=\"1\"} 1 1710000000000\n",
+        "h_bucket{id=\"a\",le=\"+Inf\"} 4 1710000000000\n",
+        "h_sum{id=\"a\"} 9.5 1710000000000\n",
+        "h_count{id=\"a\"} 4 1710000000000\n",
+        "h_created{id=\"a\"} 1709000000.0\n",
+        "# TYPE s summary\n",
+        "s{id=\"a\",quantile=\"0.9\"} 9.0 1710000000000\n",
+        "s{id=\"a\",quantile=\"0.5\"} 5.0 1710000000000\n",
+        "s{id=\"a\",quantile=\"+Inf\"} 99.0 1710000000000\n",
+        "s{id=\"a\",quantile=\"-Inf\"} 0.0 1710000000000\n",
+        "s{id=\"a\",quantile=\"NaN\"} 0.0 1710000000000\n",
+        "s_sum{id=\"a\"} 50.0 1710000000000\n",
+        "s_count{id=\"a\"} 10 1710000000000\n",
+        "s_created{id=\"a\"} 1709000000.0\n",
+    );
+    let text_records = decoder
+        .decode(text_payload.as_bytes(), &Format::TEXT, &opts)
+        .expect("Prometheus text _created payload decodes");
+    let mut text_otap = to_otap_arrow_records(&text_records);
+    text_otap
+        .encode_transport_optimized()
+        .expect("text _created transport optimize succeeds");
+    text_otap
+        .decode_transport_optimized_ids()
+        .expect("text _created transport decode succeeds");
+    let text_otlp = otap_to_otlp(&text_otap);
+
+    let text_expected = OtlpProtoMessage::Metrics(to_metrics_data(vec![
+        Metric {
+            name: "c_total".to_owned(),
+            description: String::new(),
+            unit: String::new(),
+            metadata: vec![kv_str(PROMETHEUS_TYPE_METADATA_KEY, "counter")],
+            data: Some(metric::Data::Sum(Sum {
+                aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                is_monotonic: true,
+                data_points: vec![
+                    NumberDataPoint {
+                        attributes: vec![kv_str("id", "a")],
+                        start_time_unix_nano: start_ns,
+                        time_unix_nano: ts_ns,
+                        exemplars: Vec::new(),
+                        flags: 0,
+                        value: Some(number_data_point::Value::AsDouble(10.0)),
+                    },
+                    number_dp(&[("id", "b")], ts_ns, 20.0),
+                ],
+            })),
+        },
+        Metric {
+            name: "h".to_owned(),
+            description: String::new(),
+            unit: String::new(),
+            metadata: vec![kv_str(PROMETHEUS_TYPE_METADATA_KEY, "histogram")],
+            data: Some(metric::Data::Histogram(Histogram {
+                aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                data_points: vec![HistogramDataPoint {
+                    attributes: vec![kv_str("id", "a")],
+                    start_time_unix_nano: start_ns,
+                    time_unix_nano: ts_ns,
+                    count: 4,
+                    sum: Some(9.5),
+                    bucket_counts: vec![1, 3, 0],
+                    explicit_bounds: vec![1.0, 5.0],
+                    exemplars: Vec::new(),
+                    flags: 0,
+                    min: None,
+                    max: None,
+                }],
+            })),
+        },
+        Metric {
+            name: "s".to_owned(),
+            description: String::new(),
+            unit: String::new(),
+            metadata: vec![kv_str(PROMETHEUS_TYPE_METADATA_KEY, "summary")],
+            data: Some(metric::Data::Summary(Summary {
+                data_points: vec![SummaryDataPoint {
+                    attributes: vec![kv_str("id", "a")],
+                    start_time_unix_nano: start_ns,
+                    time_unix_nano: ts_ns,
+                    count: 10,
+                    sum: 50.0,
+                    quantile_values: vec![
+                        ValueAtQuantile {
+                            quantile: 0.5,
+                            value: 5.0,
+                        },
+                        ValueAtQuantile {
+                            quantile: 0.9,
+                            value: 9.0,
+                        },
+                    ],
+                    flags: 0,
+                }],
+            })),
+        },
+    ]));
+    assert_equivalent(&[text_expected], &[text_otlp]);
+
+    // 3. Attribute-free exemplars (only `span_id`/`trace_id`, so `ExemplarAttrs` is omitted and
+    //    `Exemplars.id` is omitted).
+    let attr_free_ex = concat!(
+        "# TYPE c counter\n",
+        "c_total 1 1710000000.0 # {span_id=\"0102030405060708\"} 1.0 1710000000.0\n",
+        "# EOF\n",
+    );
+    let ex_records = decoder
+        .decode(attr_free_ex.as_bytes(), &Format::OPEN_METRICS_1_0_0, &opts)
+        .expect("attribute-free exemplar decodes");
+    assert!(ex_records.number_dp_exemplars().is_some());
+    assert!(ex_records.number_dp_exemplar_attrs().is_none());
+    let mut ex_otap = to_otap_arrow_records(&ex_records);
+    ex_otap
+        .encode_transport_optimized()
+        .expect("attribute-free exemplar transport optimize succeeds");
+    ex_otap
+        .decode_transport_optimized_ids()
+        .expect("attribute-free exemplar transport decode succeeds");
+}
+
+#[test]
 fn translation_policies_control_suffix_stripping_and_type_projections() {
     let payload = concat!(
         "# TYPE net_bytes counter\n",
