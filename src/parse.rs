@@ -349,8 +349,9 @@ pub trait Parser<'a> {
     }
 
     /// Returns the start timestamp in ms of the current sample, read from its `_created` line
-    /// in OpenMetrics or its `start_timestamp` field in protobuf. Takes `&mut self` because, like Go, it caches the last hit and turns on `_created`
-    /// skipping, so later `_created` lines are not returned as series.
+    /// in OpenMetrics or its `start_timestamp` field in protobuf. Takes `&mut self` because the
+    /// OpenMetrics parser, like Go, caches the last hit and turns on `_created` skipping, so
+    /// later `_created` lines are not returned as series. The protobuf parser only reads the field.
     fn start_timestamp(&mut self) -> Option<i64> {
         None
     }
