@@ -24,6 +24,8 @@ mod omparse;
 mod promlex;
 mod promparse;
 
+pub(crate) use float::parse_go_float;
+pub(crate) use omparse::OmScratch;
 pub use omparse::OpenMetricsParser;
 pub use promparse::PromParser;
 pub(crate) use promparse::{LabelSpan, unescape_bytes_into};
