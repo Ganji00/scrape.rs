@@ -241,48 +241,58 @@ func copyDirFiles(srcDir, dstDir, outRoot string) ([]string, error) {
 // `input += ...` literal, in source order. Assignments inside nested blocks are ignored
 // because they belong to subtests or conditional paths, not to the shared input.
 func extractFuncInputLiteral(srcFile, funcName string) (string, error) {
+	fset, assigns, err := topLevelAssigns(srcFile, funcName, "input")
+	if err != nil {
+		return "", err
+	}
+	var extracted string
+	var found bool
+	for _, assign := range assigns {
+		pos := fset.Position(assign.Pos())
+		if !found && assign.Tok != token.DEFINE {
+			continue
+		}
+		if found && assign.Tok != token.ADD_ASSIGN {
+			return "", fmt.Errorf("%s: unsupported input %s in %s", pos, assign.Tok, funcName)
+		}
+		val, ok := evalStringExpr(assign.Rhs[0])
+		if !ok {
+			return "", fmt.Errorf("%s: input %s with a non-literal expression in %s", pos, assign.Tok, funcName)
+		}
+		extracted += val
+		found = true
+	}
+	if !found {
+		return "", fmt.Errorf("could not find input literal in %s (%s)", funcName, srcFile)
+	}
+	return extracted, nil
+}
+
+// topLevelAssigns returns the single-value assignments to varName in the body of
+// funcName, in source order, skipping nested blocks.
+func topLevelAssigns(srcFile, funcName, varName string) (*token.FileSet, []*ast.AssignStmt, error) {
 	fset := token.NewFileSet()
 	fileNode, err := parser.ParseFile(fset, srcFile, nil, 0)
 	if err != nil {
-		return "", fmt.Errorf("parse %s: %w", srcFile, err)
+		return nil, nil, fmt.Errorf("parse %s: %w", srcFile, err)
 	}
-
+	var assigns []*ast.AssignStmt
 	for _, decl := range fileNode.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok || fn.Name.Name != funcName || fn.Body == nil {
 			continue
 		}
-		var extracted string
-		var found bool
 		for _, stmt := range fn.Body.List {
 			assign, ok := stmt.(*ast.AssignStmt)
 			if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
 				continue
 			}
-			ident, ok := assign.Lhs[0].(*ast.Ident)
-			if !ok || ident.Name != "input" {
-				continue
+			if ident, ok := assign.Lhs[0].(*ast.Ident); ok && ident.Name == varName {
+				assigns = append(assigns, assign)
 			}
-			pos := fset.Position(assign.Pos())
-			if !found && assign.Tok != token.DEFINE {
-				continue
-			}
-			if found && assign.Tok != token.ADD_ASSIGN {
-				return "", fmt.Errorf("%s: unsupported input %s in %s", pos, assign.Tok, funcName)
-			}
-			val, ok := evalStringExpr(assign.Rhs[0])
-			if !ok {
-				return "", fmt.Errorf("%s: input %s with a non-literal expression in %s", pos, assign.Tok, funcName)
-			}
-			extracted += val
-			found = true
-		}
-		if found {
-			return extracted, nil
 		}
 	}
-
-	return "", fmt.Errorf("could not find input literal in %s (%s)", funcName, srcFile)
+	return fset, assigns, nil
 }
 
 func evalStringExpr(expr ast.Expr) (string, bool) {
@@ -317,38 +327,24 @@ func evalStringExpr(expr ast.Expr) (string, bool) {
 // extractFuncStringSlice returns the elements of the []string literal assigned to
 // varName at the top level of funcName.
 func extractFuncStringSlice(srcFile, funcName, varName string) ([]string, error) {
-	fset := token.NewFileSet()
-	fileNode, err := parser.ParseFile(fset, srcFile, nil, 0)
+	fset, assigns, err := topLevelAssigns(srcFile, funcName, varName)
 	if err != nil {
-		return nil, fmt.Errorf("parse %s: %w", srcFile, err)
+		return nil, err
 	}
-	for _, decl := range fileNode.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Name.Name != funcName || fn.Body == nil {
-			continue
-		}
-		for _, stmt := range fn.Body.List {
-			assign, ok := stmt.(*ast.AssignStmt)
-			if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
-				continue
-			}
-			if ident, ok := assign.Lhs[0].(*ast.Ident); !ok || ident.Name != varName {
-				continue
-			}
-			lit, ok := assign.Rhs[0].(*ast.CompositeLit)
-			if !ok {
-				return nil, fmt.Errorf("%s: %s is not a composite literal", fset.Position(assign.Pos()), varName)
-			}
-			var out []string
-			for _, elt := range lit.Elts {
-				val, ok := evalStringExpr(elt)
-				if !ok {
-					return nil, fmt.Errorf("%s: non-literal element in %s", fset.Position(elt.Pos()), varName)
-				}
-				out = append(out, val)
-			}
-			return out, nil
-		}
+	if len(assigns) == 0 {
+		return nil, fmt.Errorf("could not find %s in %s (%s)", varName, funcName, srcFile)
 	}
-	return nil, fmt.Errorf("could not find %s in %s (%s)", varName, funcName, srcFile)
+	lit, ok := assigns[0].Rhs[0].(*ast.CompositeLit)
+	if !ok {
+		return nil, fmt.Errorf("%s: %s is not a composite literal", fset.Position(assigns[0].Pos()), varName)
+	}
+	var out []string
+	for _, elt := range lit.Elts {
+		val, ok := evalStringExpr(elt)
+		if !ok {
+			return nil, fmt.Errorf("%s: non-literal element in %s", fset.Position(elt.Pos()), varName)
+		}
+		out = append(out, val)
+	}
+	return out, nil
 }

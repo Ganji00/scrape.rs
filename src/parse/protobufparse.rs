@@ -40,7 +40,6 @@ pub struct ProtobufParser<'a> {
     input: &'a [u8],
     /// Offset of the next length prefix in `input`.
     pos: usize,
-    family_offset: usize,
     family: dto::MetricFamily,
     metric_index: usize,
     next_metric_index: usize,
@@ -57,7 +56,7 @@ pub struct ProtobufParser<'a> {
     /// Metric name plus the `_count`, `_sum`, or `_bucket` suffix of the current series.
     series_name: String,
     /// The `quantile` or `le` label of the current series.
-    magic_label: Option<(&'static str, f64)>,
+    magic_label: Option<(&'static str, FloatBuf)>,
     entry_bytes: Vec<u8>,
     int_histogram: Histogram<u64, i64>,
     float_histogram: Histogram<f64, f64>,
@@ -76,7 +75,6 @@ impl<'a> ProtobufParser<'a> {
         Self {
             input,
             pos: 0,
-            family_offset: 0,
             family: dto::MetricFamily::default(),
             metric_index: 0,
             next_metric_index: 0,
@@ -103,23 +101,19 @@ impl<'a> ProtobufParser<'a> {
             return Ok(false);
         }
         let mut message = rest;
-        let length = prost::encoding::decode_varint(&mut message)
+        let length = prost::decode_length_delimiter(&mut message)
             .map_err(|_| ParseError::InvalidProtobuf("invalid varint".to_owned()))?;
         let varint_len = rest.len() - message.len();
         if varint_len > MAX_VARINT_LEN_32 {
             return Err(ParseError::InvalidProtobuf("invalid varint".to_owned()));
         }
-        let message = usize::try_from(length)
-            .ok()
-            .and_then(|length| message.get(..length))
-            .ok_or_else(|| {
-                ParseError::InvalidProtobuf(format!(
-                    "insufficient length of buffer, expected at least {} bytes, got {} bytes",
-                    length.saturating_add(varint_len as u64),
-                    rest.len()
-                ))
-            })?;
-        self.family_offset = self.pos;
+        let message = message.get(..length).ok_or_else(|| {
+            ParseError::InvalidProtobuf(format!(
+                "insufficient length of buffer, expected at least {} bytes, got {} bytes",
+                length.saturating_add(varint_len),
+                rest.len()
+            ))
+        })?;
         self.pos += varint_len + message.len();
         // TODO: decodes the whole family up front, so a malformed metric fails the family
         // before its earlier metrics are returned. A lazy decoder like Go's would fix that.
@@ -148,10 +142,7 @@ impl<'a> ProtobufParser<'a> {
     }
 
     fn dto_histogram(&self) -> &dto::Histogram {
-        self.metric()
-            .histogram
-            .as_ref()
-            .unwrap_or(&EMPTY_DTO_HISTOGRAM)
+        histogram_of(&self.family, self.metric_index).unwrap_or(&EMPTY_DTO_HISTOGRAM)
     }
 
     fn kind(&self) -> dto::MetricType {
@@ -192,9 +183,17 @@ impl<'a> ProtobufParser<'a> {
 
     /// Go's `getMagicLabel`, which also sets `fields_done`.
     fn update_magic_label(&mut self) {
-        self.magic_label = None;
+        self.magic_label = self.magic_label_value().map(|(name, value)| {
+            let mut formatted = FloatBuf::default();
+            // A FloatBuf fits every f64.
+            let _ = format_openmetrics_float(value, &mut formatted);
+            (name, formatted)
+        });
+    }
+
+    fn magic_label_value(&mut self) -> Option<(&'static str, f64)> {
         if self.state == Some(Entry::Histogram) || self.field_pos < 0 {
-            return;
+            return None;
         }
         let pos = self.field_pos as usize;
         if self.kind() == dto::MetricType::Summary {
@@ -204,21 +203,18 @@ impl<'a> ProtobufParser<'a> {
                 .as_ref()
                 .map_or(&[][..], |summary| &summary.quantile);
             let (len, quantile) = (quantiles.len(), quantiles.get(pos).map(|q| q.quantile));
-            match quantile {
-                Some(quantile) => {
-                    self.fields_done = pos == len - 1;
-                    self.magic_label = Some((QUANTILE_LABEL, quantile));
-                }
-                None => self.fields_done = true,
-            }
-        } else if self.is_histogram_kind() {
+            self.fields_done = quantile.is_none() || pos == len - 1;
+            return quantile.map(|quantile| (QUANTILE_LABEL, quantile));
+        }
+        if self.is_histogram_kind() {
             let upper_bound = match self.dto_histogram().bucket.get(pos) {
                 Some(bucket) => bucket.upper_bound,
                 None => f64::INFINITY,
             };
             self.fields_done = upper_bound == f64::INFINITY;
-            self.magic_label = Some((BUCKET_LABEL, upper_bound));
+            return Some((BUCKET_LABEL, upper_bound));
         }
+        None
     }
 
     /// Go's `onSeriesOrHistogramUpdate`, plus the parts of Go's `Series` and `Histogram` that
@@ -250,15 +246,10 @@ impl<'a> ProtobufParser<'a> {
         }
         self.update_magic_label();
 
-        let mut magic_value = FloatBuf::default();
-        if let Some((_, value)) = self.magic_label {
-            // A FloatBuf fits every f64.
-            let _ = format_openmetrics_float(value, &mut magic_value);
-        }
         // TODO: collects the labels per series to sort them, measure with the Phase 4 benchmarks.
         let mut entry_bytes = std::mem::take(&mut self.entry_bytes);
         entry_bytes.clear();
-        let mut pairs: Vec<(&str, &str)> = self.label_pairs(&magic_value).collect();
+        let mut pairs: Vec<(&str, &str)> = self.label_pairs().collect();
         pairs.sort_by(|left, right| left.0.cmp(right.0));
         for (name, value) in pairs {
             if name == METRIC_NAME_LABEL {
@@ -279,10 +270,7 @@ impl<'a> ProtobufParser<'a> {
     }
 
     /// Labels of the current series in Go's insertion order, before sorting.
-    fn label_pairs<'s>(
-        &'s self,
-        magic_value: &'s FloatBuf,
-    ) -> impl Iterator<Item = (&'s str, &'s str)> {
+    fn label_pairs(&self) -> impl Iterator<Item = (&str, &str)> {
         std::iter::once((METRIC_NAME_LABEL, self.series_name.as_str()))
             .chain(
                 self.metric()
@@ -292,7 +280,8 @@ impl<'a> ProtobufParser<'a> {
             )
             .chain(
                 self.magic_label
-                    .map(|(name, _)| (name, magic_value.as_str())),
+                    .as_ref()
+                    .map(|(name, value)| (*name, value.as_str())),
             )
     }
 
@@ -303,62 +292,35 @@ impl<'a> ProtobufParser<'a> {
         } else {
             CounterResetHint::Unknown
         };
-        // Field access instead of `dto_histogram()`, so the targets below can be borrowed.
-        let source = self
-            .family
-            .metric
-            .get(self.metric_index)
-            .and_then(|metric| metric.histogram.as_ref())
-            .unwrap_or(&EMPTY_DTO_HISTOGRAM);
+        // Not `dto_histogram()`, so the targets below can be borrowed mutably.
+        let source = histogram_of(&self.family, self.metric_index).unwrap_or(&EMPTY_DTO_HISTOGRAM);
         let name = self.family.name.as_str();
         self.redo_classic = self.parse_classic_histograms && !source.bucket.is_empty();
         self.is_float_histogram = source.sample_count_float > 0.0 || source.zero_count_float > 0.0;
         if self.is_float_histogram {
-            check_span_buckets(
-                name,
-                "positive",
-                &source.positive_span,
-                source.positive_count.len(),
-            )?;
-            check_span_buckets(
-                name,
-                "negative",
-                &source.negative_span,
-                source.negative_count.len(),
-            )?;
             let target = &mut self.float_histogram;
             target.count = source.sample_count_float;
             target.zero_count = source.zero_count_float;
-            source
-                .positive_count
-                .clone_into(&mut target.positive_buckets);
-            source
-                .negative_count
-                .clone_into(&mut target.negative_buckets);
-            fill_histogram(target, source, counter_reset_hint);
+            fill_histogram(
+                target,
+                name,
+                source,
+                &source.positive_count,
+                &source.negative_count,
+                counter_reset_hint,
+            )?;
         } else {
-            check_span_buckets(
-                name,
-                "positive",
-                &source.positive_span,
-                source.positive_delta.len(),
-            )?;
-            check_span_buckets(
-                name,
-                "negative",
-                &source.negative_span,
-                source.negative_delta.len(),
-            )?;
             let target = &mut self.int_histogram;
             target.count = source.sample_count;
             target.zero_count = source.zero_count;
-            source
-                .positive_delta
-                .clone_into(&mut target.positive_buckets);
-            source
-                .negative_delta
-                .clone_into(&mut target.negative_buckets);
-            fill_histogram(target, source, counter_reset_hint);
+            fill_histogram(
+                target,
+                name,
+                source,
+                &source.positive_delta,
+                &source.negative_delta,
+                counter_reset_hint,
+            )?;
         }
         Ok(())
     }
@@ -372,6 +334,7 @@ impl<'a> ProtobufParser<'a> {
     fn start_family(&mut self) -> Result<bool, ParseError> {
         self.exemplar_pos = 0;
         self.field_pos = -2;
+        let family_offset = self.pos;
         if !self.next_metric_family()? {
             return Ok(false);
         }
@@ -381,7 +344,7 @@ impl<'a> ProtobufParser<'a> {
         }
         if self.family.name.is_empty() {
             return Err(ParseError::InvalidMetricName {
-                offset: self.family_offset,
+                offset: family_offset,
             });
         }
         if dto::MetricType::try_from(self.family.r#type).is_err() {
@@ -559,11 +522,7 @@ impl<'a> Parser<'a> for ProtobufParser<'a> {
     // in the input. A borrowing decoder like Go's would make this zero-copy.
     fn labels(&self, buf: &mut LabelsBuffer<'a>) {
         buf.clear();
-        let mut magic_value = FloatBuf::default();
-        if let Some((_, value)) = self.magic_label {
-            let _ = format_openmetrics_float(value, &mut magic_value);
-        }
-        for (name, value) in self.label_pairs(&magic_value) {
+        for (name, value) in self.label_pairs() {
             buf.push(Cow::Owned(name.to_owned()), Cow::Owned(value.to_owned()));
         }
         buf.sort();
@@ -614,11 +573,7 @@ impl ProtobufParser<'_> {
     /// The histogram branch of Go's `Exemplar`, which advances `exemplar_pos` or `field_pos`.
     fn histogram_exemplar(&mut self) -> Option<&dto::Exemplar> {
         let is_classic = self.state == Some(Entry::Series);
-        let histogram = self
-            .family
-            .metric
-            .get(self.metric_index)
-            .and_then(|metric| metric.histogram.as_ref())?;
+        let histogram = histogram_of(&self.family, self.metric_index)?;
         if !is_classic && !histogram.exemplars.is_empty() {
             // Native histograms drop exemplars without a timestamp.
             while let Some(exemplar) = histogram.exemplars.get(self.exemplar_pos) {
@@ -651,6 +606,10 @@ impl ProtobufParser<'_> {
         }
         found
     }
+}
+
+fn histogram_of(family: &dto::MetricFamily, metric_index: usize) -> Option<&dto::Histogram> {
+    family.metric.get(metric_index)?.histogram.as_ref()
 }
 
 /// Go's `isNativeHistogram`.
@@ -690,12 +649,29 @@ fn check_span_buckets(
     Ok(())
 }
 
-/// Copies the shared fields and spans, then compacts like Go's `Compact(0)`.
+/// Checks the spans, copies the fields, then compacts like Go's `Compact(0)`.
 fn fill_histogram<C, B: Bucket>(
     target: &mut Histogram<C, B>,
+    name: &str,
     source: &dto::Histogram,
+    positive_buckets: &[B],
+    negative_buckets: &[B],
     counter_reset_hint: CounterResetHint,
-) {
+) -> Result<(), ParseError> {
+    check_span_buckets(
+        name,
+        "positive",
+        &source.positive_span,
+        positive_buckets.len(),
+    )?;
+    check_span_buckets(
+        name,
+        "negative",
+        &source.negative_span,
+        negative_buckets.len(),
+    )?;
+    positive_buckets.clone_into(&mut target.positive_buckets);
+    negative_buckets.clone_into(&mut target.negative_buckets);
     target.counter_reset_hint = counter_reset_hint;
     target.schema = source.schema;
     target.zero_threshold = source.zero_threshold;
@@ -704,6 +680,7 @@ fn fill_histogram<C, B: Bucket>(
     copy_spans(&mut target.negative_spans, &source.negative_span);
     compact_buckets(&mut target.positive_buckets, &mut target.positive_spans);
     compact_buckets(&mut target.negative_buckets, &mut target.negative_spans);
+    Ok(())
 }
 
 fn copy_spans(target: &mut Vec<Span>, source: &[dto::BucketSpan]) {
