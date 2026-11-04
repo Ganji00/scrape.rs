@@ -1793,7 +1793,9 @@ impl ArrowDecoder {
 
                     if CHUNKED
                         && self.current_family.batch_id.is_none()
-                        && self.um_metric_types.len() >= MAX_METRICS_PER_BATCH
+                        && self.pending_groups.is_empty()
+                        && (self.um_metric_types.len() >= MAX_METRICS_PER_BATCH
+                            || self.total_data_points() >= max_data_points)
                     {
                         *pending_series = true;
                         let batch = self.finish_batches(default_ts_ns.is_some())?;
@@ -4059,6 +4061,28 @@ mod tests {
             assert!(stream.next().unwrap().is_ok());
         }
         assert!(dec.prom_spans.capacity() >= 4);
+
+        // Consecutive assembled families (histograms/summaries) preceded by `# TYPE` flush at
+        // `max_data_points_per_batch` when the next family begins.
+        let assembled_stream = concat!(
+            "# TYPE h1 histogram\n",
+            "h1_bucket{le=\"+Inf\"} 1\n",
+            "h1_sum 1\n",
+            "h1_count 1\n",
+            "# TYPE s1 summary\n",
+            "s1{quantile=\"0.5\"} 2\n",
+            "s1_sum 2\n",
+            "s1_count 1\n",
+        );
+        let assembled_chunks: Vec<_> = dec
+            .decode_stream(assembled_stream.as_bytes(), &Format::TEXT, &zero_opts)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(assembled_chunks.len(), 2);
+        assert_eq!(assembled_chunks[0].num_data_points(), 1);
+        assert!(assembled_chunks[0].histogram_data_points().is_some());
+        assert_eq!(assembled_chunks[1].num_data_points(), 1);
+        assert!(assembled_chunks[1].summary_data_points().is_some());
 
         // Init errors surface on the first `next()` and fuse the iterator.
         let mut bad_fmt = dec.decode_stream(b"m 1\n", &Format::UNKNOWN, &opts);
