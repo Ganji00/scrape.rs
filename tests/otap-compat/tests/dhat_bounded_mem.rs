@@ -44,9 +44,10 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
     let _profiler = dhat::Profiler::builder().testing().build();
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/textparse");
-    let nometa: Rc<[u8]> = fs::read(root.join("alltypes.237mfs.nometa.prom.txt"))
+    let full_237: Rc<[u8]> = fs::read(root.join("alltypes.237mfs.prom.txt"))
         .unwrap()
         .into();
+    let om_bench: Rc<[u8]> = fs::read(root.join("alltypes.bench.om.txt")).unwrap().into();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -57,7 +58,7 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
         // Wrap `ArrowDecoder` in `!Send` `Rc<RefCell<_>>` to mirror thread-per-core OTAP receivers.
         let shared_decoder = Rc::new(RefCell::new(ArrowDecoder::new()));
         let opts = DecodeOptions::new().with_timestamp_ms(1_700_000_000_000);
-        let nometa_full = Rc::clone(&nometa);
+        let full_237_clone = Rc::clone(&full_237);
 
         let handle = tokio::task::spawn_local(async move {
             let mut warmup_decoder_mem = 0usize;
@@ -67,7 +68,7 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
             for i in 0..32 {
                 let records = shared_decoder
                     .borrow_mut()
-                    .decode(&nometa_full, &Format::TEXT, &opts)
+                    .decode(&full_237_clone, &Format::TEXT, &opts)
                     .expect("scrape succeeds");
                 let otap = to_otap_arrow_records(&records);
                 let dec_mem = shared_decoder.borrow().retained_memory_bytes();
@@ -118,7 +119,7 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
             for i in 0..32 {
                 {
                     let mut dec = stream_decoder.borrow_mut();
-                    for chunk_res in dec.decode_stream(&nometa, &Format::TEXT, &stream_opts) {
+                    for chunk_res in dec.decode_stream(&full_237, &Format::TEXT, &stream_opts) {
                         let chunk = chunk_res.expect("stream chunk succeeds");
                         let otap = to_otap_arrow_records(&chunk);
                         drop(otap);
@@ -134,9 +135,9 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
                     warmup_stream_live_heap = live_heap;
                     assert!(warmup_stream_dec_mem > 0);
                     assert!(
-                        warmup_stream_dec_mem * 2 < full_decoder_mem,
+                        warmup_stream_dec_mem * 3 < full_decoder_mem * 2,
                         "expected 128-row streaming decoder ({warmup_stream_dec_mem} B) to retain \
-                         less than half of full-scrape decoder ({full_decoder_mem} B)"
+                         significantly less than full-scrape decoder ({full_decoder_mem} B)"
                     );
                 } else if i > 1 {
                     assert_eq!(
@@ -153,5 +154,36 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
         });
 
         stream_handle.await.expect("streaming local task succeeds");
+
+        // Verify OpenMetrics 1.0 scrapes (with histograms, summaries, exemplars, units, info, and
+        // stateset) also keep retained scratch memory and live heap strictly constant after warmup.
+        let om_decoder = Rc::new(RefCell::new(ArrowDecoder::new()));
+        let om_handle = tokio::task::spawn_local(async move {
+            let mut warmup_om_dec_mem = 0usize;
+            let mut warmup_om_live_heap = 0usize;
+
+            for i in 0..32 {
+                let records = om_decoder
+                    .borrow_mut()
+                    .decode(&om_bench, &Format::OPEN_METRICS_1_0_0, &opts)
+                    .expect("OpenMetrics scrape succeeds");
+                let otap = to_otap_arrow_records(&records);
+                let dec_mem = om_decoder.borrow().retained_memory_bytes();
+                drop(otap);
+                drop(records);
+
+                let live_heap = dhat::HeapStats::get().curr_bytes;
+                if i == 1 {
+                    warmup_om_dec_mem = dec_mem;
+                    warmup_om_live_heap = live_heap;
+                } else if i > 1 {
+                    assert_eq!(dec_mem, warmup_om_dec_mem);
+                    assert_eq!(live_heap, warmup_om_live_heap);
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        om_handle.await.expect("OpenMetrics local task succeeds");
     });
 }

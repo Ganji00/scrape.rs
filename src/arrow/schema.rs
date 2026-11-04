@@ -25,14 +25,14 @@
 //! and dictionary key width (`UInt8`, `UInt16`, or `Utf8`). The `tests/otap-compat` suite validates
 //! every emitted batch directly against `otel_arrow_dfe_pdata::schema::payloads::get`.
 
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use arrow_array::{ArrayRef, StringArray};
 use arrow_schema::{DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
 
+/// OTAP `UnivariateMetrics.metric_type` wire value for a metadata-only (`Empty`) metric.
+pub(super) const OTAP_METRIC_TYPE_EMPTY: u8 = 0;
 /// OTAP `UnivariateMetrics.metric_type` wire value for a Gauge metric (also used for `untyped`).
 pub(super) const OTAP_METRIC_TYPE_GAUGE: u8 = 1;
 /// OTAP `UnivariateMetrics.metric_type` wire value for a Sum metric (`counter`).
@@ -299,12 +299,8 @@ fn build_summary_dp_schema(
             time_nullable,
         ));
     }
-    fields.push(Field::new(
-        "summary_count",
-        DataType::UInt64,
-        count_nullable,
-    ));
-    fields.push(Field::new("summary_sum", DataType::Float64, sum_nullable));
+    fields.push(Field::new("count", DataType::UInt64, count_nullable));
+    fields.push(Field::new("sum", DataType::Float64, sum_nullable));
     fields.push(Field::new(
         "quantile",
         DataType::List(summary_quantile_item_field()),
@@ -392,19 +388,15 @@ fn build_histogram_dp_schema(
             time_nullable,
         ));
     }
+    fields.push(Field::new("count", DataType::UInt64, count_nullable));
+    fields.push(Field::new("sum", DataType::Float64, sum_nullable));
     fields.push(Field::new(
-        "histogram_count",
-        DataType::UInt64,
-        count_nullable,
-    ));
-    fields.push(Field::new("histogram_sum", DataType::Float64, sum_nullable));
-    fields.push(Field::new(
-        "histogram_bucket_counts",
+        "bucket_counts",
         DataType::List(histogram_bucket_counts_item_field()),
         false,
     ));
     fields.push(Field::new(
-        "histogram_explicit_bounds",
+        "explicit_bounds",
         DataType::List(histogram_explicit_bounds_item_field()),
         false,
     ));
@@ -476,14 +468,14 @@ pub(super) fn exemplars_schema(has_id: bool, has_span_id: bool, has_trace_id: bo
     Arc::clone(&EXEMPLARS_SCHEMAS[mask])
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum KeyEncoding {
     DictU8 = 0,
     DictU16 = 1,
     Utf8 = 2,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ValEncoding {
     DictU16 = 0,
     Utf8 = 1,
@@ -543,9 +535,4 @@ static DP_ATTRS_SCHEMAS: LazyLock<[SchemaRef; 6]> = LazyLock::new(|| {
 pub(super) fn dp_attrs_schema(key_enc: KeyEncoding, val_enc: ValEncoding) -> SchemaRef {
     let idx = (key_enc as usize) * 2 + (val_enc as usize);
     Arc::clone(&DP_ATTRS_SCHEMAS[idx])
-}
-
-#[inline]
-pub(super) fn number_dp_attrs_schema(key_enc: KeyEncoding, val_enc: ValEncoding) -> SchemaRef {
-    dp_attrs_schema(key_enc, val_enc)
 }
