@@ -2605,7 +2605,6 @@ impl ArrowDecoder {
         }
 
         let univariate_metrics = Some(self.build_univariate_metrics()?);
-        let metric_attrs = Some(self.build_metric_attrs()?);
 
         let number_data_points = if self.dp_parent_ids.is_empty() {
             None
@@ -2757,6 +2756,11 @@ impl ArrowDecoder {
             Some(res?)
         };
 
+        // Build `MetricAttrs` after data-point and exemplar attribute tables so the dynamic
+        // `InfoPolicy::MetricAttrs` path does not intern `prometheus.type` or type names into
+        // `DpAttrs` / `ExemplarAttrs` dictionaries.
+        let metric_attrs = Some(self.build_metric_attrs()?);
+
         Ok(OtapMetricRecords {
             univariate_metrics,
             metric_attrs,
@@ -2875,6 +2879,8 @@ impl ArrowDecoder {
 
     fn build_metric_attrs(&mut self) -> Result<RecordBatch, DecodeError> {
         let num_metrics = self.um_metric_types.len();
+        self.scratch_u16.clear();
+        self.scratch_u16.extend((0..num_metrics).map(|i| i as u16));
 
         if self.extra_metric_attr_pairs.is_empty() {
             // Fast path: only `prometheus.type` is present on each metric row, using pre-built
@@ -2922,25 +2928,29 @@ impl ArrowDecoder {
             b"info",
             b"stateset",
         ];
-        let mut type_val_ids = [0u32; 8];
-        for (i, name) in TYPE_NAMES.iter().enumerate() {
-            type_val_ids[i] =
-                self.val_interner
-                    .intern(name)
-                    .ok_or_else(|| DecodeError::CapacityOverflow {
-                        table: "MetricAttrs.str",
-                        count: self.val_interner.len(),
+        let mut type_val_ids = [u32::MAX; 8];
+        let mut pairs = std::mem::take(&mut self.temp_attrs);
+        pairs.clear();
+        pairs.reserve(num_metrics + self.extra_metric_attr_pairs.len());
+        for &t_idx in &self.um_attr_type_keys {
+            let idx = t_idx as usize;
+            let val_id = match type_val_ids[idx] {
+                u32::MAX => {
+                    let id = self.val_interner.intern(TYPE_NAMES[idx]).ok_or_else(|| {
+                        DecodeError::CapacityOverflow {
+                            table: "MetricAttrs.str",
+                            count: self.val_interner.len(),
+                        }
                     })?;
+                    type_val_ids[idx] = id;
+                    id
+                }
+                id => id,
+            };
+            pairs.push((prom_type_key_id, val_id));
         }
-
-        let total_rows = num_metrics + self.extra_metric_attr_pairs.len();
-        let mut parents = Vec::with_capacity(total_rows);
-        let mut pairs = Vec::with_capacity(total_rows);
-        for (m_idx, &t_idx) in self.um_attr_type_keys.iter().enumerate() {
-            parents.push(m_idx as u16);
-            pairs.push((prom_type_key_id, type_val_ids[t_idx as usize]));
-        }
-        parents.extend_from_slice(&self.extra_metric_attr_parents);
+        self.scratch_u16
+            .extend_from_slice(&self.extra_metric_attr_parents);
         pairs.extend_from_slice(&self.extra_metric_attr_pairs);
 
         let unique_keys = self.key_interner.len();
@@ -2962,15 +2972,18 @@ impl ArrowDecoder {
         let val_dict: Option<ArrayRef> = (val_enc != ValEncoding::Utf8)
             .then(|| Arc::new(self.val_interner.to_string_array()) as ArrayRef);
 
-        let parent_id_arr: ArrayRef = Arc::new(UInt16Array::new(scalar_from_slice(&parents), None));
-        let (key_arr, type_arr, val_arr) = self.build_attr_columns(
+        let parent_id_arr: ArrayRef =
+            Arc::new(UInt16Array::new(scalar_from_slice(&self.scratch_u16), None));
+        let res = self.build_attr_columns(
             &pairs,
             key_enc,
             val_enc,
             key_dict.as_ref(),
             val_dict.as_ref(),
             "MetricAttrs",
-        )?;
+        );
+        self.temp_attrs = pairs;
+        let (key_arr, type_arr, val_arr) = res?;
 
         Ok(RecordBatch::try_new(
             metric_attrs_schema_for(key_enc, val_enc),
