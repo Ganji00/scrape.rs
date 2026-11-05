@@ -143,15 +143,6 @@ pub enum DecodeError {
     #[error("unsupported exposition format: {0}")]
     UnsupportedFormat(String),
 
-    /// A metric family uses a `# TYPE` not yet supported by `ArrowDecoder`.
-    #[error("unsupported metric type {metric_type:?} for metric {metric:?}")]
-    UnsupportedMetricType {
-        /// Metric family name declared in `# TYPE`.
-        metric: String,
-        /// Prometheus type name, such as `"histogram"` or `"summary"`.
-        metric_type: &'static str,
-    },
-
     /// Unexpected token while lexing or parsing the exposition grammar.
     #[error("{expected} at byte {offset}")]
     Syntax {
