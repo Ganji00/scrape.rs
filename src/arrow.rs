@@ -40,7 +40,7 @@ use self::columns::{
     AttrEncoding, HistogramDpTable, MetricTable, NumberDpTable, ScratchBuffers, SummaryDpTable,
     f64_to_u64_count, ms_to_ns, parse_hex_array,
 };
-use self::family::{CurrentFamily, FamilyAssembly, PendingExemplar, SeriesRole};
+use self::family::{CurrentFamily, FamilyAssembly, SeriesRole};
 use self::intern::StringInterner;
 pub use self::options::{
     CounterSuffixPolicy, DEFAULT_MAX_DATA_POINTS_PER_BATCH, DecodeError, DecodeOptions, InfoPolicy,
@@ -774,7 +774,7 @@ impl ArrowDecoder {
                     && (bound.is_finite()
                         || (role == SeriesRole::HistogramBucket && bound == f64::INFINITY))
                 {
-                    self.assembly.points.push((group_idx as u32, bound, value));
+                    self.assembly.push_point(group_idx, bound, value);
                 }
             }
             SeriesRole::HistogramSum | SeriesRole::SummarySum => {
@@ -793,7 +793,7 @@ impl ArrowDecoder {
         {
             let full_input = parser.raw_series_parts().2;
             self.stage_pending_histogram_exemplar(
-                group_idx as u32,
+                group_idx,
                 ex_val,
                 ex_ts_ms,
                 ex_spans,
@@ -951,7 +951,7 @@ impl ArrowDecoder {
 
     fn stage_pending_histogram_exemplar(
         &mut self,
-        group_idx: u32,
+        group_idx: usize,
         ex_val: f64,
         ex_ts_ms: Option<i64>,
         ex_spans: &[LabelSpan],
@@ -963,17 +963,10 @@ impl ArrowDecoder {
             None => default_ts_ns.unwrap_or(0),
         };
         let attr_start = self.assembly.exemplar_attrs.len() as u32;
-        let (span_id, trace_id) = self.extract_exemplar_labels(0, ex_spans, full_input, false)?;
+        let ids = self.extract_exemplar_labels(0, ex_spans, full_input, false)?;
         let attr_len = (self.assembly.exemplar_attrs.len() as u32) - attr_start;
-        self.assembly.exemplars.push(PendingExemplar {
-            group_idx,
-            ts_ns,
-            value: ex_val,
-            span_id,
-            trace_id,
-            attr_start,
-            attr_len,
-        });
+        self.assembly
+            .push_exemplar(group_idx, ts_ns, ex_val, ids, attr_start, attr_len);
         Ok(())
     }
 

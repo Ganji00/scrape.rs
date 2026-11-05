@@ -536,3 +536,46 @@ fn interleaved_family_starts_fresh_untyped_run() {
         .unwrap();
     assert_eq!(streamed, vec![records]);
 }
+
+#[test]
+fn interleaved_histogram_lines_and_group_rehashing_assemble_correctly() {
+    let mut payload = String::from("# TYPE h histogram\n");
+    for i in 0..32_u64 {
+        payload.push_str(&format!("h_bucket{{id=\"{i}\",le=\"1\"}} {i}\n"));
+        payload.push_str(&format!(
+            "h_bucket{{id=\"{i}\",le=\"+Inf\"}} {}\n",
+            i * 2 + 1
+        ));
+    }
+    for i in 0..32_u64 {
+        payload.push_str(&format!("h_sum{{id=\"{i}\"}} {}.5\n", i * 10));
+    }
+    for i in 0..32_u64 {
+        payload.push_str(&format!("h_count{{id=\"{i}\"}} {}\n", i * 2 + 1));
+    }
+
+    let mut dec = ArrowDecoder::new();
+    let records = dec
+        .decode(payload.as_bytes(), &Format::TEXT, &DecodeOptions::default())
+        .unwrap();
+    assert_eq!(records.num_metrics(), 1);
+    assert_eq!(records.num_data_points(), 32);
+
+    let hdp = records.histogram_data_points().unwrap();
+    let counts = hdp
+        .column_by_name("count")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::UInt64Array>()
+        .unwrap();
+    let sums = hdp
+        .column_by_name("sum")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::Float64Array>()
+        .unwrap();
+    for i in 0..32_usize {
+        assert_eq!(counts.value(i), (i as u64) * 2 + 1);
+        assert_eq!(sums.value(i), (i as f64) * 10.0 + 0.5);
+    }
+}

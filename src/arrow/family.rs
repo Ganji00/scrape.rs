@@ -293,8 +293,41 @@ impl CurrentFamily {
     }
 }
 
+/// Sentinel index (`u32::MAX`) marking an empty linked-list pointer or hash-table slot in
+/// [`FamilyAssembly`].
+const NONE_IDX: u32 = u32::MAX;
+
+/// Multiplicative constant from `rustc-hash` (`FxHasher`) used to hash interned `(key_id, val_id)`
+/// attribute slices when indexing [`FamilyAssembly`] groups.
+const FX_SEED: u64 = 0x517c_c1b7_2722_0a95;
+
+#[inline]
+fn hash_attrs(attrs: &[(u32, u32)]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for &(k, v) in attrs {
+        let word = (u64::from(k) << 32) | u64::from(v);
+        hash = (hash.rotate_left(5) ^ word).wrapping_mul(FX_SEED);
+    }
+    hash ^= hash >> 32;
+    hash = hash.wrapping_mul(FX_SEED);
+    hash ^ (hash >> 32)
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct GroupBucket {
+    hash: u64,
+    group_idx: u32,
+}
+
+impl GroupBucket {
+    const EMPTY: Self = Self {
+        hash: 0,
+        group_idx: NONE_IDX,
+    };
+}
+
 /// Assembled data-point group within the active `Histogram`, `GaugeHistogram`, or `Summary` family.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub(super) struct PendingDpGroup {
     pub(super) attr_start: u32,
     pub(super) attr_len: u32,
@@ -303,18 +336,49 @@ pub(super) struct PendingDpGroup {
     pub(super) ts_ns: Option<i64>,
     pub(super) count: Option<u64>,
     pub(super) sum: Option<f64>,
+    pub(super) point_head: u32,
+    pub(super) point_tail: u32,
+    pub(super) exemplar_head: u32,
+    pub(super) exemplar_tail: u32,
 }
 
-/// Staged exemplar within an active `Histogram` or `GaugeHistogram` family.
+impl PendingDpGroup {
+    fn new(attr_start: u32, attr_len: u32) -> Self {
+        Self {
+            attr_start,
+            attr_len,
+            start_ts_ns: None,
+            start_ts_checked: false,
+            ts_ns: None,
+            count: None,
+            sum: None,
+            point_head: NONE_IDX,
+            point_tail: NONE_IDX,
+            exemplar_head: NONE_IDX,
+            exemplar_tail: NONE_IDX,
+        }
+    }
+}
+
+/// Staged bucket or quantile sample linked to a [`PendingDpGroup`].
+#[derive(Clone, Copy)]
+pub(super) struct PendingPoint {
+    pub(super) bound: f64,
+    pub(super) value: f64,
+    pub(super) next: u32,
+}
+
+/// Staged exemplar linked to a [`PendingDpGroup`] within an active `Histogram` or
+/// `GaugeHistogram` family.
 #[derive(Clone, Copy)]
 pub(super) struct PendingExemplar {
-    pub(super) group_idx: u32,
     pub(super) ts_ns: i64,
     pub(super) value: f64,
     pub(super) span_id: Option<[u8; 8]>,
     pub(super) trace_id: Option<[u8; 16]>,
     pub(super) attr_start: u32,
     pub(super) attr_len: u32,
+    pub(super) next: u32,
 }
 
 /// Flat per-family staging buffers used to assemble multi-line `Histogram`, `GaugeHistogram`, and
@@ -322,8 +386,9 @@ pub(super) struct PendingExemplar {
 #[derive(Default)]
 pub(super) struct FamilyAssembly {
     pub(super) groups: Vec<PendingDpGroup>,
+    pub(super) group_buckets: Vec<GroupBucket>,
     pub(super) group_attrs: Vec<(u32, u32)>,
-    pub(super) points: Vec<(u32, f64, f64)>,
+    pub(super) points: Vec<PendingPoint>,
     pub(super) exemplars: Vec<PendingExemplar>,
     pub(super) exemplar_attrs: Vec<(u32, u32)>,
     pub(super) group_points: Vec<(f64, f64)>,
@@ -332,6 +397,9 @@ pub(super) struct FamilyAssembly {
 
 impl FamilyAssembly {
     pub(super) fn clear(&mut self) {
+        if !self.groups.is_empty() {
+            self.group_buckets.fill(GroupBucket::EMPTY);
+        }
         self.groups.clear();
         self.group_attrs.clear();
         self.points.clear();
@@ -343,8 +411,9 @@ impl FamilyAssembly {
 
     pub(super) fn retained_memory_bytes(&self) -> usize {
         self.groups.capacity() * size_of::<PendingDpGroup>()
+            + self.group_buckets.capacity() * size_of::<GroupBucket>()
             + self.group_attrs.capacity() * size_of::<(u32, u32)>()
-            + self.points.capacity() * size_of::<(u32, f64, f64)>()
+            + self.points.capacity() * size_of::<PendingPoint>()
             + self.exemplars.capacity() * size_of::<PendingExemplar>()
             + self.exemplar_attrs.capacity() * size_of::<(u32, u32)>()
             + self.group_points.capacity() * size_of::<(f64, f64)>()
@@ -367,16 +436,30 @@ impl FamilyAssembly {
                 return true;
             }
         }
-
-        for (idx, g) in self.groups.iter().enumerate() {
-            let start = g.attr_start as usize;
-            let end = start + g.attr_len as usize;
-            if self.group_attrs[start..end] == attrs[..] {
-                self.last_group_idx = Some(idx);
-                return true;
-            }
+        if self.groups.is_empty() || self.group_buckets.is_empty() {
+            return false;
         }
-        false
+
+        let hash = hash_attrs(attrs);
+        let mask = self.group_buckets.len() - 1;
+        let mut slot = (hash as usize) & mask;
+        loop {
+            let bucket = self.group_buckets[slot];
+            if bucket.group_idx == NONE_IDX {
+                return false;
+            }
+            if bucket.hash == hash {
+                let idx = bucket.group_idx as usize;
+                let g = self.groups[idx];
+                let start = g.attr_start as usize;
+                let end = start + g.attr_len as usize;
+                if self.group_attrs[start..end] == attrs[..] {
+                    self.last_group_idx = Some(idx);
+                    return true;
+                }
+            }
+            slot = (slot + 1) & mask;
+        }
     }
 
     #[inline]
@@ -392,41 +475,125 @@ impl FamilyAssembly {
             }
         }
 
-        for (idx, g) in self.groups.iter().enumerate() {
-            let start = g.attr_start as usize;
-            let end = start + g.attr_len as usize;
-            if self.group_attrs[start..end] == attrs[..] {
-                self.last_group_idx = Some(idx);
-                return idx;
+        if self.group_buckets.is_empty() {
+            self.group_buckets.resize(16, GroupBucket::EMPTY);
+        }
+
+        let hash = hash_attrs(attrs);
+        let mask = self.group_buckets.len() - 1;
+        let mut slot = (hash as usize) & mask;
+        loop {
+            let bucket = self.group_buckets[slot];
+            if bucket.group_idx == NONE_IDX {
+                break;
             }
+            if bucket.hash == hash {
+                let idx = bucket.group_idx as usize;
+                let g = self.groups[idx];
+                let start = g.attr_start as usize;
+                let end = start + g.attr_len as usize;
+                if self.group_attrs[start..end] == attrs[..] {
+                    self.last_group_idx = Some(idx);
+                    return idx;
+                }
+            }
+            slot = (slot + 1) & mask;
         }
 
         let attr_start = self.group_attrs.len() as u32;
         let attr_len = attrs.len() as u32;
         self.group_attrs.extend_from_slice(attrs);
         let idx = self.groups.len();
-        self.groups.push(PendingDpGroup {
-            attr_start,
-            attr_len,
-            ..PendingDpGroup::default()
-        });
+        self.groups.push(PendingDpGroup::new(attr_start, attr_len));
+        self.group_buckets[slot] = GroupBucket {
+            hash,
+            group_idx: idx as u32,
+        };
+        if self.groups.len() * 10 >= self.group_buckets.len() * 7 {
+            self.rehash_groups();
+        }
         self.last_group_idx = Some(idx);
         idx
     }
 
+    #[cold]
+    fn rehash_groups(&mut self) {
+        let new_cap = (self.group_buckets.len() * 2).max(16);
+        let mask = new_cap - 1;
+        let mut next_buckets = vec![GroupBucket::EMPTY; new_cap];
+        for &bucket in &self.group_buckets {
+            if bucket.group_idx == NONE_IDX {
+                continue;
+            }
+            let mut slot = (bucket.hash as usize) & mask;
+            while next_buckets[slot].group_idx != NONE_IDX {
+                slot = (slot + 1) & mask;
+            }
+            next_buckets[slot] = bucket;
+        }
+        self.group_buckets = next_buckets;
+    }
+
     #[inline]
-    fn collect_sorted_group_points(&mut self, group_idx: u32) {
+    pub(super) fn push_point(&mut self, group_idx: usize, bound: f64, value: f64) {
+        let pt_idx = self.points.len() as u32;
+        self.points.push(PendingPoint {
+            bound,
+            value,
+            next: NONE_IDX,
+        });
+        let group = &mut self.groups[group_idx];
+        if group.point_tail == NONE_IDX {
+            group.point_head = pt_idx;
+        } else {
+            self.points[group.point_tail as usize].next = pt_idx;
+        }
+        group.point_tail = pt_idx;
+    }
+
+    #[inline]
+    pub(super) fn push_exemplar(
+        &mut self,
+        group_idx: usize,
+        ts_ns: i64,
+        value: f64,
+        (span_id, trace_id): super::SpanAndTraceId,
+        attr_start: u32,
+        attr_len: u32,
+    ) {
+        let ex_idx = self.exemplars.len() as u32;
+        self.exemplars.push(PendingExemplar {
+            ts_ns,
+            value,
+            span_id,
+            trace_id,
+            attr_start,
+            attr_len,
+            next: NONE_IDX,
+        });
+        let group = &mut self.groups[group_idx];
+        if group.exemplar_tail == NONE_IDX {
+            group.exemplar_head = ex_idx;
+        } else {
+            self.exemplars[group.exemplar_tail as usize].next = ex_idx;
+        }
+        group.exemplar_tail = ex_idx;
+    }
+
+    #[inline]
+    fn collect_sorted_group_points(&mut self, point_head: u32) {
         self.group_points.clear();
         let mut sorted = true;
         let mut prev_bound = f64::NEG_INFINITY;
-        for &(g, bound, val) in &self.points {
-            if g == group_idx {
-                if bound < prev_bound {
-                    sorted = false;
-                }
-                prev_bound = bound;
-                self.group_points.push((bound, val));
+        let mut cur = point_head;
+        while cur != NONE_IDX {
+            let pt = self.points[cur as usize];
+            if pt.bound < prev_bound {
+                sorted = false;
             }
+            prev_bound = pt.bound;
+            self.group_points.push((pt.bound, pt.value));
+            cur = pt.next;
         }
         if !sorted {
             self.group_points
@@ -476,7 +643,7 @@ impl FamilyAssembly {
                     sum_dp.counts.push(dp_index, group.count);
                     sum_dp.sums.push(dp_index, group.sum);
 
-                    self.collect_sorted_group_points(group_idx as u32);
+                    self.collect_sorted_group_points(group.point_head);
                     for &(q, val) in &self.group_points {
                         sum_dp.quantile_bounds.push(q);
                         sum_dp.quantile_vals.push(val);
@@ -514,8 +681,7 @@ impl FamilyAssembly {
                         .base
                         .push(parent_id, group.start_ts_ns, group.ts_ns.or(default_ts_ns));
 
-                    let g_u32 = group_idx as u32;
-                    self.collect_sorted_group_points(g_u32);
+                    self.collect_sorted_group_points(group.point_head);
 
                     let mut prev_cum = 0u64;
                     let mut inf_cum: Option<u64> = None;
@@ -555,11 +721,10 @@ impl FamilyAssembly {
                     hist_dp.counts.push(dp_index, final_count);
                     hist_dp.sums.push(dp_index, group.sum);
 
-                    for ex_idx in 0..self.exemplars.len() {
-                        let ex = self.exemplars[ex_idx];
-                        if ex.group_idx != g_u32 {
-                            continue;
-                        }
+                    let mut ex_cur = group.exemplar_head;
+                    while ex_cur != NONE_IDX {
+                        let ex = self.exemplars[ex_cur as usize];
+                        ex_cur = ex.next;
                         let hist_ex_id = hist_dp.exemplars.next_id("HistogramDpExemplars")?;
                         hist_dp.exemplars.push_row(
                             dp_id,
