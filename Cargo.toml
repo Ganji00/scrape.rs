@@ -26,7 +26,7 @@ prost-types = { version = "0.14", optional = true }
 thiserror = "2"
 
 [dev-dependencies]
-criterion = { version = "0.8", default-features = false }
+benchfmt = { git = "https://github.com/bwplotka/benchfmt.rs" }
 prost-build = "=0.14.4"
 protox = "0.10"
 
