@@ -14,6 +14,8 @@
 //! Lexer for the Prometheus text format 0.0.4, a hand-written port of
 //! [`promlex.l`](https://github.com/prometheus/prometheus/blob/main/model/textparse/promlex.l).
 
+use super::ByteSpan;
+
 /// Lexer states, named after the start conditions in `promlex.l`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
@@ -27,6 +29,14 @@ enum State {
     LValue,
     Value,
     Timestamp,
+}
+
+/// Lifetime-free cursor state of [`Lexer`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LexerState {
+    pub(super) pos: usize,
+    pub(super) token_start: usize,
+    state: State,
 }
 
 /// Lexer tokens, named after the tokens in Go's promparse.go.
@@ -136,6 +146,25 @@ impl<'a> Lexer<'a> {
     }
 
     #[inline]
+    pub(super) fn into_state(self) -> LexerState {
+        LexerState {
+            pos: self.pos,
+            token_start: self.token_start,
+            state: self.state,
+        }
+    }
+
+    #[inline]
+    pub(super) fn from_state(input: &'a [u8], state: LexerState) -> Self {
+        Self {
+            input,
+            pos: state.pos,
+            token_start: state.token_start,
+            state: state.state,
+        }
+    }
+
+    #[inline]
     fn len(&self) -> usize {
         self.input.len() + 1
     }
@@ -155,9 +184,14 @@ impl<'a> Lexer<'a> {
     }
 
     #[inline]
-    pub(super) fn token(&self) -> &'a [u8] {
+    pub(super) fn token_span(&self) -> ByteSpan {
         let end = self.input.len();
-        &self.input[self.token_start.min(end)..self.pos.min(end)]
+        ByteSpan::new(self.token_start.min(end), self.pos.min(end))
+    }
+
+    #[inline]
+    pub(super) fn token(&self) -> &'a [u8] {
+        self.token_span().slice(self.input)
     }
 
     // Go's lexer skips NUL bytes inside label values, help text and comments,
