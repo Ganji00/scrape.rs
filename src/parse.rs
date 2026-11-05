@@ -25,10 +25,10 @@ mod promlex;
 mod promparse;
 
 pub(crate) use float::parse_go_float;
-pub(crate) use omparse::OmScratch;
 pub use omparse::OpenMetricsParser;
+pub(crate) use omparse::{OmScratch, OpenMetricsParserState};
 pub use promparse::PromParser;
-pub(crate) use promparse::{LabelSpan, unescape_bytes_into};
+pub(crate) use promparse::{ByteSpan, LabelSpan, PromParserState, unescape_bytes_into};
 
 /// Label name under which [`Parser::labels`] stores the metric name.
 pub const METRIC_NAME_LABEL: &str = "__name__";
@@ -223,6 +223,9 @@ impl<'a> LabelsBuffer<'a> {
 pub trait Parser<'a> {
     /// Advances to the next entry in the exposition stream, returning `Ok(None)` at EOF.
     fn next_entry(&mut self) -> Result<Option<Entry>, ParseError>;
+
+    /// Returns the current byte offset of the parser cursor in the input slice (`0..=input.len()`).
+    fn pos(&self) -> usize;
 
     /// Returns the metric name and unescaped help text of the current [`Entry::Help`].
     fn help(&self) -> (&'a [u8], Cow<'a, [u8]>);
