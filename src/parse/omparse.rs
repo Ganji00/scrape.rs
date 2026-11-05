@@ -91,10 +91,9 @@ pub struct OpenMetricsParser<'a> {
     exemplar_labels: Vec<LabelSpan>,
     /// Labels buffer lent to the start timestamp lookahead, so it does not allocate per call.
     peek_labels: Vec<LabelSpan>,
-    /// Go's start timestamp cache: the series key and start timestamp (`Some(None)` when no
-    /// `_created` line exists for that series) of the last lookup.
+    /// Go's start timestamp cache: the series key and start timestamp of the last hit.
     start_timestamp_key: Vec<u8>,
-    start_timestamp: Option<Option<i64>>,
+    start_timestamp: Option<i64>,
 }
 
 impl<'a> OpenMetricsParser<'a> {
@@ -548,7 +547,7 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
     }
 
     /// Peeks ahead for the `_created` line of the current series, like Go's `StartTimestamp`,
-    /// caching the result for the current series key.
+    /// including its cache of the last hit.
     fn start_timestamp(&mut self) -> Option<i64> {
         if !requires_start_timestamp(self.metric_type) {
             self.start_timestamp = None;
@@ -560,12 +559,11 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
                 .series_key(family)
                 .eq(self.start_timestamp_key.iter().copied())
         {
-            return cached;
+            return Some(cached);
         }
         let mut peek = OpenMetricsParser::new(self.lexer.input);
         peek.lexer = self.lexer.clone();
         peek.peeking = true;
-        peek.family_name_len = self.family_name_len;
         peek.metric_type = self.metric_type;
         peek.labels = std::mem::take(&mut self.peek_labels);
         let found = loop {
@@ -573,12 +571,6 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
                 break None;
             }
             let Some(peeked_family) = peek.metric_name().strip_suffix(CREATED_SUFFIX) else {
-                if !peek
-                    .series_key(peek.family_name())
-                    .eq(self.series_key(family))
-                {
-                    break None;
-                }
                 continue;
             };
             let same_series = peek.series_key(peeked_family).eq(self.series_key(family));
@@ -586,11 +578,13 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
             break (same_series && peek.value.is_finite()).then_some((peek.value * 1000.0) as i64);
         };
         self.peek_labels = std::mem::take(&mut peek.labels);
-        let mut key = std::mem::take(&mut self.start_timestamp_key);
-        key.clear();
-        key.extend(self.series_key(family));
-        self.start_timestamp_key = key;
-        self.start_timestamp = Some(found);
+        if found.is_some() {
+            let mut key = std::mem::take(&mut self.start_timestamp_key);
+            key.clear();
+            key.extend(self.series_key(family));
+            self.start_timestamp_key = key;
+        }
+        self.start_timestamp = found;
         found
     }
 }
@@ -826,6 +820,18 @@ mod tests {
             [
                 ("x_total".to_owned(), Some(7000)),
                 ("x_total".to_owned(), None)
+            ]
+        );
+    }
+
+    #[test]
+    fn start_timestamp_scans_past_other_series() {
+        let input = b"# TYPE foo counter\nfoo_total{a=\"1\"} 1\nfoo_total{a=\"2\"} 2\nfoo_created{a=\"1\"} 100\n# EOF\n";
+        assert_eq!(
+            start_timestamps(input),
+            [
+                ("foo_total".to_owned(), Some(100_000)),
+                ("foo_total".to_owned(), None)
             ]
         );
     }
