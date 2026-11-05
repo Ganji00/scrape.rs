@@ -497,7 +497,6 @@ impl ArrowDecoder {
 
                     if CHUNKED
                         && self.assembly.is_empty()
-                        && role != SeriesRole::CounterCreated
                         && (self.total_data_points() >= max_data_points
                             || (self.current_family.batch_id.is_none()
                                 && self.metrics.len() >= MAX_METRICS_PER_BATCH))
@@ -510,15 +509,9 @@ impl ArrowDecoder {
 
                     self.ingest_series_entry(parser, role, opts, default_ts_ns)?;
 
-                    // In Prometheus text format, a counter's optional `_created` line immediately
-                    // follows its `_total` sample, so defer flushing at the chunk boundary until
-                    // the next entry is inspected.
                     if CHUNKED
                         && self.assembly.is_empty()
                         && self.total_data_points() >= max_data_points
-                        && (self.current_family.metric_type != MetricType::Counter
-                            || parser.is_openmetrics()
-                            || role == SeriesRole::CounterCreated)
                     {
                         let batch = self.finish_batches(default_ts_ns.is_some())?;
                         self.reset_batch();
@@ -626,17 +619,12 @@ impl ArrowDecoder {
     ) -> Result<(), DecodeError> {
         match role {
             SeriesRole::Scalar => self.append_scalar_series(parser, opts, default_ts_ns),
-            SeriesRole::CounterCreated => self.append_counter_created_series(parser),
             SeriesRole::HistogramBucket
             | SeriesRole::HistogramSum
             | SeriesRole::HistogramCount
-            | SeriesRole::HistogramCreated
             | SeriesRole::SummaryQuantile
             | SeriesRole::SummarySum
-            | SeriesRole::SummaryCount
-            | SeriesRole::SummaryCreated => {
-                self.append_assembled_series(parser, role, default_ts_ns)
-            }
+            | SeriesRole::SummaryCount => self.append_assembled_series(parser, role, default_ts_ns),
         }
     }
 
@@ -691,10 +679,8 @@ impl ArrowDecoder {
             count: dp_index + 1,
         })?;
 
-        let attr_start = self.num_dp.attrs.len();
         self.extract_series_labels_into_temp(label_spans, full_input, None)?;
         self.num_dp.attrs.extend_for_parent(dp_id, &self.temp_attrs);
-        self.num_dp.last_counter_dp_attr_start = attr_start;
 
         if let Some((ex_val, ex_ts_ms, ex_spans)) = exemplar_parts {
             self.append_number_exemplar(
@@ -722,36 +708,6 @@ impl ArrowDecoder {
             .base
             .push(parent_id, start_ts_ns, resolved_ts_ns);
         self.num_dp.values.push(value);
-        Ok(())
-    }
-
-    fn append_counter_created_series(
-        &mut self,
-        parser: &ActiveParser<'_>,
-    ) -> Result<(), DecodeError> {
-        let (_, label_spans, full_input, _, value) = parser.raw_series_parts();
-        self.extract_series_labels_into_temp(label_spans, full_input, None)?;
-        self.current_family.has_samples = true;
-        if !value.is_finite() {
-            return Ok(());
-        }
-        let created_ms = (value * 1000.0) as i64;
-        let created_ns = ms_to_ns(created_ms)?;
-
-        // Attach `_created` in Prometheus text to the preceding counter data point of the active
-        // family when its base labels match.
-        if let Some(batch_id) = self.current_family.batch_id
-            && let Some(&last_parent) = self.num_dp.base.parent_ids.last()
-            && last_parent == batch_id
-            && self.num_dp.attrs.pairs[self.num_dp.last_counter_dp_attr_start..]
-                == self.temp_attrs[..]
-        {
-            let total_rows = self.num_dp.base.len();
-            self.num_dp
-                .base
-                .start_time
-                .set(total_rows, total_rows - 1, created_ns);
-        }
         Ok(())
     }
 
@@ -815,13 +771,7 @@ impl ArrowDecoder {
             SeriesRole::HistogramCount | SeriesRole::SummaryCount => {
                 group.count = Some(f64_to_u64_count(value));
             }
-            SeriesRole::HistogramCreated | SeriesRole::SummaryCreated => {
-                if value.is_finite() {
-                    let created_ms = (value * 1000.0) as i64;
-                    group.start_ts_ns = Some(ms_to_ns(created_ms)?);
-                }
-            }
-            SeriesRole::Scalar | SeriesRole::CounterCreated => {}
+            SeriesRole::Scalar => {}
         }
 
         if matches!(

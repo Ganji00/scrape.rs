@@ -169,14 +169,11 @@ fn rejects_invalid_metadata_and_duplicate_labels() {
         .unwrap_err();
     assert!(matches!(err, DecodeError::DuplicateOrLateHelp { ref metric } if metric == "m"));
 
-    // `# HELP` appearing after a sample (or counter `_created` line) has already been emitted.
-    for payload in [
-        b"m 1\n# HELP m late\n" as &[u8],
-        b"# TYPE m counter\nm_created 1700000000\n# HELP m late\nm_total 1\n",
-    ] {
-        let err = dec.decode(payload, &Format::TEXT, &opts).unwrap_err();
-        assert!(matches!(err, DecodeError::DuplicateOrLateHelp { ref metric } if metric == "m"));
-    }
+    // `# HELP` appearing after a sample has already been emitted.
+    let err = dec
+        .decode(b"m 1\n# HELP m late\n", &Format::TEXT, &opts)
+        .unwrap_err();
+    assert!(matches!(err, DecodeError::DuplicateOrLateHelp { ref metric } if metric == "m"));
 
     // Duplicate `# TYPE`.
     let err = dec
@@ -446,33 +443,29 @@ fn decode_stream_splits_mid_family_preserves_metadata_and_handles_edges() {
     assert_eq!(assembled_chunks[1].num_data_points(), 1);
     assert!(assembled_chunks[1].summary_data_points().is_some());
 
-    // Counter `_created` lines in Prometheus text stay attached to their preceding `_total`
-    // row even when `max_data_points_per_batch = 1`.
-    let counter_created_stream = concat!(
-        "# TYPE c counter\n",
-        "c_total{id=\"1\"} 10\n",
-        "c_created{id=\"1\"} 1700000000\n",
-        "c_total{id=\"2\"} 20\n",
-        "c_created{id=\"2\"} 1700000001\n",
+    // In Prometheus text format (`Format::TEXT`), `*_created` lines are regular metrics rather
+    // than OpenMetrics start timestamps, so non-adjacent `foo_created` lines are preserved as
+    // their own metric family instead of being dropped or attached to `foo_total`.
+    let text_created_payload = concat!(
+        "# TYPE foo counter\n",
+        "foo_total{a=\"1\"} 1\n",
+        "foo_total{a=\"2\"} 2\n",
+        "foo_created{a=\"1\"} 100\n",
     );
-    let counter_chunks: Vec<_> = dec
-        .decode_stream(counter_created_stream.as_bytes(), &Format::TEXT, &zero_opts)
-        .collect::<Result<Vec<_>, _>>()
+    let text_created = dec
+        .decode(text_created_payload.as_bytes(), &Format::TEXT, &opts)
         .unwrap();
-    assert_eq!(counter_chunks.len(), 2);
-    for (idx, expected_start_ns) in [1_700_000_000_000_000_000i64, 1_700_000_001_000_000_000]
-        .into_iter()
-        .enumerate()
-    {
-        let ndp = counter_chunks[idx].number_data_points().unwrap();
-        let start_col = ndp
-            .column_by_name("start_time_unix_nano")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<TimestampNanosecondArray>()
-            .unwrap();
-        assert_eq!(start_col.value(0), expected_start_ns);
-    }
+    assert_eq!(text_created.num_metrics(), 2);
+    assert_eq!(text_created.num_data_points(), 3);
+    let text_created_um = text_created.univariate_metrics().unwrap();
+    let text_created_names = text_created_um
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(text_created_names.value(0), "foo_total");
+    assert_eq!(text_created_names.value(1), "foo_created");
 
     // Init errors surface on the first `next()` and fuse the iterator.
     let mut bad_fmt = dec.decode_stream(b"m 1\n", &Format::UNKNOWN, &opts);

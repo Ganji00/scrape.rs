@@ -568,20 +568,6 @@ impl SparseTimestampCol {
     }
 
     #[inline]
-    pub(super) fn set(&mut self, total_rows: usize, row_index: usize, val: i64) {
-        if self.values.is_empty() {
-            self.values.resize(total_rows, 0);
-            if total_rows > 1 {
-                self.valid.resize(total_rows, false);
-            }
-        }
-        self.values[row_index] = val;
-        if !self.valid.is_empty() {
-            self.valid[row_index] = true;
-        }
-    }
-
-    #[inline]
     pub(super) fn to_array(&self, nullable: bool) -> ArrayRef {
         let nulls =
             nullable.then(|| NullBuffer::new(BooleanBuffer::from_iter(self.valid.iter().copied())));
@@ -1000,7 +986,6 @@ pub(super) struct NumberDpTable {
     pub(super) base: DpBaseCols,
     pub(super) values: Vec<f64>,
     pub(super) attrs: AttrTable,
-    pub(super) last_counter_dp_attr_start: usize,
     pub(super) exemplars: ExemplarTable,
 }
 
@@ -1010,7 +995,6 @@ impl NumberDpTable {
             base: DpBaseCols::with_capacity(data_points),
             values: Vec::with_capacity(data_points),
             attrs: AttrTable::with_capacity(attrs),
-            last_counter_dp_attr_start: 0,
             exemplars: ExemplarTable::default(),
         }
     }
@@ -1019,7 +1003,6 @@ impl NumberDpTable {
         self.base.clear();
         self.values.clear();
         self.attrs.clear();
-        self.last_counter_dp_attr_start = 0;
         self.exemplars.clear();
     }
 

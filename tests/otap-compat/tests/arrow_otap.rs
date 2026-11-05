@@ -468,8 +468,8 @@ fn histograms_summaries_exemplars_and_openmetrics_types_round_trip_through_otlp(
 }
 
 #[test]
-fn gaugehistogram_text_created_unsorted_bounds_nullable_sums_and_exemplar_nulls_validate_in_otap() {
-    // 1. OpenMetrics `gaugehistogram` with `_bucket`, `_gsum`, `_gcount`, `_created`, unsorted
+fn gaugehistogram_unsorted_bounds_nullable_sums_and_exemplar_nulls_validate_in_otap() {
+    // 1. OpenMetrics `gaugehistogram` with `_bucket`, `_gsum`, `_gcount`, unsorted
     //    `le` buckets, ignored `le="-Inf"`, multiple exemplars with mixed `span_id`/`trace_id`
     //    presence and uppercase hex digits, plus a second series omitting `_gsum` so
     //    `histogram_sum` is nullable.
@@ -481,7 +481,6 @@ fn gaugehistogram_text_created_unsorted_bounds_nullable_sums_and_exemplar_nulls_
         "queue_bytes_bucket{shard=\"0\",le=\"+Inf\"} 6 1710000000.0\n",
         "queue_bytes_gsum{shard=\"0\"} 42.0 1710000000.0\n",
         "queue_bytes_gcount{shard=\"0\"} 6 1710000000.0\n",
-        "queue_bytes_created{shard=\"0\"} 1709000000.0\n",
         "queue_bytes_bucket{shard=\"1\",le=\"+Inf\"} 3 1710000000.0\n",
         "# EOF\n",
     );
@@ -506,7 +505,6 @@ fn gaugehistogram_text_created_unsorted_bounds_nullable_sums_and_exemplar_nulls_
     let om_round_tripped = otap_to_otlp(&om_otap);
 
     let ts_ns = 1_710_000_000_000_000_000_u64;
-    let start_ns = 1_709_000_000_000_000_000_u64;
     let om_expected = OtlpProtoMessage::Metrics(to_metrics_data(vec![Metric {
         name: "queue_bytes".to_owned(),
         description: String::new(),
@@ -517,7 +515,7 @@ fn gaugehistogram_text_created_unsorted_bounds_nullable_sums_and_exemplar_nulls_
             data_points: vec![
                 HistogramDataPoint {
                     attributes: vec![kv_str("shard", "0")],
-                    start_time_unix_nano: start_ns,
+                    start_time_unix_nano: 0,
                     time_unix_nano: ts_ns,
                     count: 6,
                     sum: Some(42.0),
@@ -565,22 +563,20 @@ fn gaugehistogram_text_created_unsorted_bounds_nullable_sums_and_exemplar_nulls_
     assert_equivalent(std::slice::from_ref(&om_expected), &[om_plain]);
     assert_equivalent(&[om_expected], &[om_round_tripped]);
 
-    // 2. Prometheus text format (`Format::TEXT`) with `_created` lines across counters,
-    //    histograms, and summaries (mixed presence across series), unsorted summary quantiles,
-    //    ignored non-finite quantile bounds (`+Inf`, `-Inf`, `NaN`), and attribute-free exemplars
-    //    in OpenMetrics (`has_id = false` on `NumberDpExemplars`).
+    // 2. Prometheus text format (`Format::TEXT`) with unsorted histogram bounds, unsorted summary
+    //    quantiles, ignored non-finite quantile bounds (`+Inf`, `-Inf`, `NaN`), and `*_created`
+    //    lines treated as regular metrics rather than OpenMetrics start timestamps.
     let text_payload = concat!(
         "# TYPE c counter\n",
         "c_total{id=\"a\"} 10 1710000000000\n",
-        "c_created{id=\"a\"} 1709000000.0\n",
         "c_total{id=\"b\"} 20 1710000000000\n",
+        "c_created{id=\"a\"} 1709000000.0 1710000000000\n",
         "# TYPE h histogram\n",
         "h_bucket{id=\"a\",le=\"5\"} 4 1710000000000\n",
         "h_bucket{id=\"a\",le=\"1\"} 1 1710000000000\n",
         "h_bucket{id=\"a\",le=\"+Inf\"} 4 1710000000000\n",
         "h_sum{id=\"a\"} 9.5 1710000000000\n",
         "h_count{id=\"a\"} 4 1710000000000\n",
-        "h_created{id=\"a\"} 1709000000.0\n",
         "# TYPE s summary\n",
         "s{id=\"a\",quantile=\"0.9\"} 9.0 1710000000000\n",
         "s{id=\"a\",quantile=\"0.5\"} 5.0 1710000000000\n",
@@ -589,18 +585,17 @@ fn gaugehistogram_text_created_unsorted_bounds_nullable_sums_and_exemplar_nulls_
         "s{id=\"a\",quantile=\"NaN\"} 0.0 1710000000000\n",
         "s_sum{id=\"a\"} 50.0 1710000000000\n",
         "s_count{id=\"a\"} 10 1710000000000\n",
-        "s_created{id=\"a\"} 1709000000.0\n",
     );
     let text_records = decoder
         .decode(text_payload.as_bytes(), &Format::TEXT, &opts)
-        .expect("Prometheus text _created payload decodes");
+        .expect("Prometheus text payload decodes");
     let mut text_otap = to_otap_arrow_records(&text_records);
     text_otap
         .encode_transport_optimized()
-        .expect("text _created transport optimize succeeds");
+        .expect("text transport optimize succeeds");
     text_otap
         .decode_transport_optimized_ids()
-        .expect("text _created transport decode succeeds");
+        .expect("text transport decode succeeds");
     let text_otlp = otap_to_otlp(&text_otap);
 
     let text_expected = OtlpProtoMessage::Metrics(to_metrics_data(vec![
@@ -613,16 +608,18 @@ fn gaugehistogram_text_created_unsorted_bounds_nullable_sums_and_exemplar_nulls_
                 aggregation_temporality: AggregationTemporality::Cumulative as i32,
                 is_monotonic: true,
                 data_points: vec![
-                    NumberDataPoint {
-                        attributes: vec![kv_str("id", "a")],
-                        start_time_unix_nano: start_ns,
-                        time_unix_nano: ts_ns,
-                        exemplars: Vec::new(),
-                        flags: 0,
-                        value: Some(number_data_point::Value::AsDouble(10.0)),
-                    },
+                    number_dp(&[("id", "a")], ts_ns, 10.0),
                     number_dp(&[("id", "b")], ts_ns, 20.0),
                 ],
+            })),
+        },
+        Metric {
+            name: "c_created".to_owned(),
+            description: String::new(),
+            unit: String::new(),
+            metadata: vec![kv_str(PROMETHEUS_TYPE_METADATA_KEY, "unknown")],
+            data: Some(metric::Data::Gauge(Gauge {
+                data_points: vec![number_dp(&[("id", "a")], ts_ns, 1_709_000_000.0)],
             })),
         },
         Metric {
@@ -634,7 +631,7 @@ fn gaugehistogram_text_created_unsorted_bounds_nullable_sums_and_exemplar_nulls_
                 aggregation_temporality: AggregationTemporality::Cumulative as i32,
                 data_points: vec![HistogramDataPoint {
                     attributes: vec![kv_str("id", "a")],
-                    start_time_unix_nano: start_ns,
+                    start_time_unix_nano: 0,
                     time_unix_nano: ts_ns,
                     count: 4,
                     sum: Some(9.5),
@@ -655,7 +652,7 @@ fn gaugehistogram_text_created_unsorted_bounds_nullable_sums_and_exemplar_nulls_
             data: Some(metric::Data::Summary(Summary {
                 data_points: vec![SummaryDataPoint {
                     attributes: vec![kv_str("id", "a")],
-                    start_time_unix_nano: start_ns,
+                    start_time_unix_nano: 0,
                     time_unix_nano: ts_ns,
                     count: 10,
                     sum: 50.0,

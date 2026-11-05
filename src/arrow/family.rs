@@ -29,15 +29,12 @@ use super::schema::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SeriesRole {
     Scalar,
-    CounterCreated,
     HistogramBucket,
     HistogramSum,
     HistogramCount,
-    HistogramCreated,
     SummaryQuantile,
     SummarySum,
     SummaryCount,
-    SummaryCreated,
 }
 
 /// Active contiguous metric-family cursor.
@@ -131,7 +128,6 @@ impl CurrentFamily {
                         b"_bucket" => Some(SeriesRole::HistogramBucket),
                         b"_sum" => Some(SeriesRole::HistogramSum),
                         b"_count" => Some(SeriesRole::HistogramCount),
-                        b"_created" => Some(SeriesRole::HistogramCreated),
                         _ => None,
                     })
             }
@@ -142,7 +138,6 @@ impl CurrentFamily {
                         b"_bucket" => Some(SeriesRole::HistogramBucket),
                         b"_gsum" | b"_sum" => Some(SeriesRole::HistogramSum),
                         b"_gcount" | b"_count" => Some(SeriesRole::HistogramCount),
-                        b"_created" => Some(SeriesRole::HistogramCreated),
                         _ => None,
                     })
             }
@@ -155,7 +150,6 @@ impl CurrentFamily {
                     .and_then(|suffix| match suffix {
                         b"_sum" => Some(SeriesRole::SummarySum),
                         b"_count" => Some(SeriesRole::SummaryCount),
-                        b"_created" => Some(SeriesRole::SummaryCreated),
                         _ => None,
                     })
             }
@@ -166,20 +160,9 @@ impl CurrentFamily {
                     }
                     return Some(SeriesRole::Scalar);
                 }
-                if let Some(suffix) = series_name.strip_prefix(fam) {
-                    if suffix == b"_total" {
-                        self.saw_total_suffix = true;
-                        return Some(SeriesRole::Scalar);
-                    }
-                    if suffix == b"_created" {
-                        return Some(SeriesRole::CounterCreated);
-                    }
-                }
-                if let Some(base) = fam.strip_suffix(b"_total")
-                    && !base.is_empty()
-                    && series_name.strip_prefix(base) == Some(b"_created")
-                {
-                    return Some(SeriesRole::CounterCreated);
+                if series_name.strip_prefix(fam) == Some(b"_total") {
+                    self.saw_total_suffix = true;
+                    return Some(SeriesRole::Scalar);
                 }
                 None
             }
