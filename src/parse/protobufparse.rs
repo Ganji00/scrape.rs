@@ -441,6 +441,9 @@ impl<'a> Parser<'a> for ProtobufParser<'a> {
                         self.switch_to_classic();
                         continue;
                     }
+                    // Go keeps both positions here and loses the next histogram's exemplars.
+                    self.field_pos = -2;
+                    self.exemplar_pos = 0;
                     if !self.next_metric() {
                         self.state = None;
                         continue;
@@ -925,5 +928,86 @@ mod tests {
             parse_all(&delimited(&[histogram_family("", vec![1, 0])])),
             Err(ParseError::InvalidMetricName { .. })
         ));
+    }
+
+    fn first_histogram(input: &[u8]) -> Histogram<u64, i64> {
+        let mut parser = ProtobufParser::new(input, false, false);
+        while let Some(entry) = parser.next_entry().unwrap() {
+            if let (Entry::Histogram, (_, _, HistogramRef::Int(histogram))) =
+                (entry, parser.histogram())
+            {
+                return histogram.clone();
+            }
+        }
+        panic!("no native histogram");
+    }
+
+    fn assert_compacts(
+        spans: &[(i32, u32)],
+        deltas: &[i64],
+        want_spans: &[(i32, u32)],
+        want_buckets: &[i64],
+    ) {
+        let to_spans = |spans: &[(i32, u32)]| -> Vec<Span> {
+            spans
+                .iter()
+                .map(|&(offset, length)| Span { offset, length })
+                .collect()
+        };
+        let mut family = histogram_family("h", deltas.to_vec());
+        family.metric[0].histogram.as_mut().unwrap().positive_span = spans
+            .iter()
+            .map(|&(offset, length)| dto::BucketSpan { offset, length })
+            .collect();
+        let histogram = first_histogram(&delimited(&[family]));
+        assert_eq!(histogram.positive_spans, to_spans(want_spans));
+        assert_eq!(histogram.positive_buckets, want_buckets);
+    }
+
+    #[test]
+    fn compacts_empty_buckets_like_go() {
+        // Expected values come from Go's NewProtobufParser at v0.315.1 on the same input.
+        assert_compacts(
+            &[(0, 2), (0, 2)],
+            &[1, -1, 2, -2],
+            &[(0, 1), (1, 1)],
+            &[1, 1],
+        );
+        assert_compacts(
+            &[(0, 2), (2, 2)],
+            &[1, -1, 0, 2],
+            &[(0, 1), (4, 1)],
+            &[1, 1],
+        );
+        assert_compacts(&[(0, 1), (0, 1)], &[1, 0], &[(0, 2)], &[1, 0]);
+    }
+
+    #[test]
+    fn returns_exemplars_of_each_native_histogram() {
+        let exemplar = |id: &str| dto::Exemplar {
+            label: vec![dto::LabelPair {
+                name: "id".to_owned(),
+                value: id.to_owned(),
+            }],
+            timestamp: Some(prost_types::Timestamp::default()),
+            ..Default::default()
+        };
+        let mut family = histogram_family("h", vec![1, 0]);
+        family.metric.push(family.metric[0].clone());
+        for (metric, id) in family.metric.iter_mut().zip(["e1", "e2"]) {
+            metric.histogram.as_mut().unwrap().exemplars = vec![exemplar(id)];
+        }
+        let input = delimited(&[family]);
+        let mut parser = ProtobufParser::new(&input, false, false);
+        let mut labels = LabelsBuffer::default();
+        let mut ids = Vec::new();
+        while let Some(entry) = parser.next_entry().unwrap() {
+            if entry == Entry::Histogram {
+                while parser.exemplar(&mut labels).is_some() {
+                    ids.push(labels.iter().next().unwrap().1.to_owned());
+                }
+            }
+        }
+        assert_eq!(ids, ["e1", "e2"]);
     }
 }
