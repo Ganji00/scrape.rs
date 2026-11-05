@@ -15,6 +15,7 @@
 //! [`promparse.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/promparse.go).
 
 use std::borrow::Cow;
+use std::ops::Index;
 
 use super::float::{
     FloatBuf, common_openmetrics_float, format_openmetrics_float, parse_go_float,
@@ -45,10 +46,14 @@ impl ByteSpan {
     pub(crate) const fn new(start: usize, end: usize) -> Self {
         Self { start, end }
     }
+}
+
+impl Index<ByteSpan> for [u8] {
+    type Output = [u8];
 
     #[inline]
-    pub(crate) fn slice(self, input: &[u8]) -> &[u8] {
-        &input[self.start..self.end]
+    fn index(&self, span: ByteSpan) -> &[u8] {
+        &self[span.start..span.end]
     }
 }
 
@@ -184,7 +189,7 @@ impl<'a> PromParser<'a> {
     /// Returns the raw metric name and raw (escaped) help text for `Entry::Help` without
     /// allocating a `Cow::Owned` buffer.
     pub(crate) fn raw_help(&self) -> (&'a [u8], &'a [u8]) {
-        (self.metric_name(), self.text.slice(self.lexer.input))
+        (self.metric_name(), &self.lexer.input[self.text])
     }
 
     /// Returns the raw metric name, validated UTF-8 label spans, full input slice, optional
@@ -234,7 +239,7 @@ impl<'a> PromParser<'a> {
             text_span.start.saturating_add(1).min(text_span.end),
             text_span.end,
         );
-        let text = self.text.slice(self.lexer.input);
+        let text = &self.lexer.input[self.text];
         let entry = if kind == Token::Type {
             self.last_type = parse_metric_type(text)?;
             Entry::Type
@@ -385,7 +390,7 @@ impl<'a> PromParser<'a> {
 
     #[inline]
     fn metric_name(&self) -> &'a [u8] {
-        self.name.map_or(b"", |span| span.slice(self.lexer.input))
+        self.name.map_or(b"", |span| &self.lexer.input[span])
     }
 }
 
@@ -415,7 +420,7 @@ impl<'a> Parser<'a> for PromParser<'a> {
     fn help(&self) -> (&'a [u8], Cow<'a, [u8]>) {
         (
             self.metric_name(),
-            unescape(self.text.slice(self.lexer.input), false),
+            unescape(&self.lexer.input[self.text], false),
         )
     }
 
@@ -424,15 +429,11 @@ impl<'a> Parser<'a> for PromParser<'a> {
     }
 
     fn comment(&self) -> &'a [u8] {
-        self.text.slice(self.lexer.input)
+        &self.lexer.input[self.text]
     }
 
     fn series(&self) -> (&'a [u8], Option<i64>, f64) {
-        (
-            self.series.slice(self.lexer.input),
-            self.timestamp,
-            self.value,
-        )
+        (&self.lexer.input[self.series], self.timestamp, self.value)
     }
 
     fn labels(&self, buf: &mut LabelsBuffer<'a>) {

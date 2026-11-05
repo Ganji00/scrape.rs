@@ -244,7 +244,7 @@ impl<'a> OpenMetricsParser<'a> {
 
     /// Returns the raw metric name and raw (escaped) help text for `Entry::Help`.
     pub(crate) fn raw_help(&self) -> (&'a [u8], &'a [u8]) {
-        (self.metric_name(), self.text.slice(self.lexer.input))
+        (self.metric_name(), &self.lexer.input[self.text])
     }
 
     /// Returns the raw metric name, validated UTF-8 label spans, full input slice, optional
@@ -298,7 +298,7 @@ impl<'a> OpenMetricsParser<'a> {
             return Err(self.unexpected("expected text"));
         }
         let text_span = self.lexer.token_span();
-        let text = text_span.slice(self.lexer.input);
+        let text = &self.lexer.input[text_span];
         // The text token starts with a blank and ends with a linebreak, which the lexer
         // can follow with NUL bytes.
         let end = text
@@ -307,7 +307,7 @@ impl<'a> OpenMetricsParser<'a> {
             .unwrap_or(text.len());
         let text_end = text_span.start + end;
         self.text = ByteSpan::new((text_span.start + 1).min(text_end), text_end);
-        let raw_text = self.text.slice(self.lexer.input);
+        let raw_text = &self.lexer.input[self.text];
         match kind {
             Token::Type => {
                 self.metric_type = parse_metric_type(raw_text)?;
@@ -513,7 +513,7 @@ impl<'a> OpenMetricsParser<'a> {
 
     #[inline]
     fn metric_name(&self) -> &'a [u8] {
-        self.name.map_or(b"", |span| span.slice(self.lexer.input))
+        self.name.map_or(b"", |span| &self.lexer.input[span])
     }
 
     fn is_created_series(&self) -> bool {
@@ -596,10 +596,7 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
 
     fn help(&self) -> (&'a [u8], Cow<'a, [u8]>) {
         // OpenMetrics help text uses label value escaping, unlike Prometheus text.
-        (
-            self.metric_name(),
-            unescape(self.text.slice(self.lexer.input)),
-        )
+        (self.metric_name(), unescape(&self.lexer.input[self.text]))
     }
 
     fn metric_type(&self) -> (&'a [u8], MetricType) {
@@ -607,19 +604,15 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
     }
 
     fn unit(&self) -> (&'a [u8], &'a [u8]) {
-        (self.metric_name(), self.text.slice(self.lexer.input))
+        (self.metric_name(), &self.lexer.input[self.text])
     }
 
     fn comment(&self) -> &'a [u8] {
-        self.text.slice(self.lexer.input)
+        &self.lexer.input[self.text]
     }
 
     fn series(&self) -> (&'a [u8], Option<i64>, f64) {
-        (
-            self.series.slice(self.lexer.input),
-            self.timestamp,
-            self.value,
-        )
+        (&self.lexer.input[self.series], self.timestamp, self.value)
     }
 
     fn labels(&self, buf: &mut LabelsBuffer<'a>) {

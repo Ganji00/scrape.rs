@@ -191,7 +191,7 @@ impl<'a> Lexer<'a> {
 
     #[inline]
     pub(super) fn token(&self) -> &'a [u8] {
-        self.token_span().slice(self.input)
+        &self.input[self.token_span()]
     }
 
     // Go's lexer skips NUL bytes inside label values, help text and comments,
