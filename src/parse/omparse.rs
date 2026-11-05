@@ -574,8 +574,11 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
                 continue;
             };
             let same_series = peek.series_key(peeked_family).eq(self.series_key(family));
-            // Go converts NaN and Inf into a timestamp that looks valid.
-            break (same_series && peek.value.is_finite()).then_some((peek.value * 1000.0) as i64);
+            let millis = peek.value * 1000.0;
+            // Go converts NaN and Inf into a timestamp that looks valid; also ignore values
+            // outside the representable i64 millisecond range instead of saturating to i64::MAX.
+            break (same_series && (i64::MIN as f64..i64::MAX as f64).contains(&millis))
+                .then_some(millis as i64);
         };
         self.peek_labels = std::mem::take(&mut peek.labels);
         if found.is_some() {
@@ -774,6 +777,8 @@ mod tests {
         for input in [
             &b"# TYPE a counter\na_total 1\na_created NaN\n# EOF\n"[..],
             b"# TYPE a counter\na_total 1\na_created +Inf\n# EOF\n",
+            b"# TYPE a counter\na_total 1\na_created 1e300\n# EOF\n",
+            b"# TYPE a counter\na_total 1\na_created -1e300\n# EOF\n",
         ] {
             assert_eq!(first_start_timestamp(input), None);
         }

@@ -690,10 +690,7 @@ impl ArrowDecoder {
         let parent_id = self
             .current_family
             .emit_into_batch(&mut self.metrics, opts)?;
-        let start_ts_ns = match start_ts_ms {
-            Some(ms) => Some(ms_to_ns(ms)?),
-            None => None,
-        };
+        let start_ts_ns = start_ts_ms.and_then(|ms| ms.checked_mul(1_000_000));
         let resolved_ts_ns = match sample_ts_ms {
             Some(ms) => Some(ms_to_ns(ms)?),
             None => default_ts_ns,
@@ -730,13 +727,12 @@ impl ArrowDecoder {
         };
         let om_start_ts_ns = if !self.assembly.groups[group_idx].start_ts_checked {
             self.assembly.groups[group_idx].start_ts_checked = true;
-            match if parser.is_openmetrics() {
-                parser.start_timestamp()
+            if parser.is_openmetrics() {
+                parser
+                    .start_timestamp()
+                    .and_then(|ms| ms.checked_mul(1_000_000))
             } else {
                 None
-            } {
-                Some(ms) => Some(ms_to_ns(ms)?),
-                None => None,
             }
         } else {
             None

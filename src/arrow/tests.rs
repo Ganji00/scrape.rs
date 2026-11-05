@@ -237,6 +237,31 @@ fn rejects_invalid_metadata_and_duplicate_labels() {
             timestamp_ms: 9_223_372_036_855
         }
     ));
+
+    // Out-of-range OpenMetrics `_created` values are ignored rather than failing the scrape.
+    let huge_created = dec
+        .decode(
+            b"# TYPE foo counter\nfoo_total 1\nfoo_created 1e300\n# TYPE h histogram\nh_bucket{le=\"+Inf\"} 1\nh_created 1e12\n# EOF\n",
+            &Format::OPEN_METRICS_1_0_0,
+            &opts,
+        )
+        .unwrap();
+    assert_eq!(huge_created.num_metrics(), 2);
+    assert_eq!(huge_created.num_data_points(), 2);
+    assert!(
+        huge_created
+            .number_data_points()
+            .unwrap()
+            .column_by_name("start_time_unix_nano")
+            .is_none()
+    );
+    assert!(
+        huge_created
+            .histogram_data_points()
+            .unwrap()
+            .column_by_name("start_time_unix_nano")
+            .is_none()
+    );
 }
 
 #[test]
