@@ -17,16 +17,88 @@
 use std::borrow::Cow;
 
 use super::float::{FloatBuf, common_openmetrics_float, format_openmetrics_float, parse_go_float};
-use super::omlex::{Lexer, Token};
+use super::omlex::{Lexer, LexerState, Token};
 use super::{
-    BUCKET_LABEL, Entry, LabelsBuffer, METRIC_NAME_LABEL, MetricType, ParseError, Parser,
-    QUANTILE_LABEL,
+    BUCKET_LABEL, ByteSpan, Entry, LabelSpan, LabelsBuffer, METRIC_NAME_LABEL, MetricType,
+    ParseError, Parser, QUANTILE_LABEL,
 };
 
 /// Go's `value.NormalNaN`, the canonical NaN bit pattern Prometheus stores.
 const NORMAL_NAN: u64 = 0x7ff8_0000_0000_0001;
 
 const CREATED_SUFFIX: &[u8] = b"_created";
+
+/// Reusable scratch buffers for [`OpenMetricsParser`] so callers can preserve capacity across
+/// scrapes without lifetime coupling.
+#[derive(Default)]
+pub(crate) struct OmScratch {
+    pub(crate) labels: Vec<LabelSpan>,
+    pub(crate) exemplar_labels: Vec<LabelSpan>,
+    pub(crate) peek_labels: Vec<LabelSpan>,
+    pub(crate) start_timestamp_key: Vec<u8>,
+}
+
+impl OmScratch {
+    pub(crate) fn with_capacity(label_cap: usize) -> Self {
+        Self {
+            labels: Vec::with_capacity(label_cap),
+            exemplar_labels: Vec::with_capacity(4),
+            peek_labels: Vec::with_capacity(label_cap),
+            start_timestamp_key: Vec::with_capacity(64),
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.labels.clear();
+        self.exemplar_labels.clear();
+        self.peek_labels.clear();
+        self.start_timestamp_key.clear();
+    }
+
+    pub(crate) fn retained_memory_bytes(&self) -> usize {
+        (self.labels.capacity() + self.exemplar_labels.capacity() + self.peek_labels.capacity())
+            * size_of::<LabelSpan>()
+            + self.start_timestamp_key.capacity()
+    }
+}
+
+/// Lifetime-free state of [`OpenMetricsParser`] that can be stored across suspension points
+/// alongside an owned input buffer without self-referential lifetimes.
+pub(crate) struct OpenMetricsParserState {
+    lexer: LexerState,
+    done: bool,
+    peeking: bool,
+    line_start: usize,
+    series: ByteSpan,
+    text: ByteSpan,
+    name: Option<ByteSpan>,
+    family_name_len: usize,
+    metric_type: MetricType,
+    value: f64,
+    timestamp: Option<i64>,
+    labels: Vec<LabelSpan>,
+    exemplar: Option<(f64, Option<i64>)>,
+    exemplar_labels: Vec<LabelSpan>,
+    peek_labels: Vec<LabelSpan>,
+    start_timestamp_key: Vec<u8>,
+    start_timestamp: Option<i64>,
+}
+
+impl OpenMetricsParserState {
+    /// Takes the reusable scratch buffers in place for `Drop` handlers.
+    pub(crate) fn take_scratch(&mut self) -> OmScratch {
+        self.labels.clear();
+        self.exemplar_labels.clear();
+        self.peek_labels.clear();
+        self.start_timestamp_key.clear();
+        OmScratch {
+            labels: std::mem::take(&mut self.labels),
+            exemplar_labels: std::mem::take(&mut self.exemplar_labels),
+            peek_labels: std::mem::take(&mut self.peek_labels),
+            start_timestamp_key: std::mem::take(&mut self.start_timestamp_key),
+        }
+    }
+}
 
 /// Zero-copy parser for the OpenMetrics 1.0 text exposition format.
 ///
@@ -41,21 +113,21 @@ pub struct OpenMetricsParser<'a> {
     /// returns `_created` lines.
     peeking: bool,
     line_start: usize,
-    series: &'a [u8],
-    text: &'a [u8],
-    name: Option<&'a str>,
+    series: ByteSpan,
+    text: ByteSpan,
+    name: Option<ByteSpan>,
     /// Length of the name on the last metadata line, Go's `mfNameLen`.
     family_name_len: usize,
     /// The type from the last `# TYPE` line, which Go keeps across metric families.
     metric_type: MetricType,
     value: f64,
     timestamp: Option<i64>,
-    /// Escaped label names and values, without quotes.
-    labels: Vec<(&'a str, &'a str)>,
+    /// Escaped label name and value byte spans in `lexer.input`, without quotes.
+    labels: Vec<LabelSpan>,
     exemplar: Option<(f64, Option<i64>)>,
-    exemplar_labels: Vec<(&'a str, &'a str)>,
+    exemplar_labels: Vec<LabelSpan>,
     /// Labels buffer lent to the start timestamp lookahead, so it does not allocate per call.
-    peek_labels: Vec<(&'a str, &'a str)>,
+    peek_labels: Vec<LabelSpan>,
     /// Go's start timestamp cache: the series key and start timestamp of the last hit.
     start_timestamp_key: Vec<u8>,
     start_timestamp: Option<i64>,
@@ -64,25 +136,134 @@ pub struct OpenMetricsParser<'a> {
 impl<'a> OpenMetricsParser<'a> {
     /// Creates a parser over `input`.
     pub fn new(input: &'a [u8]) -> Self {
+        Self::with_scratch(input, OmScratch::default())
+    }
+
+    /// Creates a parser over `input` reusing pre-allocated scratch buffers.
+    pub(crate) fn with_scratch(input: &'a [u8], mut scratch: OmScratch) -> Self {
+        scratch.clear();
         Self {
             lexer: Lexer::new(input),
             done: false,
             peeking: false,
             line_start: 0,
-            series: b"",
-            text: b"",
+            series: ByteSpan::default(),
+            text: ByteSpan::default(),
             name: None,
             family_name_len: 0,
             metric_type: MetricType::Unknown,
             value: 0.0,
             timestamp: None,
-            labels: Vec::new(),
+            labels: scratch.labels,
             exemplar: None,
-            exemplar_labels: Vec::new(),
-            peek_labels: Vec::new(),
-            start_timestamp_key: Vec::new(),
+            exemplar_labels: scratch.exemplar_labels,
+            peek_labels: scratch.peek_labels,
+            start_timestamp_key: scratch.start_timestamp_key,
             start_timestamp: None,
         }
+    }
+
+    /// Detaches the borrowed `input` slice and returns the lifetime-free parser state.
+    #[inline]
+    pub(crate) fn into_state(self) -> OpenMetricsParserState {
+        OpenMetricsParserState {
+            lexer: self.lexer.into_state(),
+            done: self.done,
+            peeking: self.peeking,
+            line_start: self.line_start,
+            series: self.series,
+            text: self.text,
+            name: self.name,
+            family_name_len: self.family_name_len,
+            metric_type: self.metric_type,
+            value: self.value,
+            timestamp: self.timestamp,
+            labels: self.labels,
+            exemplar: self.exemplar,
+            exemplar_labels: self.exemplar_labels,
+            peek_labels: self.peek_labels,
+            start_timestamp_key: self.start_timestamp_key,
+            start_timestamp: self.start_timestamp,
+        }
+    }
+
+    /// Reconstructs a parser over `input` from a previously detached [`OpenMetricsParserState`].
+    #[inline]
+    pub(crate) fn from_state(input: &'a [u8], state: OpenMetricsParserState) -> Self {
+        Self {
+            lexer: Lexer::from_state(input, state.lexer),
+            done: state.done,
+            peeking: state.peeking,
+            line_start: state.line_start,
+            series: state.series,
+            text: state.text,
+            name: state.name,
+            family_name_len: state.family_name_len,
+            metric_type: state.metric_type,
+            value: state.value,
+            timestamp: state.timestamp,
+            labels: state.labels,
+            exemplar: state.exemplar,
+            exemplar_labels: state.exemplar_labels,
+            peek_labels: state.peek_labels,
+            start_timestamp_key: state.start_timestamp_key,
+            start_timestamp: state.start_timestamp,
+        }
+    }
+
+    /// Returns the reusable scratch buffers so callers can preserve capacity across scrapes.
+    pub(crate) fn into_scratch(mut self) -> OmScratch {
+        self.take_scratch()
+    }
+
+    /// Takes the reusable scratch buffers in place for `Drop` handlers.
+    pub(crate) fn take_scratch(&mut self) -> OmScratch {
+        self.labels.clear();
+        self.exemplar_labels.clear();
+        self.peek_labels.clear();
+        self.start_timestamp_key.clear();
+        OmScratch {
+            labels: std::mem::take(&mut self.labels),
+            exemplar_labels: std::mem::take(&mut self.exemplar_labels),
+            peek_labels: std::mem::take(&mut self.peek_labels),
+            start_timestamp_key: std::mem::take(&mut self.start_timestamp_key),
+        }
+    }
+
+    /// Returns the current byte offset of the parser cursor in `input` (`0..=input.len()`).
+    #[inline]
+    pub(crate) fn pos(&self) -> usize {
+        self.lexer.pos.min(self.lexer.input.len())
+    }
+
+    /// Returns the byte offset of the current entry's metric name in `input`.
+    #[inline]
+    pub(crate) fn name_offset(&self) -> usize {
+        self.name.map_or(0, |span| span.start)
+    }
+
+    /// Returns the raw metric name and raw (escaped) help text for `Entry::Help`.
+    pub(crate) fn raw_help(&self) -> (&'a [u8], &'a [u8]) {
+        (self.metric_name(), &self.lexer.input[self.text])
+    }
+
+    /// Returns the raw metric name, validated UTF-8 label spans, full input slice, optional
+    /// timestamp in milliseconds, and sample value for `Entry::Series`.
+    pub(crate) fn raw_series_parts(&self) -> (&'a [u8], &[LabelSpan], &'a [u8], Option<i64>, f64) {
+        (
+            self.metric_name(),
+            &self.labels,
+            self.lexer.input,
+            self.timestamp,
+            self.value,
+        )
+    }
+
+    /// Returns the exemplar value, optional timestamp in milliseconds, and label spans for the
+    /// current `Entry::Series`, if present.
+    pub(crate) fn raw_exemplar_parts(&self) -> Option<(f64, Option<i64>, &[LabelSpan])> {
+        self.exemplar
+            .map(|(val, ts)| (val, ts, self.exemplar_labels.as_slice()))
     }
 
     fn unexpected(&self, expected: &'static str) -> ParseError {
@@ -92,11 +273,14 @@ impl<'a> OpenMetricsParser<'a> {
         }
     }
 
-    fn utf8(&self, start: usize, end: usize) -> Result<&'a str, ParseError> {
+    fn utf8_span(&self, start: usize, end: usize) -> Result<ByteSpan, ParseError> {
         let input = self.lexer.input;
-        std::str::from_utf8(&input[start..end]).map_err(|_| ParseError::InvalidUtf8 {
-            offset: self.lexer.token_start,
-        })
+        if std::str::from_utf8(&input[start..end]).is_err() {
+            return Err(ParseError::InvalidUtf8 {
+                offset: self.lexer.token_start,
+            });
+        }
+        Ok(ByteSpan::new(start, end))
     }
 
     fn parse_metadata(&mut self, kind: Token) -> Result<Entry, ParseError> {
@@ -109,26 +293,29 @@ impl<'a> OpenMetricsParser<'a> {
             end -= 1;
         }
         self.family_name_len = end - start;
-        self.name = Some(self.utf8(start, end)?);
+        self.name = Some(self.utf8_span(start, end)?);
         if self.lexer.lex() != Token::Text {
             return Err(self.unexpected("expected text"));
         }
-        let text = self.lexer.token();
+        let text_span = self.lexer.token_span();
+        let text = &self.lexer.input[text_span];
         // The text token starts with a blank and ends with a linebreak, which the lexer
         // can follow with NUL bytes.
         let end = text
             .iter()
             .position(|&byte| byte == b'\n')
             .unwrap_or(text.len());
-        self.text = text.get(1..end).unwrap_or_default();
+        let text_end = text_span.start + end;
+        self.text = ByteSpan::new((text_span.start + 1).min(text_end), text_end);
+        let raw_text = &self.lexer.input[self.text];
         match kind {
             Token::Type => {
-                self.metric_type = parse_metric_type(self.text)?;
+                self.metric_type = parse_metric_type(raw_text)?;
                 self.start_timestamp = None;
                 Ok(Entry::Type)
             }
             Token::Help => {
-                if std::str::from_utf8(self.text).is_err() {
+                if std::str::from_utf8(raw_text).is_err() {
                     return Err(ParseError::InvalidUtf8 {
                         offset: self.lexer.token_start,
                     });
@@ -137,7 +324,7 @@ impl<'a> OpenMetricsParser<'a> {
             }
             _ => {
                 let metric = self.metric_name();
-                let unit = self.text;
+                let unit = raw_text;
                 let is_suffix = metric.len() > unit.len()
                     && metric.ends_with(unit)
                     && metric[metric.len() - unit.len() - 1] == b'_';
@@ -156,14 +343,14 @@ impl<'a> OpenMetricsParser<'a> {
     fn parse_series(&mut self, first: Token) -> Result<Entry, ParseError> {
         let mut token = first;
         if first == Token::MName {
-            self.name = Some(self.utf8(self.line_start, self.lexer.pos)?);
+            self.name = Some(self.utf8_span(self.line_start, self.lexer.pos)?);
             token = self.lexer.lex();
         }
         if token == Token::BraceOpen {
             self.parse_label_values(false)?;
             token = self.lexer.lex();
         }
-        self.series = &self.lexer.input[self.line_start..self.lexer.token_start];
+        self.series = ByteSpan::new(self.line_start, self.lexer.token_start);
         self.parse_series_end_of_line(token)?;
         Ok(Entry::Series)
     }
@@ -179,7 +366,7 @@ impl<'a> OpenMetricsParser<'a> {
                 _ => return Err(self.unexpected("expected label name")),
             };
             let quoted = token == Token::QString;
-            let name = self.utf8(start, end)?;
+            let name = self.utf8_span(start, end)?;
             token = self.lexer.lex();
             if quoted && matches!(token, Token::Comma | Token::BraceClose) {
                 if exemplar {
@@ -194,7 +381,7 @@ impl<'a> OpenMetricsParser<'a> {
                 if token == Token::BraceClose {
                     return Ok(());
                 }
-                token = self.lexer.lex();
+                token = self.next_after_quoted_name();
                 continue;
             }
             if token != Token::Equal {
@@ -203,19 +390,25 @@ impl<'a> OpenMetricsParser<'a> {
             if self.lexer.lex() != Token::LValue {
                 return Err(self.unexpected("expected label value"));
             }
+            let val_token_start = self.lexer.token_start;
             let value =
                 std::str::from_utf8(self.lexer.token()).map_err(|_| ParseError::InvalidUtf8 {
-                    offset: self.lexer.token_start,
+                    offset: val_token_start,
                 })?;
             // The token can end in NUL bytes after the closing quote. Go drops only the last
             // byte, so it keeps the quote and all but the last NUL in the value. We cut at the
             // quote.
             let close = value.rfind('"').unwrap_or(0);
-            let label = (name, &value[1..close.max(1)]);
+            let span = LabelSpan {
+                name_start: start,
+                name_end: end,
+                val_start: val_token_start + 1,
+                val_end: val_token_start + close.max(1),
+            };
             if exemplar {
-                self.exemplar_labels.push(label);
+                self.exemplar_labels.push(span);
             } else {
-                self.labels.push(label);
+                self.labels.push(span);
             }
             token = self.lexer.lex();
             match token {
@@ -224,6 +417,11 @@ impl<'a> OpenMetricsParser<'a> {
                 _ => return Err(self.unexpected("expected comma or brace close")),
             }
         }
+    }
+
+    #[inline]
+    fn next_after_quoted_name(&mut self) -> Token {
+        self.lexer.lex()
     }
 
     fn parse_series_end_of_line(&mut self, token: Token) -> Result<(), ParseError> {
@@ -313,8 +511,9 @@ impl<'a> OpenMetricsParser<'a> {
         Ok((seconds * 1000.0) as i64)
     }
 
+    #[inline]
     fn metric_name(&self) -> &'a [u8] {
-        self.name.unwrap_or_default().as_bytes()
+        self.name.map_or(b"", |span| &self.lexer.input[span])
     }
 
     fn is_created_series(&self) -> bool {
@@ -325,10 +524,20 @@ impl<'a> OpenMetricsParser<'a> {
     /// `quantile` on summaries, followed by the metric family name. Each piece is
     /// length-prefixed so `{ab="c"}` and `{a="bc"}` differ.
     fn series_key<'k>(&'k self, family: &'k [u8]) -> impl Iterator<Item = u8> + 'k {
+        let input = self.lexer.input;
         self.labels
             .iter()
-            .filter(|(name, _)| !is_float_label(self.metric_type, name))
-            .flat_map(|(name, value)| [name.as_bytes(), value.as_bytes()])
+            .filter(|span| {
+                let name =
+                    std::str::from_utf8(&input[span.name_start..span.name_end]).unwrap_or_default();
+                !is_float_label(self.metric_type, name)
+            })
+            .flat_map(|span| {
+                [
+                    &input[span.name_start..span.name_end],
+                    &input[span.val_start..span.val_end],
+                ]
+            })
             .chain([family])
             .flat_map(|piece| {
                 piece
@@ -380,9 +589,14 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
         }
     }
 
+    #[inline]
+    fn pos(&self) -> usize {
+        OpenMetricsParser::pos(self)
+    }
+
     fn help(&self) -> (&'a [u8], Cow<'a, [u8]>) {
         // OpenMetrics help text uses label value escaping, unlike Prometheus text.
-        (self.metric_name(), unescape(self.text))
+        (self.metric_name(), unescape(&self.lexer.input[self.text]))
     }
 
     fn metric_type(&self) -> (&'a [u8], MetricType) {
@@ -390,26 +604,29 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
     }
 
     fn unit(&self) -> (&'a [u8], &'a [u8]) {
-        (self.metric_name(), self.text)
+        (self.metric_name(), &self.lexer.input[self.text])
     }
 
     fn comment(&self) -> &'a [u8] {
-        self.text
+        &self.lexer.input[self.text]
     }
 
     fn series(&self) -> (&'a [u8], Option<i64>, f64) {
-        (self.series, self.timestamp, self.value)
+        (&self.lexer.input[self.series], self.timestamp, self.value)
     }
 
     fn labels(&self, buf: &mut LabelsBuffer<'a>) {
         buf.clear();
-        buf.push(
-            Cow::Borrowed(METRIC_NAME_LABEL),
-            unescape_label(self.name.unwrap_or_default()),
-        );
-        for &(name, value) in &self.labels {
-            let name = unescape_label(name);
-            let value = normalize_float_label(self.metric_type, &name, unescape_label(value));
+        let name = std::str::from_utf8(self.metric_name()).unwrap_or_default();
+        buf.push(Cow::Borrowed(METRIC_NAME_LABEL), unescape_label(name));
+        let input = self.lexer.input;
+        for span in &self.labels {
+            let raw_name =
+                std::str::from_utf8(&input[span.name_start..span.name_end]).unwrap_or_default();
+            let raw_val =
+                std::str::from_utf8(&input[span.val_start..span.val_end]).unwrap_or_default();
+            let name = unescape_label(raw_name);
+            let value = normalize_float_label(self.metric_type, &name, unescape_label(raw_val));
             buf.push(name, value);
         }
         buf.sort();
@@ -420,8 +637,13 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
         let exemplar = self.exemplar.take()?;
         // Go's OpenMetrics 1.0 parser keeps exemplar labels escaped. We unescape them like
         // series labels, as Go's OpenMetrics 2.0 parser does.
-        for &(name, value) in &self.exemplar_labels {
-            buf.push(unescape_label(name), unescape_label(value));
+        let input = self.lexer.input;
+        for span in &self.exemplar_labels {
+            let raw_name =
+                std::str::from_utf8(&input[span.name_start..span.name_end]).unwrap_or_default();
+            let raw_val =
+                std::str::from_utf8(&input[span.val_start..span.val_end]).unwrap_or_default();
+            buf.push(unescape_label(raw_name), unescape_label(raw_val));
         }
         buf.sort();
         Some(exemplar)
@@ -455,8 +677,11 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
                 continue;
             };
             let same_series = peek.series_key(peeked_family).eq(self.series_key(family));
-            // Go converts NaN and Inf into a timestamp that looks valid.
-            break (same_series && peek.value.is_finite()).then_some((peek.value * 1000.0) as i64);
+            let millis = peek.value * 1000.0;
+            // Go converts NaN and Inf into a timestamp that looks valid; also ignore values
+            // outside the representable i64 millisecond range instead of saturating to i64::MAX.
+            break (same_series && (i64::MIN as f64..i64::MAX as f64).contains(&millis))
+                .then_some(millis as i64);
         };
         self.peek_labels = std::mem::take(&mut peek.labels);
         if found.is_some() {
@@ -655,6 +880,8 @@ mod tests {
         for input in [
             &b"# TYPE a counter\na_total 1\na_created NaN\n# EOF\n"[..],
             b"# TYPE a counter\na_total 1\na_created +Inf\n# EOF\n",
+            b"# TYPE a counter\na_total 1\na_created 1e300\n# EOF\n",
+            b"# TYPE a counter\na_total 1\na_created -1e300\n# EOF\n",
         ] {
             assert_eq!(first_start_timestamp(input), None);
         }
@@ -701,6 +928,18 @@ mod tests {
             [
                 ("x_total".to_owned(), Some(7000)),
                 ("x_total".to_owned(), None)
+            ]
+        );
+    }
+
+    #[test]
+    fn start_timestamp_scans_past_other_series() {
+        let input = b"# TYPE foo counter\nfoo_total{a=\"1\"} 1\nfoo_total{a=\"2\"} 2\nfoo_created{a=\"1\"} 100\n# EOF\n";
+        assert_eq!(
+            start_timestamps(input),
+            [
+                ("foo_total".to_owned(), Some(100_000)),
+                ("foo_total".to_owned(), None)
             ]
         );
     }
@@ -920,5 +1159,175 @@ mod tests {
         assert_eq!(parser.next_entry(), Ok(Some(Entry::Series)));
         parser.labels(&mut buf);
         assert_eq!(buf.get("b"), Some("c"));
+    }
+
+    #[test]
+    fn pos_and_state_roundtrip_preserve_parse_results() {
+        let input = concat!(
+            "# HELP foo_seconds Counter help\n",
+            "# UNIT foo_seconds seconds\n",
+            "# TYPE foo_seconds counter\n",
+            "foo_seconds_total{env=\"prod\"} 10 1.5 # {trace_id=\"abc\"} 1.0 2.0\n",
+            "foo_seconds_created{env=\"prod\"} 1.0\n",
+            "{\"my.gauge\",k=\"v\"} 3.25\n",
+            "# EOF\n",
+        );
+        let bytes = input.as_bytes();
+
+        type Snapshot = (
+            Entry,
+            String,
+            Option<MetricType>,
+            Option<(Option<i64>, u64, Option<i64>)>,
+            Vec<(String, String)>,
+            Option<(u64, Option<i64>, Vec<(String, String)>)>,
+        );
+
+        let collect_direct = |b: &[u8]| -> Vec<Snapshot> {
+            let mut parser = OpenMetricsParser::new(b);
+            let mut buf = LabelsBuffer::new();
+            let mut ex_buf = LabelsBuffer::new();
+            let mut out = Vec::new();
+            let lossy = |s: &[u8]| String::from_utf8_lossy(s).into_owned();
+            while let Some(entry) = parser.next_entry().unwrap() {
+                let snap = match entry {
+                    Entry::Help => {
+                        let (n, t) = parser.help();
+                        (
+                            entry,
+                            format!("{}:{}", lossy(n), lossy(&t)),
+                            None,
+                            None,
+                            Vec::new(),
+                            None,
+                        )
+                    }
+                    Entry::Unit => {
+                        let (n, u) = parser.unit();
+                        (
+                            entry,
+                            format!("{}:{}", lossy(n), lossy(u)),
+                            None,
+                            None,
+                            Vec::new(),
+                            None,
+                        )
+                    }
+                    Entry::Type => {
+                        let (n, mt) = parser.metric_type();
+                        (entry, lossy(n), Some(mt), None, Vec::new(), None)
+                    }
+                    Entry::Series => {
+                        let (s, ts, val) = parser.series();
+                        let st = parser.start_timestamp();
+                        parser.labels(&mut buf);
+                        let labels = buf
+                            .iter()
+                            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                            .collect();
+                        let ex = parser.exemplar(&mut ex_buf).map(|(ev, ets)| {
+                            let elabels = ex_buf
+                                .iter()
+                                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                                .collect();
+                            (ev.to_bits(), ets, elabels)
+                        });
+                        (
+                            entry,
+                            lossy(s),
+                            None,
+                            Some((ts, val.to_bits(), st)),
+                            labels,
+                            ex,
+                        )
+                    }
+                    Entry::Comment => {
+                        (entry, lossy(parser.comment()), None, None, Vec::new(), None)
+                    }
+                };
+                out.push(snap);
+            }
+            out
+        };
+
+        let want = collect_direct(bytes);
+        let mut state = OpenMetricsParser::new(bytes).into_state();
+        let mut buf = LabelsBuffer::new();
+        let mut ex_buf = LabelsBuffer::new();
+        let mut got = Vec::new();
+        let mut prev_pos = 0;
+        let lossy = |s: &[u8]| String::from_utf8_lossy(s).into_owned();
+
+        loop {
+            let mut parser = OpenMetricsParser::from_state(bytes, state);
+            assert_eq!(parser.pos(), prev_pos);
+            let Some(entry) = parser.next_entry().unwrap() else {
+                assert_eq!(parser.pos(), bytes.len());
+                break;
+            };
+            let next_pos = parser.pos();
+            assert!(next_pos > prev_pos, "{next_pos} <= {prev_pos}");
+            prev_pos = next_pos;
+
+            let mid_state = parser.into_state();
+            let mut parser = OpenMetricsParser::from_state(bytes, mid_state);
+            let snap = match entry {
+                Entry::Help => {
+                    let (n, t) = parser.help();
+                    (
+                        entry,
+                        format!("{}:{}", lossy(n), lossy(&t)),
+                        None,
+                        None,
+                        Vec::new(),
+                        None,
+                    )
+                }
+                Entry::Unit => {
+                    let (n, u) = parser.unit();
+                    (
+                        entry,
+                        format!("{}:{}", lossy(n), lossy(u)),
+                        None,
+                        None,
+                        Vec::new(),
+                        None,
+                    )
+                }
+                Entry::Type => {
+                    let (n, mt) = parser.metric_type();
+                    (entry, lossy(n), Some(mt), None, Vec::new(), None)
+                }
+                Entry::Series => {
+                    let (s, ts, val) = parser.series();
+                    let st = parser.start_timestamp();
+                    parser.labels(&mut buf);
+                    let labels = buf
+                        .iter()
+                        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                        .collect();
+                    let ex = parser.exemplar(&mut ex_buf).map(|(ev, ets)| {
+                        let elabels = ex_buf
+                            .iter()
+                            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                            .collect();
+                        (ev.to_bits(), ets, elabels)
+                    });
+                    (
+                        entry,
+                        lossy(s),
+                        None,
+                        Some((ts, val.to_bits(), st)),
+                        labels,
+                        ex,
+                    )
+                }
+                Entry::Comment => (entry, lossy(parser.comment()), None, None, Vec::new(), None),
+            };
+            got.push(snap);
+            state = parser.into_state();
+        }
+
+        assert_eq!(got, want);
     }
 }

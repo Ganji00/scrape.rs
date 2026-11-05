@@ -16,7 +16,7 @@
 use std::fmt::{self, Write};
 
 /// Go's `strconv.ParseFloat(s, 64)`, without hex float support.
-pub(super) fn parse_go_float(text: &str) -> Option<f64> {
+pub(crate) fn parse_go_float(text: &str) -> Option<f64> {
     if text.contains('_') {
         if !underscores_ok(text.as_bytes()) {
             return None;

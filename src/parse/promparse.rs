@@ -15,12 +15,13 @@
 //! [`promparse.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/promparse.go).
 
 use std::borrow::Cow;
+use std::ops::Index;
 
 use super::float::{
     FloatBuf, common_openmetrics_float, format_openmetrics_float, parse_go_float,
     parse_go_float_no_underscore,
 };
-use super::promlex::{Lexer, Token};
+use super::promlex::{Lexer, LexerState, Token};
 use super::{
     BUCKET_LABEL, Entry, LabelsBuffer, METRIC_NAME_LABEL, MetricType, ParseError, Parser,
     QUANTILE_LABEL,
@@ -28,6 +29,33 @@ use super::{
 
 /// Go's `value.NormalNaN`, the canonical NaN bit pattern Prometheus stores.
 const NORMAL_NAN: u64 = 0x7ff8_0000_0000_0001;
+
+/// Byte offsets `[start, end)` of a slice in the parser's input buffer.
+///
+/// Storing lifetime-free byte spans allows parser state to be held across suspension points
+/// alongside an owned `Bytes` buffer without self-referential lifetimes under
+/// `#![forbid(unsafe_code)]`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ByteSpan {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+}
+
+impl ByteSpan {
+    #[inline]
+    pub(crate) const fn new(start: usize, end: usize) -> Self {
+        Self { start, end }
+    }
+}
+
+impl Index<ByteSpan> for [u8] {
+    type Output = [u8];
+
+    #[inline]
+    fn index(&self, span: ByteSpan) -> &[u8] {
+        &self[span.start..span.end]
+    }
+}
 
 /// Byte offsets of a UTF-8 validated `(label_name, label_value)` pair in the input slice.
 ///
@@ -41,20 +69,41 @@ pub(crate) struct LabelSpan {
     pub(crate) val_end: usize,
 }
 
+/// Lifetime-free state of [`PromParser`] that can be stored across suspension points alongside an
+/// owned input buffer without self-referential lifetimes.
+pub(crate) struct PromParserState {
+    lexer: LexerState,
+    series: ByteSpan,
+    text: ByteSpan,
+    last_type: MetricType,
+    value: f64,
+    timestamp: Option<i64>,
+    line_start: usize,
+    name: Option<ByteSpan>,
+    labels: Vec<LabelSpan>,
+}
+
+impl PromParserState {
+    /// Takes the reusable label span buffer in place for `Drop` handlers.
+    pub(crate) fn take_scratch(&mut self) -> Vec<LabelSpan> {
+        self.labels.clear();
+        std::mem::take(&mut self.labels)
+    }
+}
+
 /// Zero-copy parser for the Prometheus text exposition format 0.0.4.
 ///
 /// Mirrors Go's `textparse.NewPromParser` with type and unit labels disabled.
 pub struct PromParser<'a> {
     lexer: Lexer<'a>,
-    series: &'a [u8],
-    text: &'a [u8],
+    series: ByteSpan,
+    text: ByteSpan,
     /// The type from the last `# TYPE` line, which Go keeps across metric families.
     last_type: MetricType,
     value: f64,
     timestamp: Option<i64>,
     line_start: usize,
-    name_offset: usize,
-    name: Option<&'a [u8]>,
+    name: Option<ByteSpan>,
     /// Escaped label names and values, without quotes, already checked to be UTF-8.
     labels: Vec<LabelSpan>,
 }
@@ -70,15 +119,46 @@ impl<'a> PromParser<'a> {
         labels.clear();
         Self {
             lexer: Lexer::new(input),
-            series: b"",
-            text: b"",
+            series: ByteSpan::default(),
+            text: ByteSpan::default(),
             last_type: MetricType::Unknown,
             value: 0.0,
             timestamp: None,
             line_start: 0,
-            name_offset: 0,
             name: None,
             labels,
+        }
+    }
+
+    /// Detaches the borrowed `input` slice and returns the lifetime-free parser state.
+    #[inline]
+    pub(crate) fn into_state(self) -> PromParserState {
+        PromParserState {
+            lexer: self.lexer.into_state(),
+            series: self.series,
+            text: self.text,
+            last_type: self.last_type,
+            value: self.value,
+            timestamp: self.timestamp,
+            line_start: self.line_start,
+            name: self.name,
+            labels: self.labels,
+        }
+    }
+
+    /// Reconstructs a parser over `input` from a previously detached [`PromParserState`].
+    #[inline]
+    pub(crate) fn from_state(input: &'a [u8], state: PromParserState) -> Self {
+        Self {
+            lexer: Lexer::from_state(input, state.lexer),
+            series: state.series,
+            text: state.text,
+            last_type: state.last_type,
+            value: state.value,
+            timestamp: state.timestamp,
+            line_start: state.line_start,
+            name: state.name,
+            labels: state.labels,
         }
     }
 
@@ -94,15 +174,22 @@ impl<'a> PromParser<'a> {
         std::mem::take(&mut self.labels)
     }
 
+    /// Returns the current byte offset of the parser cursor in `input` (`0..=input.len()`).
+    #[inline]
+    pub(crate) fn pos(&self) -> usize {
+        self.lexer.pos.min(self.lexer.input.len())
+    }
+
     /// Returns the byte offset of the current entry's metric name in `input`.
+    #[inline]
     pub(crate) fn name_offset(&self) -> usize {
-        self.name_offset
+        self.name.map_or(0, |span| span.start)
     }
 
     /// Returns the raw metric name and raw (escaped) help text for `Entry::Help` without
     /// allocating a `Cow::Owned` buffer.
     pub(crate) fn raw_help(&self) -> (&'a [u8], &'a [u8]) {
-        (self.metric_name(), self.text)
+        (self.metric_name(), &self.lexer.input[self.text])
     }
 
     /// Returns the raw metric name, validated UTF-8 label spans, full input slice, optional
@@ -143,18 +230,21 @@ impl<'a> PromParser<'a> {
             start += 1;
             end -= 1;
         }
-        self.name_offset = start;
-        self.name = Some(&self.lexer.input[start..end]);
+        self.name = Some(ByteSpan::new(start, end));
         if self.next_token() != Token::Text {
             return Err(self.unexpected("expected text"));
         }
-        let text = self.lexer.token();
-        self.text = text.get(1..).unwrap_or_default();
+        let text_span = self.lexer.token_span();
+        self.text = ByteSpan::new(
+            text_span.start.saturating_add(1).min(text_span.end),
+            text_span.end,
+        );
+        let text = &self.lexer.input[self.text];
         let entry = if kind == Token::Type {
-            self.last_type = parse_metric_type(self.text)?;
+            self.last_type = parse_metric_type(text)?;
             Entry::Type
         } else {
-            if std::str::from_utf8(self.text).is_err() {
+            if std::str::from_utf8(text).is_err() {
                 return Err(ParseError::InvalidUtf8 {
                     offset: self.lexer.token_start,
                 });
@@ -168,7 +258,7 @@ impl<'a> PromParser<'a> {
     }
 
     fn parse_comment(&mut self) -> Result<Entry, ParseError> {
-        self.text = self.lexer.token();
+        self.text = self.lexer.token_span();
         if self.next_token() != Token::Linebreak {
             return Err(self.unexpected("expected linebreak after comment"));
         }
@@ -180,23 +270,22 @@ impl<'a> PromParser<'a> {
         let mut token = first;
         if first == Token::MName {
             // Go uses the line start, so leading blanks become part of the name.
-            self.name_offset = self.line_start;
-            self.series = self.consumed_line();
+            self.series = self.consumed_line_span();
             self.name = Some(self.series);
             token = self.next_token();
         }
         if token == Token::BraceOpen {
             self.parse_label_values()?;
-            self.series = self.consumed_line();
+            self.series = self.consumed_line_span();
             token = self.next_token();
         }
         self.parse_metric_suffix(token)
     }
 
-    /// Returns the bytes of the current line that the lexer has consumed so far.
+    /// Returns the byte span of the current line that the lexer has consumed so far.
     #[inline]
-    fn consumed_line(&self) -> &'a [u8] {
-        &self.lexer.input[self.line_start..self.lexer.pos]
+    fn consumed_line_span(&self) -> ByteSpan {
+        ByteSpan::new(self.line_start, self.lexer.pos)
     }
 
     fn parse_label_values(&mut self) -> Result<(), ParseError> {
@@ -216,8 +305,7 @@ impl<'a> PromParser<'a> {
                         offset: self.line_start,
                     });
                 }
-                self.name_offset = name_start;
-                self.name = Some(&self.lexer.input[name_start..name_end]);
+                self.name = Some(ByteSpan::new(name_start, name_end));
                 if token == Token::BraceClose {
                     return Ok(());
                 }
@@ -302,7 +390,7 @@ impl<'a> PromParser<'a> {
 
     #[inline]
     fn metric_name(&self) -> &'a [u8] {
-        self.name.unwrap_or_default()
+        self.name.map_or(b"", |span| &self.lexer.input[span])
     }
 }
 
@@ -324,8 +412,16 @@ impl<'a> Parser<'a> for PromParser<'a> {
         }
     }
 
+    #[inline]
+    fn pos(&self) -> usize {
+        PromParser::pos(self)
+    }
+
     fn help(&self) -> (&'a [u8], Cow<'a, [u8]>) {
-        (self.metric_name(), unescape(self.text, false))
+        (
+            self.metric_name(),
+            unescape(&self.lexer.input[self.text], false),
+        )
     }
 
     fn metric_type(&self) -> (&'a [u8], MetricType) {
@@ -333,11 +429,11 @@ impl<'a> Parser<'a> for PromParser<'a> {
     }
 
     fn comment(&self) -> &'a [u8] {
-        self.text
+        &self.lexer.input[self.text]
     }
 
     fn series(&self) -> (&'a [u8], Option<i64>, f64) {
-        (self.series, self.timestamp, self.value)
+        (&self.lexer.input[self.series], self.timestamp, self.value)
     }
 
     fn labels(&self, buf: &mut LabelsBuffer<'a>) {
@@ -775,5 +871,63 @@ mod tests {
             let got_noq = unescape_bytes_into(raw.as_bytes(), false, &mut scratch).to_vec();
             assert_eq!(got_noq, want_noq.as_bytes(), "quote=false {raw:?}");
         }
+    }
+
+    #[test]
+    fn pos_and_state_roundtrip_preserve_parse_results() {
+        let input = concat!(
+            "# HELP s A summary\n",
+            "# TYPE s summary\n",
+            "# comment line\n",
+            "s{quantile=\"0.5\",l=\"a\\\"b\"} 42 1000\n",
+            "{\"go.gc\",quantile=\"0.25\"} 7\n",
+        );
+        let bytes = input.as_bytes();
+        let want = parse(bytes).unwrap();
+
+        let mut state = PromParser::new(bytes).into_state();
+        let mut buf = LabelsBuffer::new();
+        let mut got = Vec::new();
+        let mut prev_pos = 0;
+        let lossy = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+
+        loop {
+            let mut parser = PromParser::from_state(bytes, state);
+            assert_eq!(parser.pos(), prev_pos);
+            let Some(entry) = parser.next_entry().unwrap() else {
+                assert_eq!(parser.pos(), bytes.len());
+                break;
+            };
+            let next_pos = parser.pos();
+            assert!(next_pos > prev_pos, "{next_pos} <= {prev_pos}");
+            prev_pos = next_pos;
+
+            // Round-trip state between `next_entry()` and entry inspection too.
+            let mid_state = parser.into_state();
+            let parser = PromParser::from_state(bytes, mid_state);
+            got.push(match entry {
+                Entry::Help => {
+                    let (name, text) = parser.help();
+                    Got::Help(lossy(name), lossy(&text))
+                }
+                Entry::Type => {
+                    let (name, mtype) = parser.metric_type();
+                    Got::Type(lossy(name), mtype)
+                }
+                Entry::Comment => Got::Comment(lossy(parser.comment())),
+                _ => {
+                    let (series, ts, val) = parser.series();
+                    parser.labels(&mut buf);
+                    let labels = buf
+                        .iter()
+                        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                        .collect();
+                    Got::Series(lossy(series), ts, val.to_bits(), labels)
+                }
+            });
+            state = parser.into_state();
+        }
+
+        assert_eq!(got, want);
     }
 }

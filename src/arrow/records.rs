@@ -39,9 +39,32 @@ pub enum MetricPayloadType {
     UnivariateMetrics = 10,
     /// Scalar gauge, counter, and untyped data points (`ArrowPayloadType::NumberDataPoints = 11`).
     NumberDataPoints = 11,
+    /// Summary data points with quantile values (`ArrowPayloadType::SummaryDataPoints = 12`).
+    SummaryDataPoints = 12,
+    /// Classic explicit-bucket histogram data points
+    /// (`ArrowPayloadType::HistogramDataPoints = 13`).
+    HistogramDataPoints = 13,
     /// Key-value label attributes attached to [`Self::NumberDataPoints`]
     /// (`ArrowPayloadType::NumberDpAttrs = 15`).
     NumberDpAttrs = 15,
+    /// Key-value label attributes attached to [`Self::SummaryDataPoints`]
+    /// (`ArrowPayloadType::SummaryDpAttrs = 16`).
+    SummaryDpAttrs = 16,
+    /// Key-value label attributes attached to [`Self::HistogramDataPoints`]
+    /// (`ArrowPayloadType::HistogramDpAttrs = 17`).
+    HistogramDpAttrs = 17,
+    /// Exemplars attached to [`Self::NumberDataPoints`]
+    /// (`ArrowPayloadType::NumberDpExemplars = 19`).
+    NumberDpExemplars = 19,
+    /// Exemplars attached to [`Self::HistogramDataPoints`]
+    /// (`ArrowPayloadType::HistogramDpExemplars = 20`).
+    HistogramDpExemplars = 20,
+    /// Filtered attributes attached to [`Self::NumberDpExemplars`]
+    /// (`ArrowPayloadType::NumberDpExemplarAttrs = 22`).
+    NumberDpExemplarAttrs = 22,
+    /// Filtered attributes attached to [`Self::HistogramDpExemplars`]
+    /// (`ArrowPayloadType::HistogramDpExemplarAttrs = 23`).
+    HistogramDpExemplarAttrs = 23,
     /// Metric-level metadata attributes (`ArrowPayloadType::MetricAttrs = 26`).
     MetricAttrs = 26,
 }
@@ -63,7 +86,15 @@ pub struct OtapMetricRecords {
     pub(super) univariate_metrics: Option<RecordBatch>,
     pub(super) metric_attrs: Option<RecordBatch>,
     pub(super) number_data_points: Option<RecordBatch>,
+    pub(super) summary_data_points: Option<RecordBatch>,
+    pub(super) histogram_data_points: Option<RecordBatch>,
     pub(super) number_dp_attrs: Option<RecordBatch>,
+    pub(super) summary_dp_attrs: Option<RecordBatch>,
+    pub(super) histogram_dp_attrs: Option<RecordBatch>,
+    pub(super) number_dp_exemplars: Option<RecordBatch>,
+    pub(super) histogram_dp_exemplars: Option<RecordBatch>,
+    pub(super) number_dp_exemplar_attrs: Option<RecordBatch>,
+    pub(super) histogram_dp_exemplar_attrs: Option<RecordBatch>,
 }
 
 impl OtapMetricRecords {
@@ -85,10 +116,58 @@ impl OtapMetricRecords {
         self.number_data_points.as_ref()
     }
 
+    /// Returns the `SummaryDataPoints` table (`ArrowPayloadType = 12`), if non-empty.
+    #[must_use]
+    pub fn summary_data_points(&self) -> Option<&RecordBatch> {
+        self.summary_data_points.as_ref()
+    }
+
+    /// Returns the `HistogramDataPoints` table (`ArrowPayloadType = 13`), if non-empty.
+    #[must_use]
+    pub fn histogram_data_points(&self) -> Option<&RecordBatch> {
+        self.histogram_data_points.as_ref()
+    }
+
     /// Returns the `NumberDpAttrs` table (`ArrowPayloadType = 15`), if non-empty.
     #[must_use]
     pub fn number_dp_attrs(&self) -> Option<&RecordBatch> {
         self.number_dp_attrs.as_ref()
+    }
+
+    /// Returns the `SummaryDpAttrs` table (`ArrowPayloadType = 16`), if non-empty.
+    #[must_use]
+    pub fn summary_dp_attrs(&self) -> Option<&RecordBatch> {
+        self.summary_dp_attrs.as_ref()
+    }
+
+    /// Returns the `HistogramDpAttrs` table (`ArrowPayloadType = 17`), if non-empty.
+    #[must_use]
+    pub fn histogram_dp_attrs(&self) -> Option<&RecordBatch> {
+        self.histogram_dp_attrs.as_ref()
+    }
+
+    /// Returns the `NumberDpExemplars` table (`ArrowPayloadType = 19`), if non-empty.
+    #[must_use]
+    pub fn number_dp_exemplars(&self) -> Option<&RecordBatch> {
+        self.number_dp_exemplars.as_ref()
+    }
+
+    /// Returns the `HistogramDpExemplars` table (`ArrowPayloadType = 20`), if non-empty.
+    #[must_use]
+    pub fn histogram_dp_exemplars(&self) -> Option<&RecordBatch> {
+        self.histogram_dp_exemplars.as_ref()
+    }
+
+    /// Returns the `NumberDpExemplarAttrs` table (`ArrowPayloadType = 22`), if non-empty.
+    #[must_use]
+    pub fn number_dp_exemplar_attrs(&self) -> Option<&RecordBatch> {
+        self.number_dp_exemplar_attrs.as_ref()
+    }
+
+    /// Returns the `HistogramDpExemplarAttrs` table (`ArrowPayloadType = 23`), if non-empty.
+    #[must_use]
+    pub fn histogram_dp_exemplar_attrs(&self) -> Option<&RecordBatch> {
+        self.histogram_dp_exemplar_attrs.as_ref()
     }
 
     /// Looks up a decoded [`RecordBatch`] by its [`MetricPayloadType`].
@@ -96,9 +175,19 @@ impl OtapMetricRecords {
     pub fn get(&self, payload_type: MetricPayloadType) -> Option<&RecordBatch> {
         match payload_type {
             MetricPayloadType::UnivariateMetrics => self.univariate_metrics.as_ref(),
-            MetricPayloadType::MetricAttrs => self.metric_attrs.as_ref(),
             MetricPayloadType::NumberDataPoints => self.number_data_points.as_ref(),
+            MetricPayloadType::SummaryDataPoints => self.summary_data_points.as_ref(),
+            MetricPayloadType::HistogramDataPoints => self.histogram_data_points.as_ref(),
             MetricPayloadType::NumberDpAttrs => self.number_dp_attrs.as_ref(),
+            MetricPayloadType::SummaryDpAttrs => self.summary_dp_attrs.as_ref(),
+            MetricPayloadType::HistogramDpAttrs => self.histogram_dp_attrs.as_ref(),
+            MetricPayloadType::NumberDpExemplars => self.number_dp_exemplars.as_ref(),
+            MetricPayloadType::HistogramDpExemplars => self.histogram_dp_exemplars.as_ref(),
+            MetricPayloadType::NumberDpExemplarAttrs => self.number_dp_exemplar_attrs.as_ref(),
+            MetricPayloadType::HistogramDpExemplarAttrs => {
+                self.histogram_dp_exemplar_attrs.as_ref()
+            }
+            MetricPayloadType::MetricAttrs => self.metric_attrs.as_ref(),
         }
     }
 
@@ -114,8 +203,40 @@ impl OtapMetricRecords {
                 self.number_data_points.as_ref(),
             ),
             (
+                MetricPayloadType::SummaryDataPoints,
+                self.summary_data_points.as_ref(),
+            ),
+            (
+                MetricPayloadType::HistogramDataPoints,
+                self.histogram_data_points.as_ref(),
+            ),
+            (
                 MetricPayloadType::NumberDpAttrs,
                 self.number_dp_attrs.as_ref(),
+            ),
+            (
+                MetricPayloadType::SummaryDpAttrs,
+                self.summary_dp_attrs.as_ref(),
+            ),
+            (
+                MetricPayloadType::HistogramDpAttrs,
+                self.histogram_dp_attrs.as_ref(),
+            ),
+            (
+                MetricPayloadType::NumberDpExemplars,
+                self.number_dp_exemplars.as_ref(),
+            ),
+            (
+                MetricPayloadType::HistogramDpExemplars,
+                self.histogram_dp_exemplars.as_ref(),
+            ),
+            (
+                MetricPayloadType::NumberDpExemplarAttrs,
+                self.number_dp_exemplar_attrs.as_ref(),
+            ),
+            (
+                MetricPayloadType::HistogramDpExemplarAttrs,
+                self.histogram_dp_exemplar_attrs.as_ref(),
             ),
             (MetricPayloadType::MetricAttrs, self.metric_attrs.as_ref()),
         ]
@@ -131,7 +252,33 @@ impl OtapMetricRecords {
                 self.univariate_metrics,
             ),
             (MetricPayloadType::NumberDataPoints, self.number_data_points),
+            (
+                MetricPayloadType::SummaryDataPoints,
+                self.summary_data_points,
+            ),
+            (
+                MetricPayloadType::HistogramDataPoints,
+                self.histogram_data_points,
+            ),
             (MetricPayloadType::NumberDpAttrs, self.number_dp_attrs),
+            (MetricPayloadType::SummaryDpAttrs, self.summary_dp_attrs),
+            (MetricPayloadType::HistogramDpAttrs, self.histogram_dp_attrs),
+            (
+                MetricPayloadType::NumberDpExemplars,
+                self.number_dp_exemplars,
+            ),
+            (
+                MetricPayloadType::HistogramDpExemplars,
+                self.histogram_dp_exemplars,
+            ),
+            (
+                MetricPayloadType::NumberDpExemplarAttrs,
+                self.number_dp_exemplar_attrs,
+            ),
+            (
+                MetricPayloadType::HistogramDpExemplarAttrs,
+                self.histogram_dp_exemplar_attrs,
+            ),
             (MetricPayloadType::MetricAttrs, self.metric_attrs),
         ]
         .into_iter()
@@ -152,11 +299,20 @@ impl OtapMetricRecords {
             .map_or(0, RecordBatch::num_rows)
     }
 
-    /// Returns the number of scalar data points in `NumberDataPoints`.
+    /// Returns the total number of data points across `NumberDataPoints`, `SummaryDataPoints`,
+    /// and `HistogramDataPoints`.
     #[must_use]
     pub fn num_data_points(&self) -> usize {
         self.number_data_points
             .as_ref()
             .map_or(0, RecordBatch::num_rows)
+            + self
+                .summary_data_points
+                .as_ref()
+                .map_or(0, RecordBatch::num_rows)
+            + self
+                .histogram_data_points
+                .as_ref()
+                .map_or(0, RecordBatch::num_rows)
     }
 }
