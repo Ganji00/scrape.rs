@@ -365,6 +365,11 @@ impl ArrowDecoder {
     }
 
     #[inline]
+    fn batch_data_points(&self) -> usize {
+        self.total_data_points() + self.assembly.groups.len()
+    }
+
+    #[inline]
     fn flush_pending_family(
         &mut self,
         opts: &DecodeOptions,
@@ -495,16 +500,23 @@ impl ArrowDecoder {
                         }
                     };
 
-                    if CHUNKED
-                        && self.assembly.is_empty()
-                        && (self.total_data_points() >= max_data_points
-                            || (self.current_family.batch_id.is_none()
-                                && self.metrics.len() >= MAX_METRICS_PER_BATCH))
-                    {
-                        *pending_series = true;
-                        let batch = self.finish_batches(default_ts_ns.is_some())?;
-                        self.reset_batch();
-                        return Ok(Some(batch));
+                    if CHUNKED {
+                        let split_assembled = !self.assembly.is_empty()
+                            && self.batch_data_points() >= max_data_points
+                            && !self.series_matches_staged_group(parser, role);
+                        let split_scalar = self.assembly.is_empty()
+                            && (self.total_data_points() >= max_data_points
+                                || (self.current_family.batch_id.is_none()
+                                    && self.metrics.len() >= MAX_METRICS_PER_BATCH));
+                        if split_assembled || split_scalar {
+                            if split_assembled {
+                                self.flush_pending_family(opts, default_ts_ns)?;
+                            }
+                            *pending_series = true;
+                            let batch = self.finish_batches(default_ts_ns.is_some())?;
+                            self.reset_batch();
+                            return Ok(Some(batch));
+                        }
                     }
 
                     self.ingest_series_entry(parser, role, opts, default_ts_ns)?;
@@ -791,6 +803,58 @@ impl ArrowDecoder {
         }
 
         Ok(())
+    }
+
+    /// Checks whether the current assembled series line belongs to a data-point group already
+    /// staged in `self.assembly` without interning new keys or values into the active batch.
+    fn series_matches_staged_group(&mut self, parser: &ActiveParser<'_>, role: SeriesRole) -> bool {
+        let special_label = match role {
+            SeriesRole::HistogramBucket => Some(b"le" as &[u8]),
+            SeriesRole::SummaryQuantile => Some(b"quantile" as &[u8]),
+            _ => None,
+        };
+        let (_, label_spans, full_input, _, _) = parser.raw_series_parts();
+        self.temp_attrs.clear();
+
+        let mut prev_key_id: Option<u32> = None;
+        let mut sorted_by_key_id = true;
+
+        for span in label_spans {
+            let raw_key = &full_input[span.name_start..span.name_end];
+            let raw_val = &full_input[span.val_start..span.val_end];
+
+            if let Some(target_key) = special_label {
+                let key = unescape_bytes_into(raw_key, true, &mut self.unescape_buf);
+                if key == target_key {
+                    continue;
+                }
+            }
+            if raw_val.is_empty() {
+                continue;
+            }
+
+            let key_bytes = unescape_bytes_into(raw_key, true, &mut self.unescape_buf);
+            let Some(key_id) = self.key_interner.lookup(key_bytes) else {
+                return false;
+            };
+            let val_bytes = unescape_bytes_into(raw_val, true, &mut self.unescape_buf);
+            let Some(val_id) = self.val_interner.lookup(val_bytes) else {
+                return false;
+            };
+
+            if let Some(prev) = prev_key_id
+                && key_id <= prev
+            {
+                sorted_by_key_id = false;
+            }
+            prev_key_id = Some(key_id);
+            self.temp_attrs.push((key_id, val_id));
+        }
+
+        if !sorted_by_key_id {
+            self.temp_attrs.sort_unstable_by_key(|&(k, _)| k);
+        }
+        self.assembly.contains_group(&self.temp_attrs)
     }
 
     #[inline]

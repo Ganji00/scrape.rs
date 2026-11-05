@@ -422,12 +422,19 @@ fn decode_stream_splits_mid_family_preserves_metadata_and_handles_edges() {
     assert!(dec.prom_spans.capacity() >= 4);
 
     // Consecutive assembled families (histograms/summaries) preceded by `# TYPE` flush at
-    // `max_data_points_per_batch` when the next family begins.
+    // `max_data_points_per_batch` when the next family begins, and a single assembled family
+    // with multiple series splits across chunks at `max_data_points_per_batch`.
     let assembled_stream = concat!(
+        "# HELP h1 Request latency.\n",
         "# TYPE h1 histogram\n",
-        "h1_bucket{le=\"+Inf\"} 1\n",
-        "h1_sum 1\n",
-        "h1_count 1\n",
+        "h1_bucket{id=\"1\",le=\"1\"} 1\n",
+        "h1_bucket{id=\"1\",le=\"+Inf\"} 2\n",
+        "h1_sum{id=\"1\"} 1.5\n",
+        "h1_count{id=\"1\"} 2\n",
+        "h1_bucket{id=\"2\",le=\"1\"} 3\n",
+        "h1_bucket{id=\"2\",le=\"+Inf\"} 4\n",
+        "h1_sum{id=\"2\"} 3.5\n",
+        "h1_count{id=\"2\"} 4\n",
         "# TYPE s1 summary\n",
         "s1{quantile=\"0.5\"} 2\n",
         "s1_sum 2\n",
@@ -437,11 +444,13 @@ fn decode_stream_splits_mid_family_preserves_metadata_and_handles_edges() {
         .decode_stream(assembled_stream.as_bytes(), &Format::TEXT, &zero_opts)
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(assembled_chunks.len(), 2);
+    assert_eq!(assembled_chunks.len(), 3);
     assert_eq!(assembled_chunks[0].num_data_points(), 1);
     assert!(assembled_chunks[0].histogram_data_points().is_some());
     assert_eq!(assembled_chunks[1].num_data_points(), 1);
-    assert!(assembled_chunks[1].summary_data_points().is_some());
+    assert!(assembled_chunks[1].histogram_data_points().is_some());
+    assert_eq!(assembled_chunks[2].num_data_points(), 1);
+    assert!(assembled_chunks[2].summary_data_points().is_some());
 
     // In Prometheus text format (`Format::TEXT`), `*_created` lines are regular metrics rather
     // than OpenMetrics start timestamps, so non-adjacent `foo_created` lines are preserved as

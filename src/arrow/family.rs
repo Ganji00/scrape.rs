@@ -356,6 +356,30 @@ impl FamilyAssembly {
     }
 
     #[inline]
+    pub(super) fn contains_group(&mut self, attrs: &[(u32, u32)]) -> bool {
+        if let Some(last_idx) = self.last_group_idx
+            && last_idx < self.groups.len()
+        {
+            let g = self.groups[last_idx];
+            let start = g.attr_start as usize;
+            let end = start + g.attr_len as usize;
+            if self.group_attrs[start..end] == attrs[..] {
+                return true;
+            }
+        }
+
+        for (idx, g) in self.groups.iter().enumerate() {
+            let start = g.attr_start as usize;
+            let end = start + g.attr_len as usize;
+            if self.group_attrs[start..end] == attrs[..] {
+                self.last_group_idx = Some(idx);
+                return true;
+            }
+        }
+        false
+    }
+
+    #[inline]
     pub(super) fn find_or_create_group(&mut self, attrs: &[(u32, u32)]) -> usize {
         if let Some(last_idx) = self.last_group_idx
             && last_idx < self.groups.len()

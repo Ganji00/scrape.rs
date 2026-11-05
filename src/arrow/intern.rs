@@ -122,6 +122,25 @@ impl StringInterner {
         &self.bytes[start..end]
     }
 
+    /// Looks up a previously interned byte slice without inserting it.
+    #[inline]
+    pub(super) fn lookup(&self, raw: &[u8]) -> Option<u32> {
+        let hash = fx_hash(raw);
+        let mask = self.buckets.len() - 1;
+        let mut slot = (hash as usize) & mask;
+
+        loop {
+            let bucket = self.buckets[slot];
+            if bucket.id == EMPTY_SLOT {
+                return None;
+            }
+            if bucket.hash == hash && self.get_bytes(bucket.id) == raw {
+                return Some(bucket.id);
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
     /// Interns UTF-8 validated `raw` bytes, returning `Some(id)` or `None` if the cumulative byte
     /// arena exceeds `i32::MAX`.
     #[inline]
