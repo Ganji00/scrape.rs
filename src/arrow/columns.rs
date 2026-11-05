@@ -27,12 +27,11 @@ use super::DecodeError;
 use super::intern::StringInterner;
 use super::schema::{
     AGGREGATION_TEMPORALITY_CUMULATIVE, ATTR_VALUE_TYPE_STR, KeyEncoding,
-    OTAP_METRIC_TYPE_HISTOGRAM, OTAP_METRIC_TYPE_SUM, PROMETHEUS_TYPE_METADATA_KEY, UTC_TIME_ZONE,
-    ValEncoding, dp_attrs_schema, exemplars_schema, histogram_bucket_counts_item_field,
-    histogram_dp_schema, histogram_explicit_bounds_item_field, metric_attrs_key_dict,
-    metric_attrs_schema, metric_attrs_schema_for, metric_attrs_type_val_dict, number_dp_schema,
-    summary_dp_schema, summary_quantile_item_field, summary_quantile_struct_fields,
-    univariate_metrics_schema,
+    OTAP_METRIC_TYPE_HISTOGRAM, OTAP_METRIC_TYPE_SUM, UTC_TIME_ZONE, ValEncoding, dp_attrs_schema,
+    exemplars_schema, histogram_bucket_counts_item_field, histogram_dp_schema,
+    histogram_explicit_bounds_item_field, metric_attrs_key_dict, metric_attrs_schema,
+    metric_attrs_type_val_dict, number_dp_schema, summary_dp_schema, summary_quantile_item_field,
+    summary_quantile_struct_fields, univariate_metrics_schema,
 };
 
 /// Reusable scratch vectors used when materializing Arrow columns without reallocating.
@@ -284,8 +283,6 @@ pub(super) struct MetricTable {
     pub(super) all_temporality: bool,
     pub(super) any_sum: bool,
     pub(super) all_sum: bool,
-    pub(super) extra_attr_parents: Vec<u16>,
-    pub(super) extra_attr_pairs: Vec<(u32, u32)>,
 }
 
 impl MetricTable {
@@ -304,8 +301,6 @@ impl MetricTable {
             all_temporality: true,
             any_sum: false,
             all_sum: true,
-            extra_attr_parents: Vec::new(),
-            extra_attr_pairs: Vec::new(),
         }
     }
 
@@ -322,8 +317,6 @@ impl MetricTable {
         self.all_temporality = true;
         self.any_sum = false;
         self.all_sum = true;
-        self.extra_attr_parents.clear();
-        self.extra_attr_pairs.clear();
     }
 
     pub(super) fn retained_memory_bytes(&self) -> usize {
@@ -334,8 +327,6 @@ impl MetricTable {
             + self.name_bytes.capacity()
             + self.desc.retained_memory_bytes()
             + self.unit.retained_memory_bytes()
-            + self.extra_attr_parents.capacity() * size_of::<u16>()
-            + self.extra_attr_pairs.capacity() * size_of::<(u32, u32)>()
     }
 
     #[inline]
@@ -424,92 +415,33 @@ impl MetricTable {
 
     pub(super) fn build_metric_attrs(
         &self,
-        key_interner: &mut StringInterner,
-        val_interner: &mut StringInterner,
-        temp_attrs: &mut Vec<(u32, u32)>,
         scratch: &mut ScratchBuffers,
     ) -> Result<RecordBatch, DecodeError> {
         let num_metrics = self.metric_types.len();
         scratch.u16_buf.clear();
         scratch.u16_buf.extend((0..num_metrics).map(|i| i as u16));
 
-        if self.extra_attr_pairs.is_empty() {
-            // Fast path: only `prometheus.type` is present on each metric row, using pre-built
-            // static dictionary arrays.
-            let parent_id_arr = UInt16Array::new(scalar_from_slice(&scratch.u16_buf), None);
+        let parent_id_arr = UInt16Array::new(scalar_from_slice(&scratch.u16_buf), None);
 
-            scratch.u8_buf.clear();
-            scratch.u8_buf.resize(num_metrics, 0);
-            let key_keys = UInt8Array::new(scalar_from_slice(&scratch.u8_buf), None);
-            let key_dict = DictionaryArray::<UInt8Type>::new(key_keys, metric_attrs_key_dict());
+        scratch.u8_buf.clear();
+        scratch.u8_buf.resize(num_metrics, 0);
+        let key_keys = UInt8Array::new(scalar_from_slice(&scratch.u8_buf), None);
+        let key_dict = DictionaryArray::<UInt8Type>::new(key_keys, metric_attrs_key_dict());
 
-            scratch.u8_buf.fill(ATTR_VALUE_TYPE_STR);
-            let type_arr = UInt8Array::new(scalar_from_slice(&scratch.u8_buf), None);
+        scratch.u8_buf.fill(ATTR_VALUE_TYPE_STR);
+        let type_arr = UInt8Array::new(scalar_from_slice(&scratch.u8_buf), None);
 
-            let str_keys = UInt16Array::new(scalar_from_slice(&self.attr_type_keys), None);
-            let str_dict =
-                DictionaryArray::<UInt16Type>::new(str_keys, metric_attrs_type_val_dict());
-
-            return Ok(RecordBatch::try_new(
-                metric_attrs_schema(),
-                vec![
-                    Arc::new(parent_id_arr),
-                    Arc::new(key_dict),
-                    Arc::new(type_arr),
-                    Arc::new(str_dict),
-                ],
-            )?);
-        }
-
-        // Dynamic path when `InfoPolicy::MetricAttrs` attaches `info` labels to `MetricAttrs`.
-        let prom_type_key_id = key_interner
-            .intern(PROMETHEUS_TYPE_METADATA_KEY.as_bytes())
-            .ok_or_else(|| DecodeError::CapacityOverflow {
-                table: "MetricAttrs.key",
-                count: key_interner.len(),
-            })?;
-        const TYPE_NAMES: [&[u8]; 8] = [
-            b"unknown",
-            b"counter",
-            b"gauge",
-            b"histogram",
-            b"gaugehistogram",
-            b"summary",
-            b"info",
-            b"stateset",
-        ];
-        let mut type_val_ids = [u32::MAX; 8];
-        temp_attrs.clear();
-        temp_attrs.reserve(num_metrics + self.extra_attr_pairs.len());
-        for &t_idx in &self.attr_type_keys {
-            let idx = t_idx as usize;
-            let val_id = match type_val_ids[idx] {
-                u32::MAX => {
-                    let id = val_interner.intern(TYPE_NAMES[idx]).ok_or_else(|| {
-                        DecodeError::CapacityOverflow {
-                            table: "MetricAttrs.str",
-                            count: val_interner.len(),
-                        }
-                    })?;
-                    type_val_ids[idx] = id;
-                    id
-                }
-                id => id,
-            };
-            temp_attrs.push((prom_type_key_id, val_id));
-        }
-        scratch.u16_buf.extend_from_slice(&self.extra_attr_parents);
-        temp_attrs.extend_from_slice(&self.extra_attr_pairs);
-
-        let enc = AttrEncoding::new(key_interner, val_interner, true);
-        let parent_id_arr: ArrayRef =
-            Arc::new(UInt16Array::new(scalar_from_slice(&scratch.u16_buf), None));
-        let (key_arr, type_arr, val_arr) =
-            scratch.build_attr_columns(temp_attrs, &enc, "MetricAttrs")?;
+        let str_keys = UInt16Array::new(scalar_from_slice(&self.attr_type_keys), None);
+        let str_dict = DictionaryArray::<UInt16Type>::new(str_keys, metric_attrs_type_val_dict());
 
         Ok(RecordBatch::try_new(
-            metric_attrs_schema_for(enc.key_enc, enc.val_enc),
-            vec![parent_id_arr, key_arr, type_arr, val_arr],
+            metric_attrs_schema(),
+            vec![
+                Arc::new(parent_id_arr),
+                Arc::new(key_dict),
+                Arc::new(type_arr),
+                Arc::new(str_dict),
+            ],
         )?)
     }
 }

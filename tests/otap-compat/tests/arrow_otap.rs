@@ -18,9 +18,8 @@ use std::fs;
 use std::path::Path;
 
 use expfmt::arrow::{
-    ArrowDecoder, CounterSuffixPolicy, DecodeError, DecodeOptions, InfoPolicy, MetricPayloadType,
-    OtapMetricRecords, PROMETHEUS_TYPE_METADATA_KEY, StatesetPolicy, UnitSuffixPolicy,
-    UntypedPolicy,
+    ArrowDecoder, CounterSuffixPolicy, DecodeError, DecodeOptions, MetricPayloadType,
+    OtapMetricRecords, PROMETHEUS_TYPE_METADATA_KEY, UnitSuffixPolicy, UntypedPolicy,
 };
 use expfmt::format::Format;
 use otel_arrow_dfe_pdata::otap::{Metrics, OtapArrowRecords, OtapBatchStore};
@@ -695,15 +694,11 @@ fn gaugehistogram_unsorted_bounds_nullable_sums_and_exemplar_nulls_validate_in_o
 }
 
 #[test]
-fn translation_policies_control_suffix_stripping_and_type_projections() {
+fn translation_policies_control_suffix_stripping_and_untyped_projections() {
     let payload = concat!(
         "# TYPE net_bytes counter\n",
         "# UNIT net_bytes bytes\n",
         "net_bytes_total 100 1710000000.0\n",
-        "# TYPE build info\n",
-        "build_info{rev=\"abc\"} 1 1710000000.0\n",
-        "# TYPE flag stateset\n",
-        "flag{flag=\"a\"} 1 1710000000.0\n",
         "# TYPE raw_total unknown\n",
         "raw_total 7 1710000000.0\n",
         "# EOF\n",
@@ -713,8 +708,6 @@ fn translation_policies_control_suffix_stripping_and_type_projections() {
     let opts = DecodeOptions::new()
         .with_counter_suffix_policy(CounterSuffixPolicy::Strip)
         .with_unit_suffix_policy(UnitSuffixPolicy::Strip)
-        .with_info_policy(InfoPolicy::MetricAttrs)
-        .with_stateset_policy(StatesetPolicy::NonMonotonicSum)
         .with_untyped_policy(UntypedPolicy::InferFromSuffix);
 
     let decoded = decoder
@@ -742,27 +735,6 @@ fn translation_policies_control_suffix_stripping_and_type_projections() {
             })),
         },
         Metric {
-            name: "build".to_owned(),
-            description: String::new(),
-            unit: String::new(),
-            metadata: vec![
-                kv_str(PROMETHEUS_TYPE_METADATA_KEY, "info"),
-                kv_str("rev", "abc"),
-            ],
-            data: None,
-        },
-        Metric {
-            name: "flag".to_owned(),
-            description: String::new(),
-            unit: String::new(),
-            metadata: vec![kv_str(PROMETHEUS_TYPE_METADATA_KEY, "stateset")],
-            data: Some(metric::Data::Sum(Sum {
-                aggregation_temporality: AggregationTemporality::Cumulative as i32,
-                is_monotonic: false,
-                data_points: vec![number_dp(&[("flag", "a")], ts_ns, 1.0)],
-            })),
-        },
-        Metric {
             name: "raw".to_owned(),
             description: String::new(),
             unit: String::new(),
@@ -776,11 +748,8 @@ fn translation_policies_control_suffix_stripping_and_type_projections() {
     ]));
     assert_equivalent(&[expected], &[actual_otlp]);
 
-    // Verify Drop policies omit `info`, `stateset`, and `unknown` families cleanly.
-    let drop_opts = DecodeOptions::new()
-        .with_info_policy(InfoPolicy::Drop)
-        .with_stateset_policy(StatesetPolicy::Drop)
-        .with_untyped_policy(UntypedPolicy::Drop);
+    // Verify `UntypedPolicy::Drop` omits `unknown` families cleanly.
+    let drop_opts = DecodeOptions::new().with_untyped_policy(UntypedPolicy::Drop);
     let dropped = decoder
         .decode(payload.as_bytes(), &Format::OPEN_METRICS_1_0_0, &drop_opts)
         .expect("drop policy decode succeeds");

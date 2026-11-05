@@ -43,8 +43,8 @@ use self::columns::{
 use self::family::{CurrentFamily, FamilyAssembly, SeriesRole};
 use self::intern::StringInterner;
 pub use self::options::{
-    CounterSuffixPolicy, DEFAULT_MAX_DATA_POINTS_PER_BATCH, DecodeError, DecodeOptions, InfoPolicy,
-    StatesetPolicy, UnitSuffixPolicy, UntypedPolicy,
+    CounterSuffixPolicy, DEFAULT_MAX_DATA_POINTS_PER_BATCH, DecodeError, DecodeOptions,
+    UnitSuffixPolicy, UntypedPolicy,
 };
 pub use self::records::{MetricPayloadType, OtapMetricRecords};
 pub use self::schema::PROMETHEUS_TYPE_METADATA_KEY;
@@ -657,31 +657,13 @@ impl ArrowDecoder {
 
         // Always validate series labels first so duplicate/reserved labels are caught even when a
         // translation policy drops the metric family.
-        let is_dropped = match self.current_family.metric_type {
-            MetricType::Info => opts.info_policy == InfoPolicy::Drop,
-            MetricType::Stateset => opts.stateset_policy == StatesetPolicy::Drop,
-            MetricType::Unknown => opts.untyped_policy == UntypedPolicy::Drop,
-            _ => false,
-        };
+        let is_dropped = self.current_family.metric_type == MetricType::Unknown
+            && opts.untyped_policy == UntypedPolicy::Drop;
         if is_dropped {
             for span_idx in 0..label_spans.len() {
                 self.validate_empty_label(span_idx, &label_spans[..=span_idx], full_input)?;
             }
             self.current_family.has_samples = true;
-            return Ok(());
-        }
-
-        if self.current_family.metric_type == MetricType::Info
-            && opts.info_policy == InfoPolicy::MetricAttrs
-        {
-            self.extract_series_labels_into_temp(label_spans, full_input, None)?;
-            let parent_id = self
-                .current_family
-                .emit_into_batch(&mut self.metrics, opts)?;
-            for &(k, v) in &self.temp_attrs {
-                self.metrics.extra_attr_parents.push(parent_id);
-                self.metrics.extra_attr_pairs.push((k, v));
-            }
             return Ok(());
         }
 
@@ -1195,15 +1177,7 @@ impl ArrowDecoder {
             .attrs
             .build_batch(&enc, &mut self.scratch)?;
 
-        // Build `MetricAttrs` after data-point and exemplar attribute tables so the dynamic
-        // `InfoPolicy::MetricAttrs` path does not intern `prometheus.type` or type names into
-        // `DpAttrs` / `ExemplarAttrs` dictionaries.
-        let metric_attrs = Some(self.metrics.build_metric_attrs(
-            &mut self.key_interner,
-            &mut self.val_interner,
-            &mut self.temp_attrs,
-            &mut self.scratch,
-        )?);
+        let metric_attrs = Some(self.metrics.build_metric_attrs(&mut self.scratch)?);
 
         Ok(OtapMetricRecords {
             univariate_metrics,

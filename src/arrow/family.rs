@@ -17,12 +17,11 @@ use crate::parse::MetricType;
 
 use super::columns::{HistogramDpTable, MetricTable, SummaryDpTable, f64_to_u64_count};
 use super::options::{
-    CounterSuffixPolicy, DecodeError, DecodeOptions, InfoPolicy, StatesetPolicy, UnitSuffixPolicy,
-    UntypedPolicy,
+    CounterSuffixPolicy, DecodeError, DecodeOptions, UnitSuffixPolicy, UntypedPolicy,
 };
 use super::schema::{
-    OTAP_METRIC_TYPE_EMPTY, OTAP_METRIC_TYPE_GAUGE, OTAP_METRIC_TYPE_HISTOGRAM,
-    OTAP_METRIC_TYPE_SUM, OTAP_METRIC_TYPE_SUMMARY,
+    OTAP_METRIC_TYPE_GAUGE, OTAP_METRIC_TYPE_HISTOGRAM, OTAP_METRIC_TYPE_SUM,
+    OTAP_METRIC_TYPE_SUMMARY,
 };
 
 /// Role of a series line within the active [`CurrentFamily`].
@@ -249,16 +248,8 @@ impl CurrentFamily {
             MetricType::Histogram => (OTAP_METRIC_TYPE_HISTOGRAM, 3u16, false),
             MetricType::GaugeHistogram => (OTAP_METRIC_TYPE_HISTOGRAM, 4u16, false),
             MetricType::Summary => (OTAP_METRIC_TYPE_SUMMARY, 5u16, false),
-            MetricType::Info => match opts.info_policy {
-                InfoPolicy::Gauge | InfoPolicy::Drop => (OTAP_METRIC_TYPE_GAUGE, 6u16, false),
-                InfoPolicy::MetricAttrs => (OTAP_METRIC_TYPE_EMPTY, 6u16, false),
-            },
-            MetricType::Stateset => match opts.stateset_policy {
-                StatesetPolicy::Gauge | StatesetPolicy::Drop => {
-                    (OTAP_METRIC_TYPE_GAUGE, 7u16, false)
-                }
-                StatesetPolicy::NonMonotonicSum => (OTAP_METRIC_TYPE_SUM, 7u16, false),
-            },
+            MetricType::Info => (OTAP_METRIC_TYPE_GAUGE, 6u16, false),
+            MetricType::Stateset => (OTAP_METRIC_TYPE_GAUGE, 7u16, false),
             MetricType::Unknown => {
                 if inferred_counter {
                     (OTAP_METRIC_TYPE_SUM, 0u16, true)

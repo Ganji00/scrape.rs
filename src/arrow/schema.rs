@@ -31,8 +31,6 @@ use std::sync::{Arc, LazyLock};
 use arrow_array::{ArrayRef, StringArray};
 use arrow_schema::{DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
 
-/// OTAP `UnivariateMetrics.metric_type` wire value for a metadata-only (`Empty`) metric.
-pub(super) const OTAP_METRIC_TYPE_EMPTY: u8 = 0;
 /// OTAP `UnivariateMetrics.metric_type` wire value for a Gauge metric (also used for `untyped`).
 pub(super) const OTAP_METRIC_TYPE_GAUGE: u8 = 1;
 /// OTAP `UnivariateMetrics.metric_type` wire value for a Sum metric (`counter`).
@@ -136,23 +134,6 @@ static METRIC_ATTRS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 pub(super) fn metric_attrs_schema() -> SchemaRef {
     Arc::clone(&METRIC_ATTRS_SCHEMA)
 }
-
-#[inline]
-pub(super) fn metric_attrs_schema_for(key_enc: KeyEncoding, val_enc: ValEncoding) -> SchemaRef {
-    let idx = (key_enc as usize) * 2 + (val_enc as usize);
-    Arc::clone(&METRIC_ATTRS_DYNAMIC_SCHEMAS[idx])
-}
-
-static METRIC_ATTRS_DYNAMIC_SCHEMAS: LazyLock<[SchemaRef; 6]> = LazyLock::new(|| {
-    [
-        build_u16_attrs_schema(KeyEncoding::DictU8, ValEncoding::DictU16),
-        build_u16_attrs_schema(KeyEncoding::DictU8, ValEncoding::Utf8),
-        build_u16_attrs_schema(KeyEncoding::DictU16, ValEncoding::DictU16),
-        build_u16_attrs_schema(KeyEncoding::DictU16, ValEncoding::Utf8),
-        build_u16_attrs_schema(KeyEncoding::Utf8, ValEncoding::DictU16),
-        build_u16_attrs_schema(KeyEncoding::Utf8, ValEncoding::Utf8),
-    ]
-});
 
 static METRIC_ATTRS_KEY_DICT: LazyLock<ArrayRef> =
     LazyLock::new(|| Arc::new(StringArray::from(vec![PROMETHEUS_TYPE_METADATA_KEY])));
@@ -479,16 +460,6 @@ pub(super) enum KeyEncoding {
 pub(super) enum ValEncoding {
     DictU16 = 0,
     Utf8 = 1,
-}
-
-fn build_u16_attrs_schema(key_enc: KeyEncoding, val_enc: ValEncoding) -> SchemaRef {
-    let (key_dt, val_dt) = attr_key_val_data_types(key_enc, val_enc);
-    Arc::new(Schema::new(vec![
-        Field::new("parent_id", DataType::UInt16, false).with_metadata(plain_id_metadata()),
-        Field::new("key", key_dt, false),
-        Field::new("type", DataType::UInt8, false),
-        Field::new("str", val_dt, true),
-    ]))
 }
 
 fn build_u32_attrs_schema(key_enc: KeyEncoding, val_enc: ValEncoding) -> SchemaRef {

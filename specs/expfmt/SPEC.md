@@ -117,7 +117,7 @@ scrape bytes
 - Metric families in text exposition are decoded as contiguous runs, with `# HELP`, `# TYPE`, and `# UNIT` metadata lines preceding that family's samples. Like OpenMetrics 1.0/2.0 and Prometheus's scrape loop, `ArrowDecoder` tracks only the active family cursor instead of maintaining a whole-scrape hash table to reassemble or reject previously seen names, so a non-contiguous repetition of an earlier metric name starts a fresh untyped run unless preceded by its own metadata.
 - A `LabelFilter` / `Relabeler` hook runs on the borrowed `LabelsBuffer` from Layer 0 so dropped series never allocate in Arrow builders or metric family state.
 - The metric family assembler groups classic histogram `_bucket`, `_sum`, and `_count` lines and summary `quantile`, `_sum`, and `_count` lines (plus OpenMetrics `_created` start timestamps) into complete metric families.
-- Configurable translation policies control counter `_total` and unit suffix handling, `info` and `stateset` projection, and untyped series handling.
+- Configurable translation policies control counter `_total` and unit suffix handling and untyped series handling.
 - `ArrowDecoder` owns its scratch buffers and Arrow builders without internal locks or global state, so a per-core `!Send` receiver can reuse allocations across scrapes with bounded memory.
 
 ### Layer 2: Proto DTO decoder

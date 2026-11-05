@@ -43,33 +43,6 @@ pub enum UnitSuffixPolicy {
     Strip,
 }
 
-/// Policy controlling how OpenMetrics `info` metric families are projected into OTAP tables.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum InfoPolicy {
-    /// Project `info` series as a `Gauge` metric with `NumberDataPoints` value `1.0` and series
-    /// labels in `NumberDpAttrs`.
-    #[default]
-    Gauge,
-    /// Project `info` series labels directly onto `MetricAttrs` (`UnivariateMetrics` `Empty` type
-    /// with `Metric.metadata` attributes in OTLP) without emitting `NumberDataPoints`.
-    MetricAttrs,
-    /// Drop `info` metric families from the decoded output.
-    Drop,
-}
-
-/// Policy controlling how OpenMetrics `stateset` metric families are projected into OTAP tables.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum StatesetPolicy {
-    /// Project `stateset` series as a `Gauge` metric with `NumberDataPoints` (`0.0` or `1.0`).
-    #[default]
-    Gauge,
-    /// Project `stateset` series as a non-monotonic cumulative `Sum` metric (`is_monotonic =
-    /// false`, `aggregation_temporality = Cumulative`).
-    NonMonotonicSum,
-    /// Drop `stateset` metric families from the decoded output.
-    Drop,
-}
-
 /// Policy controlling how untyped (`unknown`) metric families are projected into OTAP tables.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum UntypedPolicy {
@@ -97,10 +70,6 @@ pub struct DecodeOptions {
     pub counter_suffix_policy: CounterSuffixPolicy,
     /// Policy for `# UNIT` suffixes on `UnivariateMetrics.name`.
     pub unit_suffix_policy: UnitSuffixPolicy,
-    /// Projection policy for OpenMetrics `info` metric families.
-    pub info_policy: InfoPolicy,
-    /// Projection policy for OpenMetrics `stateset` metric families.
-    pub stateset_policy: StatesetPolicy,
     /// Projection policy for untyped (`unknown`) metric families.
     pub untyped_policy: UntypedPolicy,
 }
@@ -122,8 +91,6 @@ impl DecodeOptions {
             max_data_points_per_batch: DEFAULT_MAX_DATA_POINTS_PER_BATCH,
             counter_suffix_policy: CounterSuffixPolicy::Keep,
             unit_suffix_policy: UnitSuffixPolicy::Keep,
-            info_policy: InfoPolicy::Gauge,
-            stateset_policy: StatesetPolicy::Gauge,
             untyped_policy: UntypedPolicy::Gauge,
         }
     }
@@ -157,20 +124,6 @@ impl DecodeOptions {
     #[must_use]
     pub const fn with_unit_suffix_policy(mut self, policy: UnitSuffixPolicy) -> Self {
         self.unit_suffix_policy = policy;
-        self
-    }
-
-    /// Sets the [`InfoPolicy`] for OpenMetrics `info` metric families.
-    #[must_use]
-    pub const fn with_info_policy(mut self, policy: InfoPolicy) -> Self {
-        self.info_policy = policy;
-        self
-    }
-
-    /// Sets the [`StatesetPolicy`] for OpenMetrics `stateset` metric families.
-    #[must_use]
-    pub const fn with_stateset_policy(mut self, policy: StatesetPolicy) -> Self {
-        self.stateset_policy = policy;
         self
     }
 

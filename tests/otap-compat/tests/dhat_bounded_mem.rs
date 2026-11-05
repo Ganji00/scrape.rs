@@ -19,7 +19,7 @@ use std::fs;
 use std::path::Path;
 use std::rc::Rc;
 
-use expfmt::arrow::{ArrowDecoder, DecodeOptions, InfoPolicy, OtapMetricRecords};
+use expfmt::arrow::{ArrowDecoder, DecodeOptions, OtapMetricRecords};
 use expfmt::format::Format;
 use otel_arrow_dfe_pdata::otap::{Metrics, OtapArrowRecords, OtapBatchStore};
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
@@ -155,11 +155,10 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
 
         stream_handle.await.expect("streaming local task succeeds");
 
-        // Verify OpenMetrics 1.0 scrapes (with histograms, summaries, exemplars, units, info with
-        // `InfoPolicy::MetricAttrs`, and stateset) also keep retained scratch memory and live heap
-        // strictly constant after warmup.
+        // Verify OpenMetrics 1.0 scrapes (with histograms, summaries, exemplars, and units) also
+        // keep retained scratch memory and live heap strictly constant after warmup.
         let om_decoder = Rc::new(RefCell::new(ArrowDecoder::new()));
-        let om_opts = opts.with_info_policy(InfoPolicy::MetricAttrs);
+        let om_opts = opts;
         let om_handle = tokio::task::spawn_local(async move {
             let mut warmup_om_dec_mem = 0usize;
             let mut warmup_om_live_heap = 0usize;
