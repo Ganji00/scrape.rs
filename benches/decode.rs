@@ -11,21 +11,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Throughput benchmarks for `expfmt::arrow::ArrowDecoder` over the upstream Prometheus
-//! `model/textparse` fixture corpus.
+//! Throughput and allocation benchmarks for `expfmt::arrow::ArrowDecoder` over the upstream
+//! Prometheus `model/textparse` fixture corpus.
 //!
 //! Recommended CLI invocation:
 //! ```sh
-//! cargo bench --bench decode
+//! cargo bench --bench decode -- -bench '^BenchmarkDecode' -benchtime 1s -count 6 -cpu 2 -benchmem | tee ${bench}.txt
 //! ```
 
 use std::fs;
 use std::hint::black_box;
 use std::path::Path;
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use benchfmt::{CountingAlloc, Suite};
 use expfmt::arrow::{ArrowDecoder, DecodeOptions};
 use expfmt::format::Format;
+
+#[global_allocator]
+static ALLOC: CountingAlloc = CountingAlloc::new();
 
 /// Filters `alltypes.237mfs.prom.txt` down to its 209 counter, gauge, and untyped metric families
 /// until `#8` adds classic histogram and summary assembly.
@@ -70,7 +73,7 @@ fn filter_counter_gauge_families(raw: &str) -> Vec<u8> {
     out.into_bytes()
 }
 
-fn bench_arrow_decode(c: &mut Criterion) {
+fn main() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/textparse");
     let nometa = fs::read(root.join("alltypes.237mfs.nometa.prom.txt")).unwrap();
     let full = fs::read_to_string(root.join("alltypes.237mfs.prom.txt")).unwrap();
@@ -78,67 +81,62 @@ fn bench_arrow_decode(c: &mut Criterion) {
 
     let opts = DecodeOptions::new().with_timestamp_ms(0);
     let stream_256_opts = opts.with_max_data_points_per_batch(256);
-    let mut group = c.benchmark_group("ParsePromText");
 
-    group.throughput(Throughput::Bytes(nometa.len() as u64));
-    group.bench_function("alltypes.237mfs.nometa", |b| {
-        let mut decoder = ArrowDecoder::new();
-        b.iter(|| {
-            let records = decoder
-                .decode(black_box(&nometa), &Format::TEXT, &opts)
-                .unwrap();
-            black_box(records);
-        });
-    });
-    group.bench_function("alltypes.237mfs.nometa.stream_16k", |b| {
-        let mut decoder = ArrowDecoder::new();
-        b.iter(|| {
-            for chunk in decoder.decode_stream(black_box(&nometa), &Format::TEXT, &opts) {
-                black_box(chunk.unwrap());
-            }
-        });
-    });
-    group.bench_function("alltypes.237mfs.nometa.stream_256", |b| {
-        let mut decoder = ArrowDecoder::new();
-        b.iter(|| {
-            for chunk in decoder.decode_stream(black_box(&nometa), &Format::TEXT, &stream_256_opts)
-            {
-                black_box(chunk.unwrap());
-            }
-        });
-    });
+    let mut suite = Suite::from_env("expfmt").with_alloc(&ALLOC);
 
-    group.throughput(Throughput::Bytes(typed_simple.len() as u64));
-    group.bench_function("alltypes.209mfs.counter_gauge", |b| {
-        let mut decoder = ArrowDecoder::new();
-        b.iter(|| {
-            let records = decoder
-                .decode(black_box(&typed_simple), &Format::TEXT, &opts)
-                .unwrap();
-            black_box(records);
-        });
-    });
-    group.bench_function("alltypes.209mfs.counter_gauge.stream_16k", |b| {
-        let mut decoder = ArrowDecoder::new();
-        b.iter(|| {
-            for chunk in decoder.decode_stream(black_box(&typed_simple), &Format::TEXT, &opts) {
-                black_box(chunk.unwrap());
-            }
-        });
-    });
-    group.bench_function("alltypes.209mfs.counter_gauge.stream_256", |b| {
-        let mut decoder = ArrowDecoder::new();
-        b.iter(|| {
-            for chunk in
-                decoder.decode_stream(black_box(&typed_simple), &Format::TEXT, &stream_256_opts)
-            {
-                black_box(chunk.unwrap());
-            }
-        });
-    });
+    for (case, payload) in [
+        ("alltypes.237mfs.nometa", nometa.as_slice()),
+        ("alltypes.209mfs.counter_gauge", typed_simple.as_slice()),
+    ] {
+        let bytes = payload.len() as u64;
 
-    group.finish();
+        suite = suite
+            .bench(format!("Decode/case={case}/mode=decode"), move |b| {
+                // Warm internal staging and interner capacities once so B/op and allocs/op
+                // measure steady-state scrape reuse rather than cold capacity growth divided by N.
+                let mut decoder = ArrowDecoder::new();
+                black_box(decoder.decode(payload, &Format::TEXT, &opts).unwrap());
+
+                b.set_bytes(bytes);
+                b.report_allocs();
+                while b.keep_running() {
+                    let records = decoder
+                        .decode(black_box(payload), &Format::TEXT, &opts)
+                        .unwrap();
+                    black_box(records);
+                }
+            })
+            .bench(format!("Decode/case={case}/mode=stream_16k"), move |b| {
+                let mut decoder = ArrowDecoder::new();
+                for chunk in decoder.decode_stream(payload, &Format::TEXT, &opts) {
+                    black_box(chunk.unwrap());
+                }
+
+                b.set_bytes(bytes);
+                b.report_allocs();
+                while b.keep_running() {
+                    for chunk in decoder.decode_stream(black_box(payload), &Format::TEXT, &opts) {
+                        black_box(chunk.unwrap());
+                    }
+                }
+            })
+            .bench(format!("Decode/case={case}/mode=stream_256"), move |b| {
+                let mut decoder = ArrowDecoder::new();
+                for chunk in decoder.decode_stream(payload, &Format::TEXT, &stream_256_opts) {
+                    black_box(chunk.unwrap());
+                }
+
+                b.set_bytes(bytes);
+                b.report_allocs();
+                while b.keep_running() {
+                    for chunk in
+                        decoder.decode_stream(black_box(payload), &Format::TEXT, &stream_256_opts)
+                    {
+                        black_box(chunk.unwrap());
+                    }
+                }
+            });
+    }
+
+    suite.run();
 }
-
-criterion_group!(benches, bench_arrow_decode);
-criterion_main!(benches);
