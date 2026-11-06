@@ -234,16 +234,7 @@ fn matches_go_openmetricsparse_output() {
 fn matches_go_protobufparse_output() {
     use super::ProtobufParser;
 
-    for (dir, ignore_native_histograms, parse_classic_histograms) in [
-        ("protobufparse/default", false, false),
-        ("protobufparse/parse_classic_histograms", false, true),
-        ("protobufparse/ignore_native_histograms", true, false),
-    ] {
-        assert_matches_go(dir, |input| {
-            render(
-                ProtobufParser::new(input, ignore_native_histograms, parse_classic_histograms),
-                true,
-            )
-        });
-    }
+    assert_matches_go("protobufparse", |input| {
+        render(ProtobufParser::new(input), true)
+    });
 }

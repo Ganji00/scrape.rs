@@ -34,36 +34,8 @@ exemplar bf398f1d3ed527e5 1625851155146 "dummyID"="59727"
 st 0
 help "test_histogram2" "Similar histogram as before but now without sparse buckets."
 type "test_histogram2" histogram
-series "test_histogram2_count" 4065e00000000000 - "__name__"="test_histogram2_count"
-st 0
-series "test_histogram2_sum" 3f4b21c475e6362a - "__name__"="test_histogram2_sum"
-st 0
-series "test_histogram2_bucketÿleÿ-0.00048" 4000000000000000 - "__name__"="test_histogram2_bucket" "le"="-0.00048"
-st 0
-series "test_histogram2_bucketÿleÿ-0.00038" 4010000000000000 - "__name__"="test_histogram2_bucket" "le"="-0.00038"
-exemplar bf38e757928e0c9e 1625851153146 "dummyID"="59727"
-st 0
-series "test_histogram2_bucketÿleÿ1.0" 4030000000000000 - "__name__"="test_histogram2_bucket" "le"="1.0"
-exemplar bf3355475a31a4be - "dummyID"="5617"
-st 0
-series "test_histogram2_bucketÿleÿ+Inf" 4065e00000000000 - "__name__"="test_histogram2_bucket" "le"="+Inf"
-st 0
 help "test_histogram3" "Similar histogram as before but now with integer buckets."
 type "test_histogram3" histogram
-series "test_histogram3_count" 4018000000000000 - "__name__"="test_histogram3_count"
-st 0
-series "test_histogram3_sum" 4049000000000000 - "__name__"="test_histogram3_sum"
-st 0
-series "test_histogram3_bucketÿleÿ-20.0" 4000000000000000 - "__name__"="test_histogram3_bucket" "le"="-20.0"
-st 0
-series "test_histogram3_bucketÿleÿ20.0" 4010000000000000 - "__name__"="test_histogram3_bucket" "le"="20.0"
-exemplar 402e000000000000 1625851153146 "dummyID"="59727"
-st 0
-series "test_histogram3_bucketÿleÿ30.0" 4018000000000000 - "__name__"="test_histogram3_bucket" "le"="30.0"
-exemplar 4039000000000000 - "dummyID"="5617"
-st 0
-series "test_histogram3_bucketÿleÿ+Inf" 4018000000000000 - "__name__"="test_histogram3_bucket" "le"="+Inf"
-st 0
 help "test_histogram_family" "Test histogram metric family with two very simple histograms."
 type "test_histogram_family" histogram
 histogram "test_histogram_familyÿfooÿbar" - int schema=3 count=5 sum=4028333333333333 zero_threshold=0000000000000000 zero_count=0 hint=0 pos_spans=[8:2] pos=[2,1] neg_spans=[] neg=[] "__name__"="test_histogram_family" "foo"="bar"

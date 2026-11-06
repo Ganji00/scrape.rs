@@ -21,8 +21,8 @@ use prost::Message;
 
 use super::float::{FloatBuf, format_openmetrics_float};
 use super::{
-    BUCKET_LABEL, CounterResetHint, Entry, Histogram, HistogramRef, LabelsBuffer,
-    METRIC_NAME_LABEL, MetricType, ParseError, Parser, QUANTILE_LABEL, Span,
+    CounterResetHint, Entry, Histogram, HistogramRef, LabelsBuffer, METRIC_NAME_LABEL, MetricType,
+    ParseError, Parser, QUANTILE_LABEL, Span,
 };
 use crate::dto;
 
@@ -35,7 +35,8 @@ static EMPTY_DTO_HISTOGRAM: LazyLock<dto::Histogram> = LazyLock::new(dto::Histog
 /// Parser for varint length-delimited `MetricFamily` messages (`FmtProtoDelim`).
 ///
 /// Mirrors Go's `textparse.NewProtobufParser` with NHCB conversion and type and unit labels
-/// turned off.
+/// turned off. Histograms are only returned as native histograms: a histogram metric without
+/// native buckets is skipped, and classic buckets are never returned as series.
 pub struct ProtobufParser<'a> {
     input: &'a [u8],
     /// Offset of the next length prefix in `input`.
@@ -43,19 +44,17 @@ pub struct ProtobufParser<'a> {
     family: dto::MetricFamily,
     metric_index: usize,
     next_metric_index: usize,
-    ignore_native_histograms: bool,
-    parse_classic_histograms: bool,
     /// `None` is Go's `EntryInvalid`: the next call decodes the next metric family.
     state: Option<Entry>,
-    /// Go's `fieldPos`: -2 is `_count`, -1 is `_sum`, otherwise the quantile or bucket index.
+    /// Go's `fieldPos`: -2 is `_count`, -1 is `_sum`, otherwise the quantile index, or the
+    /// bucket index while reading native histogram exemplars from buckets.
     field_pos: isize,
     fields_done: bool,
-    redo_classic: bool,
     exemplar_pos: usize,
     exemplar_returned: bool,
-    /// Metric name plus the `_count`, `_sum`, or `_bucket` suffix of the current series.
+    /// Metric name plus the `_count` or `_sum` suffix of the current summary series.
     series_name: String,
-    /// The `quantile` or `le` label of the current series.
+    /// The `quantile` label of the current summary series.
     magic_label: Option<(&'static str, FloatBuf)>,
     entry_bytes: Vec<u8>,
     /// Indexes into `label_at`, sorted by label name.
@@ -66,26 +65,17 @@ pub struct ProtobufParser<'a> {
 }
 
 impl<'a> ProtobufParser<'a> {
-    /// Creates a parser over `input`. With `ignore_native_histograms`, histograms are only
-    /// returned as classic series. With `parse_classic_histograms`, a histogram that has both
-    /// native and classic buckets is returned in both forms.
-    pub fn new(
-        input: &'a [u8],
-        ignore_native_histograms: bool,
-        parse_classic_histograms: bool,
-    ) -> Self {
+    /// Creates a parser over `input`.
+    pub fn new(input: &'a [u8]) -> Self {
         Self {
             input,
             pos: 0,
             family: dto::MetricFamily::default(),
             metric_index: 0,
             next_metric_index: 0,
-            ignore_native_histograms,
-            parse_classic_histograms,
             state: None,
             field_pos: -2,
             fields_done: false,
-            redo_classic: false,
             exemplar_pos: 0,
             exemplar_returned: false,
             series_name: String::new(),
@@ -128,13 +118,16 @@ impl<'a> ProtobufParser<'a> {
         Ok(true)
     }
 
+    /// Moves to the next metric, skipping histograms without native buckets.
     fn next_metric(&mut self) -> bool {
-        if self.next_metric_index >= self.family.metric.len() {
-            return false;
+        while self.next_metric_index < self.family.metric.len() {
+            self.metric_index = self.next_metric_index;
+            self.next_metric_index += 1;
+            if !self.is_histogram_kind() || is_native_histogram(self.dto_histogram()) {
+                return true;
+            }
         }
-        self.metric_index = self.next_metric_index;
-        self.next_metric_index += 1;
-        true
+        false
     }
 
     fn metric(&self) -> &dto::Metric {
@@ -159,10 +152,6 @@ impl<'a> ProtobufParser<'a> {
         )
     }
 
-    fn is_classic_histogram(&self) -> bool {
-        self.ignore_native_histograms || !is_native_histogram(self.dto_histogram())
-    }
-
     fn timestamp(&self) -> Option<i64> {
         // Go treats 0 as unset, because gogo-protobuf has no optional fields.
         Some(self.metric().timestamp_ms).filter(|&millis| millis != 0)
@@ -170,16 +159,12 @@ impl<'a> ProtobufParser<'a> {
 
     /// Go's `getMagicName`.
     fn series_suffix(&self) -> &'static str {
-        let kind = self.kind();
-        if self.state == Some(Entry::Histogram)
-            || !(self.is_histogram_kind() || kind == dto::MetricType::Summary)
-        {
+        if self.kind() != dto::MetricType::Summary {
             return "";
         }
         match self.field_pos {
             -2 => "_count",
             -1 => "_sum",
-            _ if self.is_histogram_kind() => "_bucket",
             _ => "",
         }
     }
@@ -195,29 +180,18 @@ impl<'a> ProtobufParser<'a> {
     }
 
     fn magic_label_value(&mut self) -> Option<(&'static str, f64)> {
-        if self.state == Some(Entry::Histogram) || self.field_pos < 0 {
+        if self.kind() != dto::MetricType::Summary || self.field_pos < 0 {
             return None;
         }
         let pos = self.field_pos as usize;
-        if self.kind() == dto::MetricType::Summary {
-            let quantiles = self
-                .metric()
-                .summary
-                .as_ref()
-                .map_or(&[][..], |summary| &summary.quantile);
-            let (len, quantile) = (quantiles.len(), quantiles.get(pos).map(|q| q.quantile));
-            self.fields_done = quantile.is_none() || pos == len - 1;
-            return quantile.map(|quantile| (QUANTILE_LABEL, quantile));
-        }
-        if self.is_histogram_kind() {
-            let upper_bound = match self.dto_histogram().bucket.get(pos) {
-                Some(bucket) => bucket.upper_bound,
-                None => f64::INFINITY,
-            };
-            self.fields_done = upper_bound == f64::INFINITY;
-            return Some((BUCKET_LABEL, upper_bound));
-        }
-        None
+        let quantiles = self
+            .metric()
+            .summary
+            .as_ref()
+            .map_or(&[][..], |summary| &summary.quantile);
+        let (len, quantile) = (quantiles.len(), quantiles.get(pos).map(|q| q.quantile));
+        self.fields_done = quantile.is_none() || pos == len - 1;
+        quantile.map(|quantile| (QUANTILE_LABEL, quantile))
     }
 
     /// Go's `onSeriesOrHistogramUpdate`, plus the parts of Go's `Series` and `Histogram` that
@@ -279,7 +253,7 @@ impl<'a> ProtobufParser<'a> {
     }
 
     /// Label `index` of the current series in Go's insertion order: the metric name, the
-    /// protobuf labels, then the `quantile` or `le` label.
+    /// protobuf labels, then the `quantile` label.
     fn label_at(&self, index: usize) -> (&str, &str) {
         let labels = &self.metric().label;
         match index {
@@ -305,7 +279,6 @@ impl<'a> ProtobufParser<'a> {
         // Not `dto_histogram()`, so the targets below can be borrowed mutably.
         let source = histogram_of(&self.family, self.metric_index).unwrap_or(&EMPTY_DTO_HISTOGRAM);
         let name = self.family.name.as_str();
-        self.redo_classic = self.parse_classic_histograms && !source.bucket.is_empty();
         self.is_float_histogram = source.sample_count_float > 0.0 || source.zero_count_float > 0.0;
         if self.is_float_histogram {
             let target = &mut self.float_histogram;
@@ -335,12 +308,6 @@ impl<'a> ProtobufParser<'a> {
         Ok(())
     }
 
-    fn switch_to_classic(&mut self) {
-        self.field_pos = -3;
-        self.fields_done = false;
-        self.state = Some(Entry::Series);
-    }
-
     fn start_family(&mut self) -> Result<bool, ParseError> {
         self.exemplar_pos = 0;
         self.field_pos = -2;
@@ -348,7 +315,7 @@ impl<'a> ProtobufParser<'a> {
         if !self.next_metric_family()? {
             return Ok(false);
         }
-        if !self.next_metric() {
+        if self.family.metric.is_empty() {
             // Go skips empty metric families.
             return Ok(true);
         }
@@ -397,8 +364,8 @@ impl<'a> Parser<'a> for ProtobufParser<'a> {
                 }
                 Some(Entry::Unit) => self.state = Some(Entry::Type),
                 Some(Entry::Type) => {
-                    if self.is_histogram_kind() && self.is_classic_histogram() {
-                        self.switch_to_classic();
+                    if !self.next_metric() {
+                        self.state = None;
                         continue;
                     }
                     self.state = Some(if self.is_histogram_kind() {
@@ -409,9 +376,7 @@ impl<'a> Parser<'a> for ProtobufParser<'a> {
                     self.update_series()?;
                 }
                 Some(Entry::Series) => {
-                    let complex =
-                        self.is_histogram_kind() || self.kind() == dto::MetricType::Summary;
-                    if complex {
+                    if self.kind() == dto::MetricType::Summary {
                         if !self.fields_done {
                             self.field_pos += 1;
                             self.update_series()?;
@@ -425,31 +390,14 @@ impl<'a> Parser<'a> for ProtobufParser<'a> {
                         self.state = None;
                         continue;
                     }
-                    if self.is_histogram_kind() {
-                        // The next series may be native or classic only.
-                        if self.is_classic_histogram() {
-                            self.switch_to_classic();
-                            continue;
-                        }
-                        self.state = Some(Entry::Histogram);
-                    }
                     self.update_series()?;
                 }
                 Some(Entry::Histogram) => {
-                    if self.redo_classic {
-                        self.redo_classic = false;
-                        self.switch_to_classic();
-                        continue;
-                    }
                     // Go keeps both positions here and loses the next histogram's exemplars.
                     self.field_pos = -2;
                     self.exemplar_pos = 0;
                     if !self.next_metric() {
                         self.state = None;
-                        continue;
-                    }
-                    if self.is_classic_histogram() {
-                        self.switch_to_classic();
                         continue;
                     }
                     self.update_series()?;
@@ -507,17 +455,8 @@ impl<'a> Parser<'a> for ProtobufParser<'a> {
                         .map_or(0.0, |quantile| quantile.value),
                 }
             }
-            dto::MetricType::Histogram | dto::MetricType::GaugeHistogram => {
-                let histogram = self.dto_histogram();
-                let count = or_float(histogram.sample_count_float, histogram.sample_count);
-                match self.field_pos {
-                    -2 => count,
-                    -1 => histogram.sample_sum,
-                    pos => histogram.bucket.get(pos as usize).map_or(count, |bucket| {
-                        or_float(bucket.cumulative_count_float, bucket.cumulative_count)
-                    }),
-                }
-            }
+            // Histograms are only returned as `Entry::Histogram`.
+            dto::MetricType::Histogram | dto::MetricType::GaugeHistogram => 0.0,
         };
         (&self.entry_bytes, self.timestamp(), value)
     }
@@ -583,11 +522,11 @@ impl<'a> Parser<'a> for ProtobufParser<'a> {
 }
 
 impl ProtobufParser<'_> {
-    /// The histogram branch of Go's `Exemplar`, which advances `exemplar_pos` or `field_pos`.
+    /// The native histogram branch of Go's `Exemplar`, which advances `exemplar_pos` or
+    /// `field_pos`.
     fn histogram_exemplar(&mut self) -> Option<&dto::Exemplar> {
-        let is_classic = self.state == Some(Entry::Series);
         let histogram = histogram_of(&self.family, self.metric_index)?;
-        if !is_classic && !histogram.exemplars.is_empty() {
+        if !histogram.exemplars.is_empty() {
             // Native histograms drop exemplars without a timestamp.
             while let Some(exemplar) = histogram.exemplars.get(self.exemplar_pos) {
                 self.exemplar_pos += 1;
@@ -597,27 +536,16 @@ impl ProtobufParser<'_> {
             }
             return None;
         }
-        if self.field_pos < 0 {
-            if is_classic {
-                return None;
-            }
-            self.field_pos = 0;
-        }
+        self.field_pos = self.field_pos.max(0);
         let mut found = None;
         while let Some(bucket) = histogram.bucket.get(self.field_pos as usize) {
             found = bucket.exemplar.as_ref();
-            if is_classic {
-                break;
-            }
             self.field_pos += 1;
             if found.is_some_and(|exemplar| exemplar.timestamp.is_some()) {
                 break;
             }
         }
-        if !is_classic && found.is_none_or(|exemplar| exemplar.timestamp.is_none()) {
-            return None;
-        }
-        found
+        found.filter(|exemplar| exemplar.timestamp.is_some())
     }
 }
 
@@ -631,11 +559,6 @@ fn is_native_histogram(histogram: &dto::Histogram) -> bool {
         || !histogram.negative_span.is_empty()
         || histogram.zero_threshold > 0.0
         || histogram.zero_count > 0
-}
-
-/// Go reads the float field and falls back to the integer field when it is 0.
-fn or_float(float: f64, int: u64) -> f64 {
-    if float == 0.0 { int as f64 } else { float }
 }
 
 /// Same as Go: seconds and nanoseconds to ms, without validation.
@@ -877,7 +800,7 @@ mod tests {
     }
 
     fn parse_all(input: &[u8]) -> Result<(), ParseError> {
-        let mut parser = ProtobufParser::new(input, false, false);
+        let mut parser = ProtobufParser::new(input);
         while parser.next_entry()?.is_some() {
             if parser.state == Some(Entry::Histogram) {
                 parser.histogram();
@@ -931,7 +854,7 @@ mod tests {
     }
 
     fn first_histogram(input: &[u8]) -> Histogram<u64, i64> {
-        let mut parser = ProtobufParser::new(input, false, false);
+        let mut parser = ProtobufParser::new(input);
         while let Some(entry) = parser.next_entry().unwrap() {
             if let (Entry::Histogram, (_, _, HistogramRef::Int(histogram))) =
                 (entry, parser.histogram())
@@ -998,7 +921,7 @@ mod tests {
             metric.histogram.as_mut().unwrap().exemplars = vec![exemplar(id)];
         }
         let input = delimited(&[family]);
-        let mut parser = ProtobufParser::new(&input, false, false);
+        let mut parser = ProtobufParser::new(&input);
         let mut labels = LabelsBuffer::default();
         let mut ids = Vec::new();
         while let Some(entry) = parser.next_entry().unwrap() {

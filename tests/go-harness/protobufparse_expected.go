@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 
 	"github.com/gogo/protobuf/proto"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/textparse"
 	dto "github.com/prometheus/prometheus/prompb/io/prometheus/client"
@@ -34,21 +35,6 @@ var protobufParseInputs = []string{
 	"expfmt/protobuf-multimessage",
 }
 
-// protobufParseScenarios are the TestProtobufParse parser options, except
-// enableTypeAndUnitLabels, which the Rust parsers do not support. Each one
-// writes to testdata/protobufparse/<name>/.
-var protobufParseScenarios = []struct {
-	name                   string
-	ignoreNativeHistograms bool
-	parseClassicHistograms bool
-}{
-	{name: "default"},
-	{name: "parse_classic_histograms", parseClassicHistograms: true},
-	{name: "ignore_native_histograms", ignoreNativeHistograms: true},
-}
-
-// writeProtobufParseInput marshals the text-format MetricFamily messages from
-// createTestProtoBuf into a delimited protobuf file, like metricFamiliesToProtobuf.
 func writeProtobufParseInput(outRoot, srcFile string) (string, error) {
 	families, err := extractFuncStringSlice(srcFile, "createTestProtoBuf", "testMetricFamilies")
 	if err != nil {
@@ -73,22 +59,45 @@ func writeProtobufParseInput(outRoot, srcFile string) (string, error) {
 	return protobufParseInput, nil
 }
 
-// writeProtobufParseExpected runs textparse.NewProtobufParser on each input for
-// each scenario and writes one line per entry to testdata/protobufparse/.
+// writeProtobufParseExpected runs textparse.NewProtobufParser on each input with
+// its default options and writes one line per entry to testdata/protobufparse/.
 func writeProtobufParseExpected(outRoot string) ([]string, error) {
 	var written []string
-	for _, scenario := range protobufParseScenarios {
-		outDir := "protobufparse/" + scenario.name
-		for _, input := range protobufParseInputs {
-			err := writeExpected(outRoot, outDir, input, func(data []byte) string {
-				parser := textparse.NewProtobufParser(data, scenario.ignoreNativeHistograms, scenario.parseClassicHistograms, false, false, labels.NewSymbolTable())
-				return renderEntries(parser, true)
-			})
-			if err != nil {
-				return nil, err
-			}
-			written = append(written, outDir+"/"+input)
+	for _, input := range protobufParseInputs {
+		err := writeExpected(outRoot, "protobufparse", input, func(data []byte) string {
+			parser := textparse.NewProtobufParser(data, false, false, false, false, labels.NewSymbolTable())
+			return renderEntries(&nativeHistogramsOnly{Parser: parser}, true)
+		})
+		if err != nil {
+			return nil, err
 		}
+		written = append(written, "protobufparse/"+input)
 	}
 	return written, nil
+}
+
+// nativeHistogramsOnly drops the classic series of histograms, because the Rust parser only
+// returns native histograms.
+type nativeHistogramsOnly struct {
+	textparse.Parser
+	histogramFamily bool
+}
+
+func (p *nativeHistogramsOnly) Next() (textparse.Entry, error) {
+	for {
+		entry, err := p.Parser.Next()
+		if err != nil {
+			return entry, err
+		}
+		switch entry {
+		case textparse.EntryType:
+			_, metricType := p.Type()
+			p.histogramFamily = metricType == model.MetricTypeHistogram || metricType == model.MetricTypeGaugeHistogram
+		case textparse.EntrySeries:
+			if p.histogramFamily {
+				continue
+			}
+		}
+		return entry, nil
+	}
 }

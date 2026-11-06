@@ -184,7 +184,8 @@ To verify that `ArrowDecoder` meets the [`open-telemetry/otel-arrow#3277`](https
 ### Phase 3: OpenMetrics 2.0 and Prometheus protobuf decoding
 - Implement Layer 0, Layer 1, and Layer 2 support for OpenMetrics 2.0 matching [`openmetrics2parse.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/openmetrics2parse.go) (native histograms in text format, `st@` start timestamps, composite values) and add `specs/expfmt/openmetrics_2_0.abnf`.
 - Implement delimited protobuf decoding (`FmtProtoDelim`), including native sparse histograms, start timestamps, and exemplars, matching [`protobufparse.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/protobufparse.go).
-- Out of scope: `FmtProtoText` and `FmtProtoCompact`, because Prometheus only scrapes `encoding=delimited` ([config.go#L584](https://github.com/prometheus/prometheus/blob/v0.315.1/config/config.go#L584)), and NHCB conversion, because it is opt-in in Prometheus ([interface.go#L209-L228](https://github.com/prometheus/prometheus/blob/v0.315.1/model/textparse/interface.go#L209-L228)).
+- Protobuf histograms are only returned as native histograms. Classic histograms are left out on purpose: a histogram without native buckets is skipped, classic buckets are never returned as series, and converting classic histograms to NHCB is not implemented. We can add classic support back if users need it ([discussion](https://github.com/prometheus/scrape.rs/pull/25#discussion_r4476081239)).
+- Out of scope: `FmtProtoText` and `FmtProtoCompact`, because Prometheus only scrapes `encoding=delimited` ([config.go#L584](https://github.com/prometheus/prometheus/blob/v0.315.1/config/config.go#L584)).
 - Extend the Go `expfmt` encoder harness to cover `FmtOpenMetrics_2_0_0` and `FmtProtoDelim`.
 
 ### Phase 4: Relabeling hooks, pooling, benchmarks, fuzzing, and initial release
