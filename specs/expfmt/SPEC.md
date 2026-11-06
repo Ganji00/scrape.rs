@@ -79,25 +79,29 @@ pub trait Parser<'a> {
     /// Advances to the next entry in the exposition stream, returning `Ok(None)` at EOF.
     fn next_entry(&mut self) -> Result<Option<Entry>, ParseError>;
 
-    fn help(&self) -> (&'a [u8], Cow<'a, [u8]>);
-    fn metric_type(&self) -> (&'a [u8], MetricType);
-    fn unit(&self) -> (&'a [u8], &'a [u8]);
+    // These slices borrow from the parser, because the protobuf parser builds them.
+    fn help(&self) -> (&[u8], Cow<'_, [u8]>);
+    fn metric_type(&self) -> (&[u8], MetricType);
+    fn unit(&self) -> (&[u8], &[u8]);
     fn comment(&self) -> &'a [u8];
 
     /// Returns the raw series bytes, optional sample timestamp in ms, and float64 value.
-    fn series(&self) -> (&'a [u8], Option<i64>, f64);
+    fn series(&self) -> (&[u8], Option<i64>, f64);
 
     /// Returns the raw series bytes, optional timestamp in ms, and parsed native histogram.
-    fn histogram(&self) -> (&'a [u8], Option<i64>, HistogramRef<'a>);
+    fn histogram(&self) -> (&[u8], Option<i64>, HistogramRef<'_>);
 
-    /// Returns the start timestamp in ms if present via `st@...` or `_created`.
-    fn start_timestamp(&self) -> Option<i64>;
+    /// Returns the start timestamp in ms if present via `st@...`, `_created`, or the protobuf
+    /// `start_timestamp` field.
+    fn start_timestamp(&mut self) -> Option<i64>;
 
     /// Populates the caller's reusable label buffer for the current sample.
     fn labels(&self, buf: &mut LabelsBuffer<'a>);
 
-    /// Iterates over exemplars attached to the current sample.
-    fn exemplars(&self, buf: &mut ExemplarsBuffer<'a>) -> Result<(), ParseError>;
+    /// Fills `buf` with the labels of the next exemplar of the current sample and returns its
+    /// value and optional timestamp in ms. A native histogram can have several exemplars, so
+    /// call it until it returns `None`.
+    fn exemplar(&mut self, buf: &mut LabelsBuffer<'a>) -> Option<(f64, Option<i64>)>;
 }
 ```
 
@@ -179,7 +183,9 @@ To verify that `ArrowDecoder` meets the [`open-telemetry/otel-arrow#3277`](https
 
 ### Phase 3: OpenMetrics 2.0 and Prometheus protobuf decoding
 - Implement Layer 0, Layer 1, and Layer 2 support for OpenMetrics 2.0 matching [`openmetrics2parse.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/openmetrics2parse.go) (native histograms in text format, `st@` start timestamps, composite values) and add `specs/expfmt/openmetrics_2_0.abnf`.
-- Implement delimited and text protobuf decoding (`FmtProtoDelim`, `FmtProtoText`, `FmtProtoCompact`), including native sparse histograms and NHCB conversion matching [`protobufparse.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/protobufparse.go) and [`nhcbparse.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/nhcbparse.go).
+- Implement delimited protobuf decoding (`FmtProtoDelim`), including native sparse histograms, start timestamps, and exemplars, matching [`protobufparse.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/protobufparse.go).
+- Histograms are only returned as native histograms, converting explicit-bucket histograms to NHCB (#37). Classic `_bucket`, `_sum`, and `_count` histogram series are left out on purpose; we can add classic support later if users need it ([discussion](https://github.com/prometheus/scrape.rs/pull/25#discussion_r4476081239)).
+- Out of scope: `FmtProtoText` and `FmtProtoCompact`, because Prometheus only scrapes `encoding=delimited` ([config.go#L584](https://github.com/prometheus/prometheus/blob/v0.315.1/config/config.go#L584)).
 - Extend the Go `expfmt` encoder harness to cover `FmtOpenMetrics_2_0_0` and `FmtProtoDelim`.
 
 ### Phase 4: Relabeling hooks, pooling, benchmarks, fuzzing, and initial release

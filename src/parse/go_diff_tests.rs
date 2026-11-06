@@ -11,14 +11,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Compares Layer 0 parser output with Go's `textparse` output stored in `testdata/promparse`
-//! and `testdata/omparse`.
+//! Compares Layer 0 parser output with Go's `textparse` output stored in `testdata/promparse`,
+//! `testdata/omparse`, and `testdata/protobufparse`.
 
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::{Entry, LabelsBuffer, OpenMetricsParser, Parser, PromParser};
+use super::{Entry, HistogramRef, LabelsBuffer, OpenMetricsParser, Parser, PromParser, Span};
 
 fn quote(out: &mut Vec<u8>, bytes: &[u8]) {
     out.push(b'"');
@@ -40,6 +40,33 @@ fn quote_labels(out: &mut Vec<u8>, labels: &LabelsBuffer<'_>) {
         out.push(b'=');
         quote(out, value.as_bytes());
     }
+}
+
+fn spans_text(spans: &[Span]) -> String {
+    let spans: Vec<String> = spans
+        .iter()
+        .map(|span| format!("{}:{}", span.offset, span.length))
+        .collect();
+    format!("[{}]", spans.join(","))
+}
+
+fn ints_text(buckets: &[i64]) -> String {
+    let buckets: Vec<String> = buckets.iter().map(i64::to_string).collect();
+    format!("[{}]", buckets.join(","))
+}
+
+fn floats_text(buckets: &[f64]) -> String {
+    let buckets: Vec<String> = buckets
+        .iter()
+        .map(|bucket| format!("{:016x}", bucket.to_bits()))
+        .collect();
+    format!("[{}]", buckets.join(","))
+}
+
+fn exemplar_text(out: &mut Vec<u8>, value: f64, timestamp: Option<i64>, labels: &LabelsBuffer<'_>) {
+    let timestamp = timestamp_text(timestamp);
+    write!(out, "\nexemplar {:016x} {timestamp}", value.to_bits()).unwrap();
+    quote_labels(out, labels);
 }
 
 fn timestamp_text(timestamp: Option<i64>) -> String {
@@ -94,18 +121,63 @@ fn render<'a>(mut parser: impl Parser<'a>, start_timestamps: bool) -> Vec<u8> {
                 parser.labels(&mut labels);
                 quote_labels(&mut out, &labels);
                 if let Some((value, timestamp)) = parser.exemplar(&mut labels) {
-                    let timestamp = timestamp_text(timestamp);
-                    write!(out, "\nexemplar {:016x} {timestamp}", value.to_bits()).unwrap();
-                    quote_labels(&mut out, &labels);
+                    exemplar_text(&mut out, value, timestamp, &labels);
                 }
-                if start_timestamps {
-                    // Go returns 0 when there is no start timestamp.
-                    let start = parser.start_timestamp().unwrap_or(0);
-                    write!(out, "\nst {start}").unwrap();
+                start_timestamp_text(&mut out, &mut parser, start_timestamps);
+            }
+            Entry::Histogram => {
+                let (series, timestamp, histogram) = parser.histogram();
+                out.extend_from_slice(b"histogram ");
+                quote(&mut out, series);
+                write!(out, " {}", timestamp_text(timestamp)).unwrap();
+                match histogram {
+                    HistogramRef::Int(histogram) => write!(
+                        out,
+                        " int schema={} count={} sum={:016x} zero_threshold={:016x} zero_count={} hint={} pos_spans={} pos={} neg_spans={} neg={}",
+                        histogram.schema,
+                        histogram.count,
+                        histogram.sum.to_bits(),
+                        histogram.zero_threshold.to_bits(),
+                        histogram.zero_count,
+                        histogram.counter_reset_hint as u8,
+                        spans_text(&histogram.positive_spans),
+                        ints_text(&histogram.positive_buckets),
+                        spans_text(&histogram.negative_spans),
+                        ints_text(&histogram.negative_buckets),
+                    ),
+                    HistogramRef::Float(histogram) => write!(
+                        out,
+                        " float schema={} count={:016x} sum={:016x} zero_threshold={:016x} zero_count={:016x} hint={} pos_spans={} pos={} neg_spans={} neg={}",
+                        histogram.schema,
+                        histogram.count.to_bits(),
+                        histogram.sum.to_bits(),
+                        histogram.zero_threshold.to_bits(),
+                        histogram.zero_count.to_bits(),
+                        histogram.counter_reset_hint as u8,
+                        spans_text(&histogram.positive_spans),
+                        floats_text(&histogram.positive_buckets),
+                        spans_text(&histogram.negative_spans),
+                        floats_text(&histogram.negative_buckets),
+                    ),
                 }
+                .unwrap();
+                parser.labels(&mut labels);
+                quote_labels(&mut out, &labels);
+                while let Some((value, timestamp)) = parser.exemplar(&mut labels) {
+                    exemplar_text(&mut out, value, timestamp, &labels);
+                }
+                start_timestamp_text(&mut out, &mut parser, start_timestamps);
             }
         }
         out.push(b'\n');
+    }
+}
+
+fn start_timestamp_text<'a>(out: &mut Vec<u8>, parser: &mut impl Parser<'a>, enabled: bool) {
+    if enabled {
+        // Go returns 0 when there is no start timestamp.
+        let start = parser.start_timestamp().unwrap_or(0);
+        write!(out, "\nst {start}").unwrap();
     }
 }
 
@@ -154,5 +226,15 @@ fn matches_go_promparse_output() {
 fn matches_go_openmetricsparse_output() {
     assert_matches_go("omparse", |input| {
         render(OpenMetricsParser::new(input), true)
+    });
+}
+
+#[cfg(feature = "dto")]
+#[test]
+fn matches_go_protobufparse_output() {
+    use super::ProtobufParser;
+
+    assert_matches_go("protobufparse", |input| {
+        render(ProtobufParser::new(input), true)
     });
 }

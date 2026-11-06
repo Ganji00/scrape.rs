@@ -156,6 +156,10 @@ pub enum DecodeError {
     #[error("invalid metric type {0:?}")]
     InvalidMetricType(String),
 
+    /// Malformed protobuf payload.
+    #[error("invalid protobuf: {0}")]
+    InvalidProtobuf(String),
+
     /// Invalid UTF-8 sequence in a metric name, help string, label name, or label value.
     #[error("invalid UTF-8 at byte {offset}")]
     InvalidUtf8 {
@@ -261,6 +265,7 @@ impl DecodeError {
             ParseError::MissingEof => Self::MissingEof,
             ParseError::DataAfterEof { offset } => Self::DataAfterEof { offset },
             ParseError::InvalidUnit { metric, unit } => Self::InvalidUnit { metric, unit },
+            ParseError::InvalidProtobuf(message) => Self::InvalidProtobuf(message),
         }
     }
 }

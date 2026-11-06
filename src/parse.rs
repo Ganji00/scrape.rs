@@ -23,12 +23,16 @@ mod omlex;
 mod omparse;
 mod promlex;
 mod promparse;
+#[cfg(feature = "dto")]
+mod protobufparse;
 
 pub(crate) use float::parse_go_float;
 pub use omparse::OpenMetricsParser;
 pub(crate) use omparse::{OmScratch, OpenMetricsParserState};
 pub use promparse::PromParser;
 pub(crate) use promparse::{ByteSpan, LabelSpan, PromParserState, unescape_bytes_into};
+#[cfg(feature = "dto")]
+pub use protobufparse::ProtobufParser;
 
 /// Label name under which [`Parser::labels`] stores the metric name.
 pub const METRIC_NAME_LABEL: &str = "__name__";
@@ -53,7 +57,80 @@ pub enum Entry {
     Comment,
     /// A sample with a float64 value. Read it with [`Parser::series`] and [`Parser::labels`].
     Series,
+    /// A sample with a native histogram value. Read it with [`Parser::histogram`] and
+    /// [`Parser::labels`].
+    Histogram,
 }
+
+/// Bucket span of a native histogram, Go's `histogram.Span`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Span {
+    /// Gap to the previous span, or the start index of the first span.
+    pub offset: i32,
+    /// Number of consecutive buckets.
+    pub length: u32,
+}
+
+/// Counter reset hint of a native histogram, Go's `histogram.CounterResetHint`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+#[repr(u8)]
+pub enum CounterResetHint {
+    /// No hint, Go's `UnknownCounterReset`.
+    #[default]
+    Unknown = 0,
+    /// The histogram is a gauge, Go's `GaugeType`.
+    Gauge = 3,
+}
+
+/// Native histogram. With `C = u64` and `B = i64` it is Go's `histogram.Histogram`, with
+/// delta-encoded bucket counts. With `C = B = f64` it is Go's `histogram.FloatHistogram`,
+/// with absolute bucket counts.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Histogram<C, B> {
+    /// Counter reset hint.
+    pub counter_reset_hint: CounterResetHint,
+    /// Resolution of the exponential buckets.
+    pub schema: i32,
+    /// Width of the zero bucket.
+    pub zero_threshold: f64,
+    /// Observations in the zero bucket.
+    pub zero_count: C,
+    /// Total number of observations.
+    pub count: C,
+    /// Sum of observations.
+    pub sum: f64,
+    /// Spans of the positive buckets.
+    pub positive_spans: Vec<Span>,
+    /// Positive bucket counts.
+    pub positive_buckets: Vec<B>,
+    /// Spans of the negative buckets.
+    pub negative_spans: Vec<Span>,
+    /// Negative bucket counts.
+    pub negative_buckets: Vec<B>,
+}
+
+/// Native histogram value returned by [`Parser::histogram`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HistogramRef<'h> {
+    /// Integer counts, Go's `*histogram.Histogram`.
+    Int(&'h Histogram<u64, i64>),
+    /// Float counts, Go's `*histogram.FloatHistogram`.
+    Float(&'h Histogram<f64, f64>),
+}
+
+static EMPTY_HISTOGRAM: Histogram<u64, i64> = Histogram {
+    counter_reset_hint: CounterResetHint::Unknown,
+    schema: 0,
+    zero_threshold: 0.0,
+    zero_count: 0,
+    count: 0,
+    sum: 0.0,
+    positive_spans: Vec::new(),
+    positive_buckets: Vec::new(),
+    negative_spans: Vec::new(),
+    negative_buckets: Vec::new(),
+};
 
 /// Metric type declared by a `# TYPE` line.
 ///
@@ -122,6 +199,10 @@ pub enum ParseError {
     /// A sample value is not a valid float.
     #[error("invalid sample value {0:?}")]
     InvalidValue(String),
+
+    /// A protobuf payload is malformed or holds a value Go's protobuf parser rejects.
+    #[error("invalid protobuf: {0}")]
+    InvalidProtobuf(String),
 
     /// A sample timestamp is not a valid int64.
     #[error("invalid timestamp {0:?}")]
@@ -220,6 +301,9 @@ impl<'a> LabelsBuffer<'a> {
 /// Streaming parser over an exposition payload, mirroring Go's `textparse.Parser`.
 ///
 /// Accessors return unspecified values when called for a different [`Entry`] kind.
+///
+/// Byte slices returned by the help, type, unit, series, and histogram accessors borrow from
+/// the parser, because the protobuf parser builds them. Text parsers return slices of the input.
 pub trait Parser<'a> {
     /// Advances to the next entry in the exposition stream, returning `Ok(None)` at EOF.
     fn next_entry(&mut self) -> Result<Option<Entry>, ParseError>;
@@ -228,21 +312,27 @@ pub trait Parser<'a> {
     fn pos(&self) -> usize;
 
     /// Returns the metric name and unescaped help text of the current [`Entry::Help`].
-    fn help(&self) -> (&'a [u8], Cow<'a, [u8]>);
+    fn help(&self) -> (&[u8], Cow<'_, [u8]>);
 
     /// Returns the metric name and type of the current [`Entry::Type`].
-    fn metric_type(&self) -> (&'a [u8], MetricType);
+    fn metric_type(&self) -> (&[u8], MetricType);
 
     /// Returns the text of the current [`Entry::Comment`], including the leading `#`.
     fn comment(&self) -> &'a [u8];
 
     /// Returns the metric name and unit of the current [`Entry::Unit`].
-    fn unit(&self) -> (&'a [u8], &'a [u8]) {
+    fn unit(&self) -> (&[u8], &[u8]) {
         (b"", b"")
     }
 
     /// Returns the raw series bytes, optional sample timestamp in ms, and float64 value.
-    fn series(&self) -> (&'a [u8], Option<i64>, f64);
+    fn series(&self) -> (&[u8], Option<i64>, f64);
+
+    /// Returns the raw series bytes, optional sample timestamp in ms, and native histogram of
+    /// the current [`Entry::Histogram`].
+    fn histogram(&self) -> (&[u8], Option<i64>, HistogramRef<'_>) {
+        (b"", None, HistogramRef::Int(&EMPTY_HISTOGRAM))
+    }
 
     /// Clears `buf` and fills it with the current sample's labels, sorted by name, matching Go:
     /// the metric name is stored under [`METRIC_NAME_LABEL`], and `le` on histograms and
@@ -251,15 +341,17 @@ pub trait Parser<'a> {
 
     /// Clears `buf`, fills it with the exemplar labels of the current sample sorted by name,
     /// and returns the exemplar value and optional timestamp in ms. Returns `None` when the
-    /// sample has no exemplar or it was already returned, like Go.
+    /// sample has no exemplar or it was already returned, like Go. A native histogram can
+    /// have several exemplars, so call it until it returns `None`.
     fn exemplar(&mut self, buf: &mut LabelsBuffer<'a>) -> Option<(f64, Option<i64>)> {
         buf.clear();
         None
     }
 
-    /// Returns the start timestamp in ms of the current sample, read from its `_created` line.
-    /// Takes `&mut self` because, like Go, it caches the last hit and turns on `_created`
-    /// skipping, so later `_created` lines are not returned as series.
+    /// Returns the start timestamp in ms of the current sample, read from its `_created` line
+    /// in OpenMetrics or its `start_timestamp` field in protobuf. Takes `&mut self` because the
+    /// OpenMetrics parser, like Go, caches the last hit and turns on `_created` skipping, so
+    /// later `_created` lines are not returned as series. The protobuf parser only reads the field.
     fn start_timestamp(&mut self) -> Option<i64> {
         None
     }
