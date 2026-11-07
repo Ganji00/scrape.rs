@@ -152,9 +152,10 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
                 }
                 tokio::task::yield_now().await;
             }
+            warmup_stream_dec_mem
         });
 
-        stream_handle.await.expect("streaming local task succeeds");
+        let warmup_stream_dec_mem = stream_handle.await.expect("streaming local task succeeds");
 
         // Verify cooperative incremental streaming (`start_decode_stream` + `step_decode` across
         // `Rc<RefCell<ArrowDecoder>>` without holding a `RefMut` across `.await`, plus owned
@@ -214,8 +215,8 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
                     warmup_coop_dec_mem = dec_mem;
                     warmup_owned_dec_mem = owned_dec_mem;
                     warmup_coop_live_heap = live_heap;
-                    assert!(warmup_coop_dec_mem > 0);
-                    assert!(warmup_owned_dec_mem > 0);
+                    assert_eq!(warmup_coop_dec_mem, warmup_stream_dec_mem);
+                    assert_eq!(warmup_owned_dec_mem, warmup_stream_dec_mem);
                 } else if i > 1 {
                     assert_eq!(
                         dec_mem, warmup_coop_dec_mem,
