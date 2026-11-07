@@ -1141,12 +1141,17 @@ fn cooperative_decode_bounds_local_set_timer_scheduling_lateness_and_validates_i
             }
 
             let stream_opts = opts.with_max_data_points_per_batch(64);
+            let stream_budget = budget.with_max_entries(32);
+            let mut stream_yields = 0usize;
             let mut streamed_otlp = Vec::new();
             {
                 let mut stream =
                     decoder.decode_stream(&payload_for_task, &Format::TEXT, &stream_opts);
                 while let Some(chunk_res) = stream
-                    .next_cooperative(budget, tokio::task::yield_now)
+                    .next_cooperative(stream_budget, || {
+                        stream_yields += 1;
+                        tokio::task::yield_now()
+                    })
                     .await
                 {
                     let chunk = chunk_res.expect("cooperative stream chunk succeeds");
@@ -1158,6 +1163,10 @@ fn cooperative_decode_bounds_local_set_timer_scheduling_lateness_and_validates_i
                     streamed_otlp.push(otap_to_otlp(&otap));
                 }
             }
+            assert!(
+                stream_yields > 0,
+                "expected >0 yields during cooperative streaming decode"
+            );
 
             // Also verify the lifetime-free `OwnedScrapeDecodeJob` pattern (`PdataDecodeJob` style).
             let mut job = OwnedScrapeDecodeJob::new(
