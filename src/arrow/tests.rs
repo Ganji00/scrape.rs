@@ -978,6 +978,7 @@ fn lifetime_free_decode_cursor_supports_owned_job_across_steps() {
 
     let mut stale_cursor = job.decoder.start_decode(&Format::TEXT, &opts).unwrap();
     let mut stale_finish_cursor = job.decoder.start_decode(&Format::TEXT, &opts).unwrap();
+    let mut stale_after_active = job.decoder.start_decode(&Format::TEXT, &opts).unwrap();
     let active_input =
         b"m{k0=\"0\",k1=\"1\",k2=\"2\",k3=\"3\",k4=\"4\",k5=\"5\",k6=\"6\",k7=\"7\",k8=\"8\",k9=\"9\",k10=\"10\",k11=\"11\",k12=\"12\",k13=\"13\",k14=\"14\",k15=\"15\",k16=\"16\",k17=\"17\"} 1\nm2 2\n";
     let mut active_cursor = job.decoder.start_decode(&Format::TEXT, &opts).unwrap();
@@ -1004,7 +1005,30 @@ fn lifetime_free_decode_cursor_supports_owned_job_across_steps() {
         DecodeStep::Batch(records) => assert_eq!(records.num_data_points(), 2),
         other => panic!("expected active cursor to finish cleanly, got {other:?}"),
     }
-    assert!(job.decoder.prom_spans.capacity() >= 18);
+    let grown_prom_cap = job.decoder.prom_spans.capacity();
+    assert!(grown_prom_cap >= 18);
+    job.decoder.finish_decode(&mut stale_after_active);
+    assert!(stale_after_active.is_done());
+    assert_eq!(job.decoder.prom_spans.capacity(), grown_prom_cap);
+
+    let mut om_holder = job
+        .decoder
+        .start_decode(&Format::OPEN_METRICS_1_0_0, &opts)
+        .unwrap();
+    let mut stale_om_cursor = job
+        .decoder
+        .start_decode(&Format::OPEN_METRICS_1_0_0, &opts)
+        .unwrap();
+    job.decoder.finish_decode(&mut om_holder);
+    assert_eq!(
+        job.decoder.om_scratch.retained_memory_bytes(),
+        retained_after_first
+    );
+    job.decoder.finish_decode(&mut stale_om_cursor);
+    assert_eq!(
+        job.decoder.om_scratch.retained_memory_bytes(),
+        retained_after_first
+    );
 
     let mut dec_a = ArrowDecoder::new();
     let mut dec_b = ArrowDecoder::new();
