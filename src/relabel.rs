@@ -1,0 +1,970 @@
+// Copyright 2026 The Prometheus Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Prometheus-compatible target and metric relabeling (`relabel_configs` and
+//! `metric_relabel_configs`), ported from Prometheus `model/relabel` and `scrape/target.go`.
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::sync::OnceLock;
+
+use regex::{Captures, Regex};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+/// Reserved Prometheus label holding the `<host>:<port>` scrape target address.
+pub const ADDRESS_LABEL: &str = "__address__";
+/// Reserved Prometheus label holding the scrape HTTP scheme (`"http"` or `"https"`).
+pub const SCHEME_LABEL: &str = "__scheme__";
+/// Reserved Prometheus label holding the scrape HTTP request path (e.g. `"/metrics"`).
+pub const METRICS_PATH_LABEL: &str = "__metrics_path__";
+/// Reserved Prometheus label holding the target scrape interval duration string.
+pub const SCRAPE_INTERVAL_LABEL: &str = "__scrape_interval__";
+/// Reserved Prometheus label holding the target scrape timeout duration string.
+pub const SCRAPE_TIMEOUT_LABEL: &str = "__scrape_timeout__";
+/// Prefix for reserved Prometheus labels mapping to URL query parameters (`"__param_"`).
+pub const PARAM_LABEL_PREFIX: &str = "__param_";
+/// Prefix for service-discovery metadata labels (`"__meta_"`).
+pub const META_LABEL_PREFIX: &str = "__meta_";
+/// Prefix for temporary labels used during relabeling (`"__tmp_"`).
+pub const TMP_LABEL_PREFIX: &str = "__tmp_";
+/// Prefix for all internal/reserved Prometheus labels (`"__"`).
+pub const RESERVED_LABEL_PREFIX: &str = "__";
+/// Standard Prometheus job label (`"job"`).
+pub const JOB_LABEL: &str = "job";
+/// Standard Prometheus instance label (`"instance"`).
+pub const INSTANCE_LABEL: &str = "instance";
+/// Prefix prepended to conflicting metric labels when `honor_labels` is `false` (`"exported_"`).
+pub const EXPORTED_LABEL_PREFIX: &str = "exported_";
+
+/// Default `separator` in a Prometheus relabel configuration (`";"`).
+pub const DEFAULT_SEPARATOR: &str = ";";
+/// Default `replacement` in a Prometheus relabel configuration (`"$1"`).
+pub const DEFAULT_REPLACEMENT: &str = "$1";
+/// Default unanchored `regex` pattern in a Prometheus relabel configuration (`"(.*)"`).
+pub const DEFAULT_REGEX_PATTERN: &str = "(.*)";
+
+/// Ordered map of label names to label values matching Prometheus `model.LabelSet`.
+pub type LabelSet = BTreeMap<String, String>;
+
+/// Type alias for [`Config`] matching `relabel_configs` / `metric_relabel_configs` naming.
+pub type RelabelConfig = Config;
+
+/// Error returned when parsing, validating, or applying relabel configurations.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RelabelError {
+    /// Relabel configuration validation error.
+    #[error("{0}")]
+    InvalidConfig(String),
+    /// Invalid regular expression pattern.
+    #[error("invalid regex: {0}")]
+    InvalidRegex(String),
+    /// Target population error after relabeling.
+    #[error("{0}")]
+    TargetError(String),
+}
+
+/// Relabeling action matching Prometheus `relabel.Action`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Action {
+    /// Empty/unset action (only produced when constructing an uninitialized [`Config`] manually;
+    /// deserialized configs default to [`Action::Replace`]).
+    Empty,
+    /// Performs a regular expression replacement on `target_label` (default).
+    #[default]
+    Replace,
+    /// Drops targets/samples for which the concatenated source labels do not match `regex`.
+    Keep,
+    /// Drops targets/samples for which the concatenated source labels match `regex`.
+    Drop,
+    /// Drops targets/samples for which the concatenated source labels do not equal `target_label`.
+    KeepEqual,
+    /// Drops targets/samples for which the concatenated source labels equal `target_label`.
+    DropEqual,
+    /// Sets `target_label` to the MD5 hash modulus of the concatenated source labels.
+    HashMod,
+    /// Copies labels whose names match `regex` to new label names computed via `replacement`.
+    LabelMap,
+    /// Drops any label whose name matches `regex`.
+    LabelDrop,
+    /// Drops any label whose name does not match `regex`.
+    LabelKeep,
+    /// Maps the concatenated source labels to lowercase and stores the result in `target_label`.
+    Lowercase,
+    /// Maps the concatenated source labels to uppercase and stores the result in `target_label`.
+    Uppercase,
+}
+
+impl Action {
+    /// Returns the lowercase Prometheus string representation of this action.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "",
+            Self::Replace => "replace",
+            Self::Keep => "keep",
+            Self::Drop => "drop",
+            Self::KeepEqual => "keepequal",
+            Self::DropEqual => "dropequal",
+            Self::HashMod => "hashmod",
+            Self::LabelMap => "labelmap",
+            Self::LabelDrop => "labeldrop",
+            Self::LabelKeep => "labelkeep",
+            Self::Lowercase => "lowercase",
+            Self::Uppercase => "uppercase",
+        }
+    }
+
+    /// Parses a case-insensitive relabel action name matching Prometheus `Action.UnmarshalYAML`.
+    pub fn parse(s: &str) -> Result<Self, RelabelError> {
+        match s.to_ascii_lowercase().as_str() {
+            "replace" => Ok(Self::Replace),
+            "keep" => Ok(Self::Keep),
+            "drop" => Ok(Self::Drop),
+            "keepequal" => Ok(Self::KeepEqual),
+            "dropequal" => Ok(Self::DropEqual),
+            "hashmod" => Ok(Self::HashMod),
+            "labelmap" => Ok(Self::LabelMap),
+            "labeldrop" => Ok(Self::LabelDrop),
+            "labelkeep" => Ok(Self::LabelKeep),
+            "lowercase" => Ok(Self::Lowercase),
+            "uppercase" => Ok(Self::Uppercase),
+            _ => Err(RelabelError::InvalidConfig(format!(
+                "unknown relabel action {s:?}"
+            ))),
+        }
+    }
+}
+
+impl fmt::Display for Action {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for Action {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Action {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = Option::<String>::deserialize(deserializer)?;
+        match s {
+            None => Ok(Self::Replace),
+            Some(ref val) if val.is_empty() => Ok(Self::Replace),
+            Some(val) => Self::parse(&val).map_err(serde::de::Error::custom),
+        }
+    }
+}
+
+/// Label name validation scheme matching Prometheus `model.ValidationScheme`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ValidationScheme {
+    /// Unset scheme; inherits the global validation scheme passed to [`Config::validate`].
+    Unset,
+    /// UTF-8 label name validation (`model.UTF8Validation`, default in Prometheus v3+).
+    #[default]
+    Utf8,
+    /// Legacy ASCII `[a-zA-Z_][a-zA-Z0-9_]*` label name validation (`model.LegacyValidation`).
+    Legacy,
+}
+
+impl ValidationScheme {
+    /// Returns `true` if `name` is a valid Prometheus label name under this scheme.
+    pub fn is_valid_label_name(self, name: &str) -> bool {
+        if name.is_empty() {
+            return false;
+        }
+        match self {
+            Self::Utf8 | Self::Unset => true,
+            Self::Legacy => is_valid_legacy_label_name(name),
+        }
+    }
+}
+
+/// Returns `true` if `name` matches legacy Prometheus label name syntax `[a-zA-Z_][a-zA-Z0-9_]*`.
+pub fn is_valid_legacy_label_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let Some(&first) = bytes.first() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return false;
+    }
+    bytes[1..]
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Returns `true` if `target` matches Prometheus `relabelTargetLegacy`
+/// (`^(?:(?:[a-zA-Z_]|\$(?:\{\w+\}|\w+))+\w*)+$`), which permits `$1` / `${var}` expansions
+/// within legacy ASCII label names.
+pub fn is_valid_legacy_target_label(target: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"^(?:(?:[a-zA-Z_]|\$(?:\{[0-9A-Za-z_]+\}|[0-9A-Za-z_]+))+[0-9A-Za-z_]*)+$")
+            .expect("valid relabelTargetLegacy regex")
+    });
+    re.is_match(target)
+}
+
+/// Anchored regular expression matching Prometheus `relabel.Regexp` (`^(?s:<pattern>)$`).
+#[derive(Clone, Debug)]
+pub struct Regexp {
+    raw: String,
+    compiled: Regex,
+    is_default_pattern: bool,
+}
+
+impl PartialEq for Regexp {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+    }
+}
+
+impl Eq for Regexp {}
+
+impl Default for Regexp {
+    fn default() -> Self {
+        Self::default_regexp()
+    }
+}
+
+impl Regexp {
+    /// Compiles a new anchored regular expression `^(?s:<pattern>)$` matching Prometheus
+    /// `relabel.NewRegexp`.
+    pub fn new(pattern: &str) -> Result<Self, RelabelError> {
+        let anchored = format!("^(?s:{pattern})$");
+        let compiled =
+            Regex::new(&anchored).map_err(|e| RelabelError::InvalidRegex(e.to_string()))?;
+        Ok(Self {
+            raw: pattern.to_owned(),
+            compiled,
+            is_default_pattern: false,
+        })
+    }
+
+    /// Compiles a new anchored regular expression or panics if invalid, matching
+    /// Prometheus `relabel.MustNewRegexp`.
+    pub fn must_new(pattern: &str) -> Self {
+        Self::new(pattern).unwrap_or_else(|e| panic!("invalid relabel regex {pattern:?}: {e}"))
+    }
+
+    /// Returns the default Prometheus relabel regex (`"(.*)"`).
+    pub fn default_regexp() -> Self {
+        let mut r = Self::must_new(DEFAULT_REGEX_PATTERN);
+        r.is_default_pattern = true;
+        r
+    }
+
+    /// Returns an empty anchored regex (`""` -> `^(?s:)$`).
+    pub fn empty() -> Self {
+        Self::must_new("")
+    }
+
+    /// Returns the unanchored source pattern string, matching `relabel.Regexp.String()`.
+    pub fn as_str(&self) -> &str {
+        &self.raw
+    }
+
+    /// Returns `true` if `text` matches the anchored regular expression.
+    pub fn is_match(&self, text: &str) -> bool {
+        self.compiled.is_match(text)
+    }
+
+    /// Returns `true` if this regex has the default `"(.*)"` pattern.
+    pub fn is_default(&self) -> bool {
+        self.raw == DEFAULT_REGEX_PATTERN
+    }
+}
+
+impl Serialize for Regexp {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.raw)
+    }
+}
+
+impl<'de> Deserialize<'de> for Regexp {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let opt = Option::<String>::deserialize(deserializer)?;
+        let pattern = opt.unwrap_or_default();
+        Self::new(&pattern).map_err(serde::de::Error::custom)
+    }
+}
+
+fn default_separator() -> String {
+    DEFAULT_SEPARATOR.to_owned()
+}
+
+fn default_replacement() -> String {
+    DEFAULT_REPLACEMENT.to_owned()
+}
+
+const fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+const fn is_empty_action(a: &Action) -> bool {
+    matches!(a, Action::Empty)
+}
+
+/// Configuration for a single relabeling step matching Prometheus `relabel.Config`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    /// List of source label names whose values are concatenated with `separator` in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_labels: Vec<String>,
+    /// Separator placed between concatenated source label values (defaults to `";"`).
+    #[serde(default = "default_separator")]
+    pub separator: String,
+    /// Anchored regular expression against which the concatenated value is matched
+    /// (defaults to `"(.*)"`).
+    #[serde(default = "Regexp::default_regexp")]
+    pub regex: Regexp,
+    /// Modulus to take of the MD5 hash of the concatenated source label values (`hashmod`).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub modulus: u64,
+    /// Target label name to which the resulting string is written (`replace`, `hashmod`,
+    /// `lowercase`, `uppercase`) or compared (`keepequal`, `dropequal`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub target_label: String,
+    /// Regex replacement template (defaults to `"$1"`).
+    #[serde(default = "default_replacement")]
+    pub replacement: String,
+    /// Relabeling action to perform (defaults to [`Action::Replace`]).
+    #[serde(default, skip_serializing_if = "is_empty_action")]
+    pub action: Action,
+    /// Label name validation scheme (not serialized in YAML/JSON, matching Prometheus).
+    #[serde(skip)]
+    pub name_validation_scheme: ValidationScheme,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            source_labels: Vec::new(),
+            separator: default_separator(),
+            regex: Regexp::default_regexp(),
+            modulus: 0,
+            target_label: String::new(),
+            replacement: default_replacement(),
+            action: Action::Replace,
+            name_validation_scheme: ValidationScheme::Utf8,
+        }
+    }
+}
+
+impl Config {
+    /// Validates this relabel configuration according to Prometheus `relabel.Config.Validate`.
+    pub fn validate(&mut self, default_scheme: ValidationScheme) -> Result<(), RelabelError> {
+        if self.action == Action::Empty {
+            return Err(RelabelError::InvalidConfig(
+                "relabel action cannot be empty".to_owned(),
+            ));
+        }
+        if self.modulus == 0 && self.action == Action::HashMod {
+            return Err(RelabelError::InvalidConfig(
+                "relabel configuration for hashmod requires non-zero modulus".to_owned(),
+            ));
+        }
+        if matches!(
+            self.action,
+            Action::Replace
+                | Action::HashMod
+                | Action::Lowercase
+                | Action::Uppercase
+                | Action::KeepEqual
+                | Action::DropEqual
+        ) && self.target_label.is_empty()
+        {
+            return Err(RelabelError::InvalidConfig(format!(
+                "relabel configuration for {} action requires 'target_label' value",
+                self.action
+            )));
+        }
+
+        if self.name_validation_scheme == ValidationScheme::Unset {
+            self.name_validation_scheme = match default_scheme {
+                ValidationScheme::Unset => ValidationScheme::Utf8,
+                other => other,
+            };
+        }
+
+        let scheme = self.name_validation_scheme;
+        let is_valid_with_regex_var = |value: &str| match scheme {
+            ValidationScheme::Utf8 | ValidationScheme::Unset => scheme.is_valid_label_name(value),
+            ValidationScheme::Legacy => is_valid_legacy_target_label(value),
+        };
+
+        if self.action == Action::Replace
+            && !var_in_regex_template(&self.target_label)
+            && !scheme.is_valid_label_name(&self.target_label)
+        {
+            return Err(RelabelError::InvalidConfig(format!(
+                "{:?} is invalid 'target_label' for {} action",
+                self.target_label, self.action
+            )));
+        }
+        if self.action == Action::Replace
+            && var_in_regex_template(&self.target_label)
+            && !is_valid_with_regex_var(&self.target_label)
+        {
+            return Err(RelabelError::InvalidConfig(format!(
+                "{:?} is invalid 'target_label' for {} action",
+                self.target_label, self.action
+            )));
+        }
+        if matches!(
+            self.action,
+            Action::Lowercase | Action::Uppercase | Action::KeepEqual | Action::DropEqual
+        ) && !scheme.is_valid_label_name(&self.target_label)
+        {
+            return Err(RelabelError::InvalidConfig(format!(
+                "{:?} is invalid 'target_label' for {} action",
+                self.target_label, self.action
+            )));
+        }
+        if matches!(
+            self.action,
+            Action::Lowercase | Action::Uppercase | Action::KeepEqual | Action::DropEqual
+        ) && self.replacement != DEFAULT_REPLACEMENT
+        {
+            return Err(RelabelError::InvalidConfig(format!(
+                "'replacement' can not be set for {} action",
+                self.action
+            )));
+        }
+        if self.action == Action::LabelMap && !is_valid_with_regex_var(&self.replacement) {
+            return Err(RelabelError::InvalidConfig(format!(
+                "{:?} is invalid 'replacement' for {} action",
+                self.replacement, self.action
+            )));
+        }
+        if self.action == Action::HashMod && !scheme.is_valid_label_name(&self.target_label) {
+            return Err(RelabelError::InvalidConfig(format!(
+                "{:?} is invalid 'target_label' for {} action",
+                self.target_label, self.action
+            )));
+        }
+
+        if matches!(self.action, Action::DropEqual | Action::KeepEqual)
+            && (!self.regex.is_default_pattern
+                || self.modulus != 0
+                || self.separator != DEFAULT_SEPARATOR
+                || self.replacement != DEFAULT_REPLACEMENT)
+        {
+            return Err(RelabelError::InvalidConfig(format!(
+                "{} action requires only 'source_labels' and `target_label`, and no other fields",
+                self.action
+            )));
+        }
+
+        if matches!(self.action, Action::LabelDrop | Action::LabelKeep)
+            && (!self.source_labels.is_empty()
+                || !self.target_label.is_empty()
+                || self.modulus != 0
+                || self.separator != DEFAULT_SEPARATOR
+                || self.replacement != DEFAULT_REPLACEMENT)
+        {
+            return Err(RelabelError::InvalidConfig(format!(
+                "{} action requires only 'regex', and no other fields",
+                self.action
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+fn var_in_regex_template(template: &str) -> bool {
+    template.contains('$')
+}
+
+/// Applies a slice of relabel [`Config`] rules in order to a cloned [`LabelSet`].
+///
+/// Returns `Some(labels)` if the target/sample is kept, or `None` if a rule drops it.
+pub fn process(labels: &LabelSet, cfgs: &[Config]) -> Option<LabelSet> {
+    let mut out = labels.clone();
+    if process_in_place(&mut out, cfgs) {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Applies a slice of relabel [`Config`] rules in-place to `labels`, matching
+/// Prometheus `relabel.ProcessBuilder`.
+///
+/// Any label whose value is set to `""` is removed from `labels`.
+/// Returns `true` if the target/sample is kept, or `false` if dropped.
+pub fn process_in_place(labels: &mut LabelSet, cfgs: &[Config]) -> bool {
+    // Strip any incoming empty-valued labels to match Prometheus `labels.Builder` invariants.
+    labels.retain(|_, v| !v.is_empty());
+
+    let mut val_buf = String::new();
+    for cfg in cfgs {
+        if !apply_single(cfg, labels, &mut val_buf) {
+            return false;
+        }
+    }
+    true
+}
+
+fn apply_single(cfg: &Config, labels: &mut LabelSet, val: &mut String) -> bool {
+    val.clear();
+    for (idx, ln) in cfg.source_labels.iter().enumerate() {
+        if idx > 0 {
+            val.push_str(&cfg.separator);
+        }
+        if let Some(v) = labels.get(ln.as_str()) {
+            val.push_str(v);
+        }
+    }
+
+    match cfg.action {
+        Action::Drop => {
+            if cfg.regex.is_match(val) {
+                return false;
+            }
+        }
+        Action::Keep => {
+            if !cfg.regex.is_match(val) {
+                return false;
+            }
+        }
+        Action::DropEqual => {
+            let target_val = labels
+                .get(cfg.target_label.as_str())
+                .map_or("", String::as_str);
+            if target_val == val {
+                return false;
+            }
+        }
+        Action::KeepEqual => {
+            let target_val = labels
+                .get(cfg.target_label.as_str())
+                .map_or("", String::as_str);
+            if target_val != val {
+                return false;
+            }
+        }
+        Action::Replace => {
+            // Fast path to add or delete a static label pair without running regex captures.
+            if val.is_empty()
+                && cfg.regex.is_default()
+                && !var_in_regex_template(&cfg.target_label)
+                && !var_in_regex_template(&cfg.replacement)
+            {
+                set_or_del(labels, &cfg.target_label, &cfg.replacement);
+                return true;
+            }
+
+            let Some(caps) = cfg.regex.compiled.captures(val) else {
+                return true;
+            };
+            let target = expand_template(&cfg.target_label, &caps);
+            if !cfg.name_validation_scheme.is_valid_label_name(&target) {
+                return true;
+            }
+            let res = expand_template(&cfg.replacement, &caps);
+            set_or_del(labels, &target, &res);
+        }
+        Action::Lowercase => {
+            let lower = val.to_lowercase();
+            set_or_del(labels, &cfg.target_label, &lower);
+        }
+        Action::Uppercase => {
+            let upper = val.to_uppercase();
+            set_or_del(labels, &cfg.target_label, &upper);
+        }
+        Action::HashMod => {
+            if cfg.modulus > 0 {
+                let digest = md5_sum(val.as_bytes());
+                // Prometheus uses the last 8 bytes of the 16-byte MD5 digest as big-endian u64.
+                let low = u64::from_be_bytes([
+                    digest[8], digest[9], digest[10], digest[11], digest[12], digest[13],
+                    digest[14], digest[15],
+                ]);
+                let modulo = (low % cfg.modulus).to_string();
+                set_or_del(labels, &cfg.target_label, &modulo);
+            }
+        }
+        Action::LabelMap => {
+            let snapshot: Vec<(String, String)> =
+                labels.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            for (name, value) in snapshot {
+                if let Some(caps) = cfg.regex.compiled.captures(&name) {
+                    let res = expand_template(&cfg.replacement, &caps);
+                    set_or_del(labels, &res, &value);
+                }
+            }
+        }
+        Action::LabelDrop => {
+            labels.retain(|name, _| !cfg.regex.is_match(name));
+        }
+        Action::LabelKeep => {
+            labels.retain(|name, _| cfg.regex.is_match(name));
+        }
+        Action::Empty => {}
+    }
+
+    true
+}
+
+fn set_or_del(labels: &mut LabelSet, key: &str, value: &str) {
+    if key.is_empty() {
+        return;
+    }
+    if value.is_empty() {
+        labels.remove(key);
+    } else {
+        labels.insert(key.to_owned(), value.to_owned());
+    }
+}
+
+/// Expands Go `regexp.ExpandString`-compatible `$1`, `${1}`, `$name`, `${name}`, and `$$`
+/// references against `caps`.
+fn expand_template(template: &str, caps: &Captures<'_>) -> String {
+    if !template.contains('$') {
+        return template.to_owned();
+    }
+
+    let mut out = String::with_capacity(template.len());
+    let bytes = template.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            let next_dollar = template[i..].find('$').map_or(bytes.len(), |off| i + off);
+            out.push_str(&template[i..next_dollar]);
+            i = next_dollar;
+            continue;
+        }
+
+        if i + 1 >= bytes.len() {
+            out.push('$');
+            break;
+        }
+
+        if bytes[i + 1] == b'$' {
+            out.push('$');
+            i += 2;
+            continue;
+        }
+
+        if bytes[i + 1] == b'{' {
+            if let Some(close_rel) = template[i + 2..].find('}') {
+                let end = i + 2 + close_rel;
+                let name = &template[i + 2..end];
+                append_capture(&mut out, name, caps);
+                i = end + 1;
+            } else {
+                out.push('$');
+                i += 1;
+            }
+            continue;
+        }
+
+        // Bare `$name`: consume maximal ASCII alphanumeric or '_' run, matching Go regexp.extract.
+        let start = i + 1;
+        let mut end = start;
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            end += 1;
+        }
+        if end == start {
+            out.push('$');
+            i += 1;
+        } else {
+            let name = &template[start..end];
+            append_capture(&mut out, name, caps);
+            i = end;
+        }
+    }
+
+    out
+}
+
+fn append_capture(out: &mut String, name: &str, caps: &Captures<'_>) {
+    if name.is_empty() {
+        return;
+    }
+    if name.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(idx) = name.parse::<usize>()
+            && let Some(m) = caps.get(idx)
+        {
+            out.push_str(m.as_str());
+        }
+    } else if let Some(m) = caps.name(name) {
+        out.push_str(m.as_str());
+    }
+}
+
+/// Scrape job defaults used to populate pre-relabel discovered target labels,
+/// matching the scrape configuration fields consumed by Prometheus `scrape.PopulateLabels`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetPopulateConfig {
+    /// Scrape `job_name`.
+    pub job_name: String,
+    /// Scrape interval duration string (for example `"15s"`).
+    pub scrape_interval: String,
+    /// Scrape timeout duration string (for example `"10s"`).
+    pub scrape_timeout: String,
+    /// Default metrics path (defaults to `"/metrics"`).
+    pub metrics_path: String,
+    /// Default URL scheme (defaults to `"http"`).
+    pub scheme: String,
+    /// Optional HTTP query parameters mapped to `__param_<name>` (first value).
+    pub params: BTreeMap<String, Vec<String>>,
+}
+
+impl Default for TargetPopulateConfig {
+    fn default() -> Self {
+        Self {
+            job_name: String::new(),
+            scrape_interval: "1m".to_owned(),
+            scrape_timeout: "10s".to_owned(),
+            metrics_path: "/metrics".to_owned(),
+            scheme: "http".to_owned(),
+            params: BTreeMap::new(),
+        }
+    }
+}
+
+/// Result of populating and relabeling a discovered target via [`populate_labels`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PopulatedTarget {
+    /// Final target labels after `relabel_configs` and `__meta_*` removal (includes `job`,
+    /// `instance`, `__address__`, `__scheme__`, `__metrics_path__`, and any `__param_*` labels).
+    pub labels: LabelSet,
+    /// Pre-relabel discovered labels produced by [`populate_discovered_labels`].
+    pub discovered_labels: LabelSet,
+}
+
+impl PopulatedTarget {
+    /// Returns the public (non-`__`-prefixed) target labels emitted onto scraped samples or
+    /// resource attributes (`job`, `instance`, and user labels).
+    pub fn public_labels(&self) -> LabelSet {
+        self.labels
+            .iter()
+            .filter(|(k, _)| !k.starts_with(RESERVED_LABEL_PREFIX))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+}
+
+/// Builds the pre-relabel discovered label set from a target label set, common target-group
+/// label set, and [`TargetPopulateConfig`], matching Prometheus `scrape.PopulateDiscoveredLabels`.
+pub fn populate_discovered_labels(
+    target: &LabelSet,
+    group_labels: &LabelSet,
+    cfg: &TargetPopulateConfig,
+) -> LabelSet {
+    let mut out = LabelSet::new();
+    for (k, v) in target {
+        if !v.is_empty() {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    for (k, v) in group_labels {
+        if !v.is_empty() && !out.contains_key(k) {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+
+    let defaults = [
+        (JOB_LABEL, cfg.job_name.as_str()),
+        (SCRAPE_INTERVAL_LABEL, cfg.scrape_interval.as_str()),
+        (SCRAPE_TIMEOUT_LABEL, cfg.scrape_timeout.as_str()),
+        (METRICS_PATH_LABEL, cfg.metrics_path.as_str()),
+        (SCHEME_LABEL, cfg.scheme.as_str()),
+    ];
+    for (k, v) in defaults {
+        if !v.is_empty() && !out.contains_key(k) {
+            out.insert(k.to_owned(), v.to_owned());
+        }
+    }
+
+    // Encode scrape query parameters into `__param_<name>` labels using the first value.
+    for (k, vals) in &cfg.params {
+        if let Some(first) = vals.first()
+            && !first.is_empty()
+        {
+            let param_key = format!("{PARAM_LABEL_PREFIX}{k}");
+            out.entry(param_key).or_insert_with(|| first.clone());
+        }
+    }
+
+    out
+}
+
+/// Populates discovered labels, applies `relabel_configs`, validates `__address__`, strips
+/// `__meta_*` labels, and sets the default `instance` label, matching Prometheus
+/// `scrape.PopulateLabels`.
+///
+/// Returns `Ok(Some(PopulatedTarget))` if the target is kept, `Ok(None)` if dropped by
+/// `relabel_configs`, or `Err(RelabelError::TargetError)` if `__address__` is missing or invalid.
+pub fn populate_labels(
+    target: &LabelSet,
+    group_labels: &LabelSet,
+    cfg: &TargetPopulateConfig,
+    relabel_configs: &[Config],
+) -> Result<Option<PopulatedTarget>, RelabelError> {
+    let discovered_labels = populate_discovered_labels(target, group_labels, cfg);
+    let mut labels = discovered_labels.clone();
+    if !process_in_place(&mut labels, relabel_configs) {
+        return Ok(None);
+    }
+
+    let Some(addr) = labels.get(ADDRESS_LABEL).cloned() else {
+        return Err(RelabelError::TargetError("no address".to_owned()));
+    };
+    if addr.is_empty() {
+        return Err(RelabelError::TargetError("no address".to_owned()));
+    }
+    if addr.contains('/') {
+        return Err(RelabelError::TargetError(format!(
+            "address {addr:?} cannot contain '/'"
+        )));
+    }
+
+    // Remove all `__meta_*` labels after target relabeling.
+    labels.retain(|k, _| !k.starts_with(META_LABEL_PREFIX));
+
+    // Default `instance` to `__address__` if not set by relabeling.
+    if !labels.contains_key(INSTANCE_LABEL) {
+        labels.insert(INSTANCE_LABEL.to_owned(), addr);
+    }
+
+    Ok(Some(PopulatedTarget {
+        labels,
+        discovered_labels,
+    }))
+}
+
+/// Merges non-reserved target labels onto a scraped sample's `metric_labels` according to
+/// Prometheus `honor_labels` semantics (`scrape/scrape.go`):
+///
+/// - Internal target labels starting with `"__"` are never copied onto samples.
+/// - If `honor_labels` is `true`, existing sample labels take precedence over target labels.
+/// - If `honor_labels` is `false`, conflicting sample labels are renamed to
+///   `"exported_<label>"` (iteratively prefixing `"exported_"` if `"exported_<label>"` also
+///   exists) before inserting the target label.
+pub fn merge_target_and_metric_labels(
+    metric_labels: &mut LabelSet,
+    target_labels: &LabelSet,
+    honor_labels: bool,
+) {
+    for (tk, tv) in target_labels {
+        if tk.starts_with(RESERVED_LABEL_PREFIX) || tv.is_empty() {
+            continue;
+        }
+        if !metric_labels.contains_key(tk) {
+            metric_labels.insert(tk.clone(), tv.clone());
+        } else if !honor_labels {
+            let mut exported_key = format!("{EXPORTED_LABEL_PREFIX}{tk}");
+            while target_labels.contains_key(&exported_key)
+                || metric_labels.contains_key(&exported_key)
+            {
+                exported_key = format!("{EXPORTED_LABEL_PREFIX}{exported_key}");
+            }
+            if let Some(prev_val) = metric_labels.remove(tk) {
+                metric_labels.insert(exported_key, prev_val);
+            }
+            metric_labels.insert(tk.clone(), tv.clone());
+        }
+    }
+}
+
+/// Pure-Rust RFC 1321 MD5 implementation used by [`Action::HashMod`].
+fn md5_sum(input: &[u8]) -> [u8; 16] {
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    const K: [u32; 64] = [
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
+        0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193,
+        0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d,
+        0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122,
+        0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa,
+        0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244,
+        0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb,
+        0xeb86d391,
+    ];
+
+    let mut a0: u32 = 0x67452301;
+    let mut b0: u32 = 0xefcdab89;
+    let mut c0: u32 = 0x98badcfe;
+    let mut d0: u32 = 0x10325476;
+
+    let bit_len = (input.len() as u64).wrapping_mul(8);
+    let mut msg = Vec::with_capacity((input.len() + 72) & !63);
+    msg.extend_from_slice(input);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_le_bytes());
+
+    for chunk in msg.as_chunks::<64>().0 {
+        let mut m = [0u32; 16];
+        for (i, word) in m.iter_mut().enumerate() {
+            let base = i * 4;
+            *word = u32::from_le_bytes([
+                chunk[base],
+                chunk[base + 1],
+                chunk[base + 2],
+                chunk[base + 3],
+            ]);
+        }
+
+        let mut a = a0;
+        let mut b = b0;
+        let mut c = c0;
+        let mut d = d0;
+
+        for i in 0..64 {
+            let (f, g) = if i < 16 {
+                ((b & c) | (!b & d), i)
+            } else if i < 32 {
+                ((d & b) | (!d & c), (5 * i + 1) % 16)
+            } else if i < 48 {
+                (b ^ c ^ d, (3 * i + 5) % 16)
+            } else {
+                (c ^ (b | !d), (7 * i) % 16)
+            };
+            let temp = d;
+            d = c;
+            c = b;
+            let sum = a.wrapping_add(f).wrapping_add(K[i]).wrapping_add(m[g]);
+            b = b.wrapping_add(sum.rotate_left(S[i]));
+            a = temp;
+        }
+
+        a0 = a0.wrapping_add(a);
+        b0 = b0.wrapping_add(b);
+        c0 = c0.wrapping_add(c);
+        d0 = d0.wrapping_add(d);
+    }
+
+    let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(&a0.to_le_bytes());
+    out[4..8].copy_from_slice(&b0.to_le_bytes());
+    out[8..12].copy_from_slice(&c0.to_le_bytes());
+    out[12..16].copy_from_slice(&d0.to_le_bytes());
+    out
+}
