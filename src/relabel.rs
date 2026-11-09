@@ -1065,7 +1065,9 @@ pub fn keep_metric_name(metric_name: &str, cfgs: &[Config]) -> bool {
 /// target label, `renamed_keys` is resized to `metric_keys.len()`, populating
 /// `Some(exported_name)` for each renamed dictionary entry (resolved in ascending key-length
 /// order matching Prometheus `resolveConflictingExposedLabels`) and `None` for unchanged entries,
-/// and `true` is returned.
+/// and `true` is returned. Because resolution operates across the batch-wide `metric_keys`
+/// dictionary, any `exported_<name>` key present in `metric_keys` is treated as occupied for the
+/// entire dictionary.
 pub fn resolve_conflicting_exposed_keys<K: AsRef<str>>(
     metric_keys: &[K],
     target_labels: &LabelSet,
