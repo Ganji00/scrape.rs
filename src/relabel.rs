@@ -569,23 +569,25 @@ fn apply_single(cfg: &Config, labels: &mut LabelSet, val: &mut String) -> bool {
             }
         }
         Action::Replace => {
-            // Fast path to add or delete a static label pair without running regex captures.
-            if val.is_empty()
-                && cfg.regex.is_default()
-                && !var_in_regex_template(&cfg.target_label)
-                && !var_in_regex_template(&cfg.replacement)
-            {
-                if cfg
-                    .name_validation_scheme
-                    .is_valid_label_name(&cfg.target_label)
-                {
-                    set_or_del(
-                        labels,
-                        Cow::Borrowed(&cfg.target_label),
-                        Cow::Borrowed(&cfg.replacement),
-                    );
+            // Fast path when `regex` is the default `(.*)` (which matches all strings with
+            // `$0 == $1 == val`) and `target_label` is static: skip regex capture allocation.
+            if cfg.regex.is_default() && !var_in_regex_template(&cfg.target_label) {
+                let direct_replacement = if !var_in_regex_template(&cfg.replacement) {
+                    Some(Cow::Borrowed(cfg.replacement.as_str()))
+                } else if matches!(cfg.replacement.as_str(), "$1" | "${1}" | "$0" | "${0}") {
+                    Some(Cow::Borrowed(val.as_str()))
+                } else {
+                    None
+                };
+                if let Some(res) = direct_replacement {
+                    if cfg
+                        .name_validation_scheme
+                        .is_valid_label_name(&cfg.target_label)
+                    {
+                        set_or_del(labels, Cow::Borrowed(&cfg.target_label), res);
+                    }
+                    return true;
                 }
-                return true;
             }
 
             let Some(caps) = cfg.regex.compiled.captures(val) else {
@@ -635,7 +637,9 @@ fn apply_single(cfg: &Config, labels: &mut LabelSet, val: &mut String) -> bool {
         Action::LabelMap => {
             let mut mapped = Vec::new();
             for (name, value) in labels.iter() {
-                if let Some(caps) = cfg.regex.compiled.captures(name) {
+                if cfg.regex.is_match(name)
+                    && let Some(caps) = cfg.regex.compiled.captures(name)
+                {
                     let res = expand_template(&cfg.replacement, &caps);
                     if cfg.name_validation_scheme.is_valid_label_name(&res) {
                         mapped.push((res.into_owned(), value.clone()));
@@ -679,9 +683,13 @@ fn set_or_del(labels: &mut LabelSet, key: Cow<'_, str>, value: Cow<'_, str>) {
 
 /// Expands Go `regexp.ExpandString`-compatible `$1`, `${1}`, `$name`, `${name}`, and `$$`
 /// references against `caps`.
-fn expand_template<'a>(template: &'a str, caps: &Captures<'_>) -> Cow<'a, str> {
+fn expand_template<'a>(template: &'a str, caps: &Captures<'a>) -> Cow<'a, str> {
     if !template.contains('$') {
         return Cow::Borrowed(template);
+    }
+    if matches!(template, "$1" | "${1}" | "$0" | "${0}") {
+        let idx = usize::from(matches!(template, "$1" | "${1}"));
+        return Cow::Borrowed(caps.get(idx).map_or("", |m| m.as_str()));
     }
 
     let mut out = String::with_capacity(template.len());
@@ -1249,19 +1257,27 @@ pub fn eval_single_label_value_transform<V: AsRef<str>>(
         }
         match cfg.action {
             Action::Replace => {
-                if val_str.is_empty()
-                    && cfg.regex.is_default()
-                    && !var_in_regex_template(&cfg.replacement)
-                {
-                    return if cfg.replacement.is_empty() {
-                        if in_place && !is_present {
+                if cfg.regex.is_default() {
+                    let direct_replacement = if !var_in_regex_template(&cfg.replacement) {
+                        Some(cfg.replacement.as_str())
+                    } else if matches!(cfg.replacement.as_str(), "$1" | "${1}" | "$0" | "${0}") {
+                        Some(val_str)
+                    } else {
+                        None
+                    };
+                    if let Some(res) = direct_replacement {
+                        return if res.is_empty() {
+                            if in_place && !is_present {
+                                DictionaryValueTransform::KeepExisting
+                            } else {
+                                DictionaryValueTransform::DeleteTarget
+                            }
+                        } else if in_place && is_present && res == val_str {
                             DictionaryValueTransform::KeepExisting
                         } else {
-                            DictionaryValueTransform::DeleteTarget
-                        }
-                    } else {
-                        DictionaryValueTransform::SetTarget(cfg.replacement.clone())
-                    };
+                            DictionaryValueTransform::SetTarget(res.to_owned())
+                        };
+                    }
                 }
                 let Some(caps) = cfg.regex.compiled.captures(val_str) else {
                     return DictionaryValueTransform::KeepExisting;

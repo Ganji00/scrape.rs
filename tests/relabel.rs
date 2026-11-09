@@ -1236,12 +1236,9 @@ fn stage2_dictionary_vectorized_honor_labels_and_attribute_transforms() {
         action: Action::Uppercase,
         ..Config::default()
     };
-    let absent_upper = eval_single_label_value_transform(
-        &["prod", "PROD"],
-        &upper_cross_cfg,
-        &mut transforms,
-    )
-    .unwrap();
+    let absent_upper =
+        eval_single_label_value_transform(&["prod", "PROD"], &upper_cross_cfg, &mut transforms)
+            .unwrap();
     assert_eq!(absent_upper, DictionaryValueTransform::DeleteTarget);
     assert_eq!(
         transforms,
@@ -1258,12 +1255,9 @@ fn stage2_dictionary_vectorized_honor_labels_and_attribute_transforms() {
         action: Action::HashMod,
         ..Config::default()
     };
-    let absent_hashmod = eval_single_label_value_transform(
-        &["baz", "foo\nbar"],
-        &hashmod_cfg,
-        &mut transforms,
-    )
-    .unwrap();
+    let absent_hashmod =
+        eval_single_label_value_transform(&["baz", "foo\nbar"], &hashmod_cfg, &mut transforms)
+            .unwrap();
     assert!(matches!(
         absent_hashmod,
         DictionaryValueTransform::SetTarget(_)
@@ -1332,7 +1326,14 @@ fn stage2_dictionary_vectorized_honor_labels_and_attribute_transforms() {
     assert_eq!(stage2.len(), 3);
 
     let batch_keys = ["__name__", "debug_trace", "env"];
-    let batch_vals = ["DEV", "PROD", "abc", "go_goroutines", "http_requests_total", "xyz"];
+    let batch_vals = [
+        "DEV",
+        "PROD",
+        "abc",
+        "go_goroutines",
+        "http_requests_total",
+        "xyz",
+    ];
 
     let mut stage2_key_mask = Vec::new();
     eval_key_keep_mask(&batch_keys, &stage2[0], &mut stage2_key_mask).unwrap();
