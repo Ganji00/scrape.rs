@@ -1073,6 +1073,30 @@ fn stage1_metric_name_pushdown_splits_and_filters_families() {
     assert!(multi_rem.is_empty());
     assert!(keep_metric_name("up", multi_pushdown));
     assert!(!keep_metric_name("down", multi_pushdown));
+
+    let dropequal_cfg = [Config {
+        source_labels: strs(&[METRIC_NAME_LABEL]),
+        target_label: METRIC_NAME_LABEL.to_owned(),
+        action: Action::DropEqual,
+        ..Config::default()
+    }];
+    assert!(!keep_metric_name("up", &dropequal_cfg));
+
+    let keepequal_false_cfg = [Config {
+        source_labels: strs(&[METRIC_NAME_LABEL, METRIC_NAME_LABEL]),
+        target_label: METRIC_NAME_LABEL.to_owned(),
+        action: Action::KeepEqual,
+        ..Config::default()
+    }];
+    assert!(!keep_metric_name("up", &keepequal_false_cfg));
+
+    let empty_sources_cfg = [Config {
+        source_labels: Vec::new(),
+        regex: Regexp::must_new(""),
+        action: Action::Keep,
+        ..Config::default()
+    }];
+    assert!(keep_metric_name("up", &empty_sources_cfg));
 }
 
 #[test]
