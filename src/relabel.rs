@@ -662,68 +662,85 @@ fn expand_template<'a>(template: &'a str, caps: &Captures<'_>) -> Cow<'a, str> {
     }
 
     let mut out = String::with_capacity(template.len());
-    let bytes = template.as_bytes();
-    let mut i = 0;
+    let mut rest = template;
 
-    while i < bytes.len() {
-        if bytes[i] != b'$' {
-            let next_dollar = template[i..].find('$').map_or(bytes.len(), |off| i + off);
-            out.push_str(&template[i..next_dollar]);
-            i = next_dollar;
+    while let Some(dollar_idx) = rest.find('$') {
+        out.push_str(&rest[..dollar_idx]);
+        let after_dollar = &rest[dollar_idx + 1..];
+        if after_dollar.starts_with('$') {
+            out.push('$');
+            rest = &after_dollar[1..];
             continue;
         }
-
-        if i + 1 >= bytes.len() {
-            out.push('$');
-            break;
-        }
-
-        if bytes[i + 1] == b'$' {
-            out.push('$');
-            i += 2;
-            continue;
-        }
-
-        if bytes[i + 1] == b'{' {
-            if let Some(close_rel) = template[i + 2..].find('}') {
-                let end = i + 2 + close_rel;
-                let name = &template[i + 2..end];
-                append_capture(&mut out, name, caps);
-                i = end + 1;
-            } else {
-                out.push('$');
-                i += 1;
-            }
-            continue;
-        }
-
-        // Bare `$name`: consume maximal ASCII alphanumeric or '_' run, matching Go regexp.extract.
-        let start = i + 1;
-        let mut end = start;
-        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
-            end += 1;
-        }
-        if end == start {
-            out.push('$');
-            i += 1;
+        if let Some((name, num, remaining)) = extract_template_var(after_dollar) {
+            append_capture(&mut out, name, num, caps);
+            rest = remaining;
         } else {
-            let name = &template[start..end];
-            append_capture(&mut out, name, caps);
-            i = end;
+            out.push('$');
+            rest = after_dollar;
         }
     }
+    out.push_str(rest);
 
     Cow::Owned(out)
 }
 
-fn append_capture(out: &mut String, name: &str, caps: &Captures<'_>) {
-    if name.is_empty() {
-        return;
+/// Parses a variable reference after `'$'` matching Go `regexp.extract`.
+fn extract_template_var(str_after_dollar: &str) -> Option<(&str, Option<usize>, &str)> {
+    if str_after_dollar.is_empty() {
+        return None;
     }
-    if name.bytes().all(|b| b.is_ascii_digit()) {
-        if let Ok(idx) = name.parse::<usize>()
-            && let Some(m) = caps.get(idx)
-        {
+    let (brace, body) = if let Some(stripped) = str_after_dollar.strip_prefix('{') {
+        (true, stripped)
+    } else {
+        (false, str_after_dollar)
+    };
+
+    let mut end = 0;
+    for (idx, ch) in body.char_indices() {
+        if !ch.is_alphabetic() && !ch.is_numeric() && ch != '_' {
+            break;
+        }
+        end = idx + ch.len_utf8();
+    }
+    if end == 0 {
+        return None;
+    }
+
+    let remaining = if brace {
+        let after_name = &body[end..];
+        if !after_name.starts_with('}') {
+            return None;
+        }
+        &after_name[1..]
+    } else {
+        &body[end..]
+    };
+
+    let name = &body[..end];
+    let name_bytes = name.as_bytes();
+    // Go `regexp.extract` rejects leading zeros on multi-digit group numbers and numbers >= 1e8.
+    let num = if name_bytes.len() > 1 && name_bytes[0] == b'0' {
+        None
+    } else {
+        let mut parsed: usize = 0;
+        let mut ok = true;
+        for &b in name_bytes {
+            if !b.is_ascii_digit() || parsed >= 100_000_000 {
+                ok = false;
+                break;
+            }
+            parsed = parsed * 10 + usize::from(b - b'0');
+        }
+        ok.then_some(parsed)
+    };
+
+    Some((name, num, remaining))
+}
+
+fn append_capture(out: &mut String, name: &str, num: Option<usize>, caps: &Captures<'_>) {
+    if let Some(idx) = num {
+        if let Some(m) = caps.get(idx) {
             out.push_str(m.as_str());
         }
     } else if let Some(m) = caps.name(name) {
