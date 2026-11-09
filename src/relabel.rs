@@ -161,7 +161,6 @@ impl<'de> Deserialize<'de> for Action {
         let s = Option::<String>::deserialize(deserializer)?;
         match s {
             None => Ok(Self::Replace),
-            Some(ref val) if val.is_empty() => Ok(Self::Replace),
             Some(val) => Self::parse(&val).map_err(serde::de::Error::custom),
         }
     }
