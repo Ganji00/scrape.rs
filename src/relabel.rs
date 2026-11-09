@@ -908,23 +908,42 @@ pub fn merge_target_and_metric_labels(
     target_labels: &LabelSet,
     honor_labels: bool,
 ) {
+    metric_labels.retain(|_, v| !v.is_empty());
+
+    if honor_labels {
+        for (tk, tv) in target_labels {
+            if tk.starts_with(RESERVED_LABEL_PREFIX) || tv.is_empty() {
+                continue;
+            }
+            if !metric_labels.contains_key(tk) {
+                metric_labels.insert(tk.clone(), tv.clone());
+            }
+        }
+        return;
+    }
+
+    let mut conflicting = Vec::new();
     for (tk, tv) in target_labels {
         if tk.starts_with(RESERVED_LABEL_PREFIX) || tv.is_empty() {
             continue;
         }
-        if !metric_labels.contains_key(tk) {
-            metric_labels.insert(tk.clone(), tv.clone());
-        } else if !honor_labels {
-            let mut exported_key = format!("{EXPORTED_LABEL_PREFIX}{tk}");
-            while target_labels.contains_key(&exported_key)
-                || metric_labels.contains_key(&exported_key)
-            {
-                exported_key = format!("{EXPORTED_LABEL_PREFIX}{exported_key}");
+        if let Some(prev_val) = metric_labels.insert(tk.clone(), tv.clone()) {
+            conflicting.push((tk.clone(), prev_val));
+        }
+    }
+
+    if !conflicting.is_empty() {
+        // Resolve shorter conflicting sample names (`foo`) before longer already-prefixed
+        // names (`exported_foo`), matching Prometheus `resolveConflictingExposedLabels`.
+        conflicting.sort_by_key(|(name, _)| name.len());
+        for (mut name, val) in conflicting {
+            loop {
+                name.insert_str(0, EXPORTED_LABEL_PREFIX);
+                if !metric_labels.contains_key(&name) {
+                    metric_labels.insert(name, val);
+                    break;
+                }
             }
-            if let Some(prev_val) = metric_labels.remove(tk) {
-                metric_labels.insert(exported_key, prev_val);
-            }
-            metric_labels.insert(tk.clone(), tv.clone());
         }
     }
 }
