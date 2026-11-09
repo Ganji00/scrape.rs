@@ -997,7 +997,7 @@ fn deserialized_legacy_validation_and_template_expansion_edge_cases() {
     assert!(!untouched.contains_key("invalid.legacy"));
 
     // Multi-block MD5 inputs (55, 56, and 70 bytes) in `Action::HashMod`.
-    for len in [55usize, 56, 70] {
+    for (len, expected_mod) in [(55usize, "442"), (56, "603"), (70, "469")] {
         let s = "x".repeat(len);
         let res = process(
             &label_set(&[("in", &s)]),
@@ -1010,7 +1010,7 @@ fn deserialized_legacy_validation_and_template_expansion_edge_cases() {
             }],
         )
         .unwrap();
-        assert!(res.contains_key("h"));
+        assert_eq!(res.get("h").map(String::as_str), Some(expected_mod));
     }
 }
 
