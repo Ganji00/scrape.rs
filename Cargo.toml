@@ -39,6 +39,11 @@ name = "decode"
 harness = false
 required-features = ["arrow"]
 
+[[bench]]
+name = "relabel"
+harness = false
+required-features = ["relabel"]
+
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "forbid"

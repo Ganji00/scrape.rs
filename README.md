@@ -53,8 +53,9 @@ Run the Go differential fixture extractor and tests (requires Go):
 cd tests/go-harness && go test ./...
 ```
 
-Run the decoding benchmarks in Go `benchfmt` format for [`benchstat`](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat):
+Run the decoding and relabeling benchmarks in Go `benchfmt` format for [`benchstat`](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat):
 
 ```sh
 cargo bench --bench decode -- -bench '^BenchmarkDecode' -benchtime 1s -count 6 -cpu 2 -benchmem | tee decode.txt
+cargo bench --bench relabel -- -bench '^BenchmarkRelabel' -benchtime 1s -count 6 -cpu 2 -benchmem | tee relabel.txt
 ```
