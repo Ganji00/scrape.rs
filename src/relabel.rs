@@ -170,9 +170,9 @@ impl<'de> Deserialize<'de> for Action {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ValidationScheme {
     /// Unset scheme; inherits the global validation scheme passed to [`Config::validate`].
+    #[default]
     Unset,
     /// UTF-8 label name validation (`model.UTF8Validation`, default in Prometheus v3+).
-    #[default]
     Utf8,
     /// Legacy ASCII `[a-zA-Z_][a-zA-Z0-9_]*` label name validation (`model.LegacyValidation`).
     Legacy,
@@ -366,7 +366,7 @@ impl Default for Config {
             target_label: String::new(),
             replacement: default_replacement(),
             action: Action::Replace,
-            name_validation_scheme: ValidationScheme::Utf8,
+            name_validation_scheme: ValidationScheme::Unset,
         }
     }
 }
