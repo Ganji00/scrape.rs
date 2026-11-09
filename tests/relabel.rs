@@ -1121,7 +1121,7 @@ fn stage2_dictionary_vectorized_honor_labels_and_attribute_transforms() {
     assert!(renamed.is_empty());
 
     // 2. honor_labels = true: never renames metric keys even on collision.
-    let colliding_keys = ["foo", "exported_foo", "job", "method"];
+    let colliding_keys = ["exported_foo", "foo", "job", "method"];
     assert!(!resolve_conflicting_exposed_keys(
         &colliding_keys,
         &target_labels,
@@ -1140,8 +1140,8 @@ fn stage2_dictionary_vectorized_honor_labels_and_attribute_transforms() {
     assert_eq!(
         renamed,
         vec![
-            Some("exported_exported_foo".to_owned()),
             Some("exported_exported_exported_foo".to_owned()),
+            Some("exported_exported_foo".to_owned()),
             Some("exported_job".to_owned()),
             None,
         ]
