@@ -1205,7 +1205,7 @@ fn stage2_dictionary_vectorized_honor_labels_and_attribute_transforms() {
     );
     assert_eq!(val_mask, vec![true, true, false]);
 
-    // 6. Dictionary single-label value transformations (`Lowercase`, `Replace`, `HashMod`).
+    // 6. Dictionary single-label value transformations (`Lowercase`, `Uppercase`, `Replace`, `HashMod`, `DeleteTarget`).
     let mut transforms = Vec::new();
     let lower_cfg = Config {
         source_labels: strs(&["env"]),
@@ -1214,7 +1214,7 @@ fn stage2_dictionary_vectorized_honor_labels_and_attribute_transforms() {
         ..Config::default()
     };
     let absent = eval_single_label_value_transform(
-        &["prod", "PROD", "Staging"],
+        &["prod", "PROD", "Staging", ""],
         &lower_cfg,
         &mut transforms,
     )
@@ -1226,19 +1226,66 @@ fn stage2_dictionary_vectorized_honor_labels_and_attribute_transforms() {
             DictionaryValueTransform::KeepExisting,
             DictionaryValueTransform::SetTarget("prod".to_owned()),
             DictionaryValueTransform::SetTarget("staging".to_owned()),
+            DictionaryValueTransform::DeleteTarget,
+        ]
+    );
+
+    let upper_cross_cfg = Config {
+        source_labels: strs(&["env"]),
+        target_label: "env_upper".to_owned(),
+        action: Action::Uppercase,
+        ..Config::default()
+    };
+    let absent_upper = eval_single_label_value_transform(
+        &["prod", "PROD"],
+        &upper_cross_cfg,
+        &mut transforms,
+    )
+    .unwrap();
+    assert_eq!(absent_upper, DictionaryValueTransform::DeleteTarget);
+    assert_eq!(
+        transforms,
+        vec![
+            DictionaryValueTransform::SetTarget("PROD".to_owned()),
+            DictionaryValueTransform::SetTarget("PROD".to_owned()),
+        ]
+    );
+
+    let hashmod_cfg = Config {
+        source_labels: strs(&["c"]),
+        modulus: 1000,
+        target_label: "shard".to_owned(),
+        action: Action::HashMod,
+        ..Config::default()
+    };
+    let absent_hashmod = eval_single_label_value_transform(
+        &["baz", "foo\nbar"],
+        &hashmod_cfg,
+        &mut transforms,
+    )
+    .unwrap();
+    assert!(matches!(
+        absent_hashmod,
+        DictionaryValueTransform::SetTarget(_)
+    ));
+    assert_eq!(
+        transforms,
+        vec![
+            DictionaryValueTransform::SetTarget("976".to_owned()),
+            DictionaryValueTransform::SetTarget("734".to_owned()),
         ]
     );
 
     let replace_cfg = Config {
         source_labels: strs(&["pod"]),
-        regex: Regexp::must_new("([a-z]+)-[0-9a-f]+"),
+        regex: Regexp::must_new("([a-z]+)-[0-9a-f]+|dropme"),
         target_label: "app".to_owned(),
         replacement: "$1".to_owned(),
         action: Action::Replace,
         ..Config::default()
     };
     let absent_replace = eval_single_label_value_transform(
-        &["api-7f8b", "worker-12ab", "unmatched"],
+        &["api-7f8b", "worker-12ab", "dropme", "unmatched"],
         &replace_cfg,
         &mut transforms,
     )
@@ -1249,11 +1296,12 @@ fn stage2_dictionary_vectorized_honor_labels_and_attribute_transforms() {
         vec![
             DictionaryValueTransform::SetTarget("api".to_owned()),
             DictionaryValueTransform::SetTarget("worker".to_owned()),
+            DictionaryValueTransform::DeleteTarget,
             DictionaryValueTransform::KeepExisting,
         ]
     );
 
-    // 7. End-to-end equivalence: Stage 1 `__name__` pushdown + Stage 2 dictionary transforms vs per-sample `process`.
+    // 7. End-to-end equivalence: Stage 1 `__name__` pushdown + Stage 2 dictionary primitives vs per-sample `process`.
     let pipeline_cfgs = [
         Config {
             source_labels: strs(&[METRIC_NAME_LABEL]),
@@ -1268,6 +1316,12 @@ fn stage2_dictionary_vectorized_honor_labels_and_attribute_transforms() {
         },
         Config {
             source_labels: strs(&["env"]),
+            regex: Regexp::must_new("PROD|STAGING"),
+            action: Action::Keep,
+            ..Config::default()
+        },
+        Config {
+            source_labels: strs(&["env"]),
             target_label: "env".to_owned(),
             action: Action::Lowercase,
             ..Config::default()
@@ -1275,7 +1329,22 @@ fn stage2_dictionary_vectorized_honor_labels_and_attribute_transforms() {
     ];
     let (stage1, stage2) = split_metric_name_pushdown(&pipeline_cfgs);
     assert_eq!(stage1.len(), 1);
-    assert_eq!(stage2.len(), 2);
+    assert_eq!(stage2.len(), 3);
+
+    let batch_keys = ["__name__", "debug_trace", "env"];
+    let batch_vals = ["DEV", "PROD", "abc", "go_goroutines", "http_requests_total", "xyz"];
+
+    let mut stage2_key_mask = Vec::new();
+    eval_key_keep_mask(&batch_keys, &stage2[0], &mut stage2_key_mask).unwrap();
+
+    let mut stage2_val_keep_mask = Vec::new();
+    let keep_summary =
+        eval_single_label_keep_mask(&batch_vals, &stage2[1], &mut stage2_val_keep_mask).unwrap();
+
+    let mut stage2_val_transforms = Vec::new();
+    let absent_transform =
+        eval_single_label_value_transform(&batch_vals, &stage2[2], &mut stage2_val_transforms)
+            .unwrap();
 
     let samples = [
         label_set(&[
@@ -1284,18 +1353,57 @@ fn stage2_dictionary_vectorized_honor_labels_and_attribute_transforms() {
             ("debug_trace", "xyz"),
         ]),
         label_set(&[
-            ("__name__", "go_goroutines"),
+            ("__name__", "http_requests_total"),
             ("env", "DEV"),
+            ("debug_trace", "xyz"),
+        ]),
+        label_set(&[
+            ("__name__", "go_goroutines"),
+            ("env", "PROD"),
             ("debug_trace", "abc"),
         ]),
     ];
     for sample in &samples {
         let oracle = process(sample, &pipeline_cfgs);
         let name = sample.get(METRIC_NAME_LABEL).unwrap();
-        let staged = if keep_metric_name(name, stage1) {
-            process(sample, stage2)
-        } else {
+        let staged = if !keep_metric_name(name, stage1) {
             None
+        } else {
+            let mut out = LabelSet::new();
+            for (k, v) in sample {
+                let key_id = batch_keys.iter().position(|bk| bk == k).unwrap();
+                if stage2_key_mask[key_id] {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
+            let kept = match out.get("env") {
+                Some(v) => {
+                    let val_id = batch_vals.iter().position(|bv| bv == v).unwrap();
+                    stage2_val_keep_mask[val_id]
+                }
+                None => keep_summary.keep_when_absent,
+            };
+            if !kept {
+                None
+            } else {
+                let xform = match out.get("env") {
+                    Some(v) => {
+                        let val_id = batch_vals.iter().position(|bv| bv == v).unwrap();
+                        &stage2_val_transforms[val_id]
+                    }
+                    None => &absent_transform,
+                };
+                match xform {
+                    DictionaryValueTransform::KeepExisting => {}
+                    DictionaryValueTransform::DeleteTarget => {
+                        out.remove("env");
+                    }
+                    DictionaryValueTransform::SetTarget(new_v) => {
+                        out.insert("env".to_owned(), new_v.clone());
+                    }
+                }
+                Some(out)
+            }
         };
         assert_eq!(staged, oracle);
     }
