@@ -14,6 +14,7 @@
 //! Prometheus-compatible target and metric relabeling (`relabel_configs` and
 //! `metric_relabel_configs`), ported from Prometheus `model/relabel` and `scrape/target.go`.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::OnceLock;
@@ -572,7 +573,11 @@ fn apply_single(cfg: &Config, labels: &mut LabelSet, val: &mut String) -> bool {
                 && !var_in_regex_template(&cfg.target_label)
                 && !var_in_regex_template(&cfg.replacement)
             {
-                set_or_del(labels, &cfg.target_label, &cfg.replacement);
+                set_or_del(
+                    labels,
+                    Cow::Borrowed(&cfg.target_label),
+                    Cow::Borrowed(&cfg.replacement),
+                );
                 return true;
             }
 
@@ -584,15 +589,15 @@ fn apply_single(cfg: &Config, labels: &mut LabelSet, val: &mut String) -> bool {
                 return true;
             }
             let res = expand_template(&cfg.replacement, &caps);
-            set_or_del(labels, &target, &res);
+            set_or_del(labels, target, res);
         }
         Action::Lowercase => {
             let lower = val.to_lowercase();
-            set_or_del(labels, &cfg.target_label, &lower);
+            set_or_del(labels, Cow::Borrowed(&cfg.target_label), Cow::Owned(lower));
         }
         Action::Uppercase => {
             let upper = val.to_uppercase();
-            set_or_del(labels, &cfg.target_label, &upper);
+            set_or_del(labels, Cow::Borrowed(&cfg.target_label), Cow::Owned(upper));
         }
         Action::HashMod => {
             if cfg.modulus > 0 {
@@ -603,17 +608,19 @@ fn apply_single(cfg: &Config, labels: &mut LabelSet, val: &mut String) -> bool {
                     digest[14], digest[15],
                 ]);
                 let modulo = (low % cfg.modulus).to_string();
-                set_or_del(labels, &cfg.target_label, &modulo);
+                set_or_del(labels, Cow::Borrowed(&cfg.target_label), Cow::Owned(modulo));
             }
         }
         Action::LabelMap => {
-            let snapshot: Vec<(String, String)> =
-                labels.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            for (name, value) in snapshot {
-                if let Some(caps) = cfg.regex.compiled.captures(&name) {
+            let mut mapped = Vec::new();
+            for (name, value) in labels.iter() {
+                if let Some(caps) = cfg.regex.compiled.captures(name) {
                     let res = expand_template(&cfg.replacement, &caps);
-                    set_or_del(labels, &res, &value);
+                    mapped.push((res.into_owned(), value.clone()));
                 }
+            }
+            for (res, value) in mapped {
+                set_or_del(labels, Cow::Owned(res), Cow::Owned(value));
             }
         }
         Action::LabelDrop => {
@@ -628,22 +635,30 @@ fn apply_single(cfg: &Config, labels: &mut LabelSet, val: &mut String) -> bool {
     true
 }
 
-fn set_or_del(labels: &mut LabelSet, key: &str, value: &str) {
+fn set_or_del(labels: &mut LabelSet, key: Cow<'_, str>, value: Cow<'_, str>) {
     if key.is_empty() {
         return;
     }
     if value.is_empty() {
-        labels.remove(key);
+        labels.remove(key.as_ref());
+    } else if let Some(existing) = labels.get_mut(key.as_ref()) {
+        match value {
+            Cow::Borrowed(s) => {
+                existing.clear();
+                existing.push_str(s);
+            }
+            Cow::Owned(s) => *existing = s,
+        }
     } else {
-        labels.insert(key.to_owned(), value.to_owned());
+        labels.insert(key.into_owned(), value.into_owned());
     }
 }
 
 /// Expands Go `regexp.ExpandString`-compatible `$1`, `${1}`, `$name`, `${name}`, and `$$`
 /// references against `caps`.
-fn expand_template(template: &str, caps: &Captures<'_>) -> String {
+fn expand_template<'a>(template: &'a str, caps: &Captures<'_>) -> Cow<'a, str> {
     if !template.contains('$') {
-        return template.to_owned();
+        return Cow::Borrowed(template);
     }
 
     let mut out = String::with_capacity(template.len());
@@ -698,7 +713,7 @@ fn expand_template(template: &str, caps: &Captures<'_>) -> String {
         }
     }
 
-    out
+    Cow::Owned(out)
 }
 
 fn append_capture(out: &mut String, name: &str, caps: &Captures<'_>) {
@@ -912,21 +927,9 @@ fn md5_sum(input: &[u8]) -> [u8; 16] {
         0xeb86d391,
     ];
 
-    let mut a0: u32 = 0x67452301;
-    let mut b0: u32 = 0xefcdab89;
-    let mut c0: u32 = 0x98badcfe;
-    let mut d0: u32 = 0x10325476;
+    let mut state = [0x67452301u32, 0xefcdab89, 0x98badcfe, 0x10325476];
 
-    let bit_len = (input.len() as u64).wrapping_mul(8);
-    let mut msg = Vec::with_capacity((input.len() + 72) & !63);
-    msg.extend_from_slice(input);
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bit_len.to_le_bytes());
-
-    for chunk in msg.as_chunks::<64>().0 {
+    let process_block = |state: &mut [u32; 4], chunk: &[u8; 64]| {
         let mut m = [0u32; 16];
         for (i, word) in m.iter_mut().enumerate() {
             let base = i * 4;
@@ -938,11 +941,7 @@ fn md5_sum(input: &[u8]) -> [u8; 16] {
             ]);
         }
 
-        let mut a = a0;
-        let mut b = b0;
-        let mut c = c0;
-        let mut d = d0;
-
+        let [mut a, mut b, mut c, mut d] = *state;
         for i in 0..64 {
             let (f, g) = if i < 16 {
                 ((b & c) | (!b & d), i)
@@ -961,16 +960,36 @@ fn md5_sum(input: &[u8]) -> [u8; 16] {
             a = temp;
         }
 
-        a0 = a0.wrapping_add(a);
-        b0 = b0.wrapping_add(b);
-        c0 = c0.wrapping_add(c);
-        d0 = d0.wrapping_add(d);
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+    };
+
+    let (full_chunks, rem) = input.as_chunks::<64>();
+    for chunk in full_chunks {
+        process_block(&mut state, chunk);
+    }
+
+    let bit_len = (input.len() as u64).wrapping_mul(8);
+    let mut tail = [0u8; 128];
+    tail[..rem.len()].copy_from_slice(rem);
+    tail[rem.len()] = 0x80;
+    let tail_blocks = if rem.len() < 56 {
+        tail[56..64].copy_from_slice(&bit_len.to_le_bytes());
+        &tail[..64]
+    } else {
+        tail[120..128].copy_from_slice(&bit_len.to_le_bytes());
+        &tail[..128]
+    };
+    for chunk in tail_blocks.as_chunks::<64>().0 {
+        process_block(&mut state, chunk);
     }
 
     let mut out = [0u8; 16];
-    out[0..4].copy_from_slice(&a0.to_le_bytes());
-    out[4..8].copy_from_slice(&b0.to_le_bytes());
-    out[8..12].copy_from_slice(&c0.to_le_bytes());
-    out[12..16].copy_from_slice(&d0.to_le_bytes());
+    out[0..4].copy_from_slice(&state[0].to_le_bytes());
+    out[4..8].copy_from_slice(&state[1].to_le_bytes());
+    out[8..12].copy_from_slice(&state[2].to_le_bytes());
+    out[12..16].copy_from_slice(&state[3].to_le_bytes());
     out
 }
