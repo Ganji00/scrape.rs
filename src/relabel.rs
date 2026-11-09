@@ -599,15 +599,29 @@ fn apply_single(cfg: &Config, labels: &mut LabelSet, val: &mut String) -> bool {
             set_or_del(labels, target, res);
         }
         Action::Lowercase => {
-            let lower = val.to_lowercase();
-            set_or_del(labels, Cow::Borrowed(&cfg.target_label), Cow::Owned(lower));
+            if cfg
+                .name_validation_scheme
+                .is_valid_label_name(&cfg.target_label)
+            {
+                let lower = val.to_lowercase();
+                set_or_del(labels, Cow::Borrowed(&cfg.target_label), Cow::Owned(lower));
+            }
         }
         Action::Uppercase => {
-            let upper = val.to_uppercase();
-            set_or_del(labels, Cow::Borrowed(&cfg.target_label), Cow::Owned(upper));
+            if cfg
+                .name_validation_scheme
+                .is_valid_label_name(&cfg.target_label)
+            {
+                let upper = val.to_uppercase();
+                set_or_del(labels, Cow::Borrowed(&cfg.target_label), Cow::Owned(upper));
+            }
         }
         Action::HashMod => {
-            if cfg.modulus > 0 {
+            if cfg.modulus > 0
+                && cfg
+                    .name_validation_scheme
+                    .is_valid_label_name(&cfg.target_label)
+            {
                 let digest = md5_sum(val.as_bytes());
                 // Prometheus uses the last 8 bytes of the 16-byte MD5 digest as big-endian u64.
                 let low = u64::from_be_bytes([
@@ -623,7 +637,9 @@ fn apply_single(cfg: &Config, labels: &mut LabelSet, val: &mut String) -> bool {
             for (name, value) in labels.iter() {
                 if let Some(caps) = cfg.regex.compiled.captures(name) {
                     let res = expand_template(&cfg.replacement, &caps);
-                    mapped.push((res.into_owned(), value.clone()));
+                    if cfg.name_validation_scheme.is_valid_label_name(&res) {
+                        mapped.push((res.into_owned(), value.clone()));
+                    }
                 }
             }
             for (res, value) in mapped {
