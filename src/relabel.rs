@@ -573,11 +573,16 @@ fn apply_single(cfg: &Config, labels: &mut LabelSet, val: &mut String) -> bool {
                 && !var_in_regex_template(&cfg.target_label)
                 && !var_in_regex_template(&cfg.replacement)
             {
-                set_or_del(
-                    labels,
-                    Cow::Borrowed(&cfg.target_label),
-                    Cow::Borrowed(&cfg.replacement),
-                );
+                if cfg
+                    .name_validation_scheme
+                    .is_valid_label_name(&cfg.target_label)
+                {
+                    set_or_del(
+                        labels,
+                        Cow::Borrowed(&cfg.target_label),
+                        Cow::Borrowed(&cfg.replacement),
+                    );
+                }
                 return true;
             }
 
@@ -815,7 +820,7 @@ pub fn populate_discovered_labels(
         }
     }
     for (k, v) in group_labels {
-        if !v.is_empty() && !out.contains_key(k) {
+        if !v.is_empty() && !target.contains_key(k) {
             out.insert(k.clone(), v.clone());
         }
     }
