@@ -726,7 +726,7 @@ fn kubernetes_relabel_pipeline_and_serde_roundtrip() {
 
     let populated = populate_labels(&discovered_target, &BTreeMap::new(), &pop_cfg, &cfgs)
         .unwrap()
-        .expect("target should be kept (10.132.183.40:80 hashmod 3 == 0)");
+        .expect("target should be kept (10.132.183.40:80 hashmod 3 == 1)");
     assert_eq!(
         populated.public_labels(),
         label_set(&[
@@ -741,6 +741,30 @@ fn kubernetes_relabel_pipeline_and_serde_roundtrip() {
             ("pod", "promtail-loki-boltdb-shipper-jgtr7"),
         ])
     );
+
+    // Verify JSON round-trip preserves configs and validation (including KeepEqual default regex).
+    let serialized = serde_json::to_string(&cfgs).unwrap();
+    let mut roundtripped: Vec<Config> = serde_json::from_str(&serialized).unwrap();
+    for cfg in &mut roundtripped {
+        cfg.validate(ValidationScheme::Utf8).unwrap();
+    }
+    assert_eq!(roundtripped, cfgs);
+
+    let keepequal_cfg = Config {
+        source_labels: strs(&["a"]),
+        target_label: "b".to_owned(),
+        action: Action::KeepEqual,
+        ..Config::default()
+    };
+    let keepequal_json = serde_json::to_string(&keepequal_cfg).unwrap();
+    assert!(!keepequal_json.contains("\"regex\""));
+    let mut roundtripped_keepequal: Config = serde_json::from_str(&keepequal_json).unwrap();
+    roundtripped_keepequal
+        .validate(ValidationScheme::Utf8)
+        .unwrap();
+
+    // Explicit empty string `"action": ""` must fail deserialization like Go Action.UnmarshalYAML.
+    assert!(serde_json::from_str::<Config>(r#"{"action": ""}"#).is_err());
 }
 
 #[test]
@@ -772,11 +796,17 @@ fn populate_labels_and_honor_labels_merging_match_prometheus() {
         Some(&"prom.local".to_owned())
     );
 
+    // An explicit empty value in `target` prevents `group_labels` from populating that key.
+    let target_with_empty = label_set(&[("__address__", "127.0.0.1:9090"), ("env", "")]);
+    let discovered_empty = populate_discovered_labels(&target_with_empty, &group_labels, &pop_cfg);
+    assert!(!discovered_empty.contains_key("env"));
+
     let populated = populate_labels(&target, &group_labels, &pop_cfg, &[])
         .unwrap()
         .unwrap();
-    // `__meta_*` is stripped and `instance` defaults to `__address__`.
+    // `__meta_*` is stripped from `labels`, retained in `discovered_labels`, and `instance` defaults to `__address__`.
     assert!(!populated.labels.contains_key("__meta_dns_name"));
+    assert!(populated.discovered_labels.contains_key("__meta_dns_name"));
     assert_eq!(
         populated.labels.get("instance"),
         Some(&"127.0.0.1:9090".to_owned())
@@ -790,6 +820,19 @@ fn populate_labels_and_honor_labels_merging_match_prometheus() {
             ("team", "obs"),
         ])
     );
+
+    // Dropped target returns Ok(None); missing or '/' address returns Err(TargetError).
+    let drop_all = [Config {
+        action: Action::Drop,
+        ..Config::default()
+    }];
+    assert_eq!(
+        populate_labels(&target, &group_labels, &pop_cfg, &drop_all).unwrap(),
+        None
+    );
+    assert!(populate_labels(&LabelSet::new(), &group_labels, &pop_cfg, &[]).is_err());
+    let slash_addr = label_set(&[("__address__", "127.0.0.1:9090/metrics")]);
+    assert!(populate_labels(&slash_addr, &group_labels, &pop_cfg, &[]).is_err());
 
     // honor_labels = false: conflicting sample labels are renamed to `exported_<name>`.
     let mut sample_labels = label_set(&[
@@ -811,8 +854,22 @@ fn populate_labels_and_honor_labels_merging_match_prometheus() {
         ])
     );
 
-    // honor_labels = true: existing sample labels win over target labels.
-    let mut honored_labels = label_set(&[("job", "sample-job"), ("method", "GET")]);
+    // Multi-collision exported_ prefix ordering from Prometheus TestScrapeLoopAppendForConflictingPrefixedLabels.
+    let target_colliding = label_set(&[("foo", "3"), ("exported_foo", "4")]);
+    let mut metric_colliding = label_set(&[("foo", "1"), ("exported_foo", "2"), ("empty", "")]);
+    merge_target_and_metric_labels(&mut metric_colliding, &target_colliding, false);
+    assert_eq!(
+        metric_colliding,
+        label_set(&[
+            ("exported_exported_exported_foo", "2"),
+            ("exported_exported_foo", "1"),
+            ("exported_foo", "4"),
+            ("foo", "3"),
+        ])
+    );
+
+    // honor_labels = true: existing sample labels win over target labels, while empty sample labels are stripped.
+    let mut honored_labels = label_set(&[("job", "sample-job"), ("env", ""), ("method", "GET")]);
     merge_target_and_metric_labels(&mut honored_labels, &populated.labels, true);
     assert_eq!(
         honored_labels,
@@ -824,4 +881,73 @@ fn populate_labels_and_honor_labels_merging_match_prometheus() {
             ("team", "obs"),
         ])
     );
+}
+
+#[test]
+fn deserialized_legacy_validation_and_template_expansion_edge_cases() {
+    // Deserialized and default-constructed configs inherit `ValidationScheme::Legacy` in `validate`.
+    let mut deserialized_replace: Config =
+        serde_json::from_str(r#"{"target_label": "utf8.label", "replacement": "v"}"#).unwrap();
+    assert!(
+        deserialized_replace
+            .validate(ValidationScheme::Legacy)
+            .is_err()
+    );
+
+    let mut default_lower = Config {
+        action: Action::Lowercase,
+        target_label: "${3}".to_owned(),
+        ..Config::default()
+    };
+    assert!(default_lower.validate(ValidationScheme::Legacy).is_err());
+
+    // Go `regexp.ExpandString` edge cases: `$$`, trailing `$`, `${}`, `${a-b}`, `${foo$1}`, unclosed `${1`, and leading-zero `$01`/`${01}`.
+    let input = label_set(&[("a", "hello")]);
+    let expanded = process(
+        &input,
+        &[Config {
+            source_labels: strs(&["a"]),
+            regex: Regexp::must_new("(he)(llo)"),
+            target_label: "out".to_owned(),
+            replacement: "$$-${}-${a-b}-${foo$1}-${1-$01-${01}-$1-$2-$".to_owned(),
+            action: Action::Replace,
+            ..Config::default()
+        }],
+    )
+    .unwrap();
+    assert_eq!(
+        expanded.get("out").map(String::as_str),
+        Some("$-${}-${a-b}-${foohe}-${1---he-llo-$")
+    );
+
+    // Static `Action::Replace` fast path respects `ValidationScheme::Legacy`.
+    let untouched = process(
+        &input,
+        &[Config {
+            target_label: "invalid.legacy".to_owned(),
+            replacement: "val".to_owned(),
+            action: Action::Replace,
+            name_validation_scheme: ValidationScheme::Legacy,
+            ..Config::default()
+        }],
+    )
+    .unwrap();
+    assert!(!untouched.contains_key("invalid.legacy"));
+
+    // Multi-block MD5 inputs (55, 56, and 70 bytes) in `Action::HashMod`.
+    for len in [55usize, 56, 70] {
+        let s = "x".repeat(len);
+        let res = process(
+            &label_set(&[("in", &s)]),
+            &[Config {
+                source_labels: strs(&["in"]),
+                modulus: 1000,
+                target_label: "h".to_owned(),
+                action: Action::HashMod,
+                ..Config::default()
+            }],
+        )
+        .unwrap();
+        assert!(res.contains_key("h"));
+    }
 }

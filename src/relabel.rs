@@ -672,9 +672,9 @@ fn expand_template<'a>(template: &'a str, caps: &Captures<'_>) -> Cow<'a, str> {
     while let Some(dollar_idx) = rest.find('$') {
         out.push_str(&rest[..dollar_idx]);
         let after_dollar = &rest[dollar_idx + 1..];
-        if after_dollar.starts_with('$') {
+        if let Some(stripped) = after_dollar.strip_prefix('$') {
             out.push('$');
-            rest = &after_dollar[1..];
+            rest = stripped;
             continue;
         }
         if let Some((name, num, remaining)) = extract_template_var(after_dollar) {
@@ -937,13 +937,11 @@ pub fn merge_target_and_metric_labels(
         // names (`exported_foo`), matching Prometheus `resolveConflictingExposedLabels`.
         conflicting.sort_by_key(|(name, _)| name.len());
         for (mut name, val) in conflicting {
-            loop {
+            name.insert_str(0, EXPORTED_LABEL_PREFIX);
+            while metric_labels.contains_key(&name) {
                 name.insert_str(0, EXPORTED_LABEL_PREFIX);
-                if !metric_labels.contains_key(&name) {
-                    metric_labels.insert(name, val);
-                    break;
-                }
             }
+            metric_labels.insert(name, val);
         }
     }
 }
