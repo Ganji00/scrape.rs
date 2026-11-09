@@ -1281,7 +1281,7 @@ pub fn eval_single_label_value_transform<V: AsRef<str>>(
             }
             Action::Lowercase => {
                 if val_str.is_empty() {
-                    if in_place {
+                    if in_place && !is_present {
                         DictionaryValueTransform::KeepExisting
                     } else {
                         DictionaryValueTransform::DeleteTarget
@@ -1297,7 +1297,7 @@ pub fn eval_single_label_value_transform<V: AsRef<str>>(
             }
             Action::Uppercase => {
                 if val_str.is_empty() {
-                    if in_place {
+                    if in_place && !is_present {
                         DictionaryValueTransform::KeepExisting
                     } else {
                         DictionaryValueTransform::DeleteTarget
