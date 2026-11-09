@@ -15,13 +15,15 @@
 //! `metric_relabel_configs`), ported from Prometheus `model/relabel` and `scrape/target.go`.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::sync::OnceLock;
 
 use regex::{Captures, Regex};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+/// Reserved Prometheus label holding the metric name (`"__name__"`).
+pub const METRIC_NAME_LABEL: &str = "__name__";
 /// Reserved Prometheus label holding the `<host>:<port>` scrape target address.
 pub const ADDRESS_LABEL: &str = "__address__";
 /// Reserved Prometheus label holding the scrape HTTP scheme (`"http"` or `"https"`).
@@ -944,6 +946,380 @@ pub fn merge_target_and_metric_labels(
             metric_labels.insert(name, val);
         }
     }
+}
+
+fn is_metric_name_pushdown_filter(cfg: &Config) -> bool {
+    match cfg.action {
+        Action::Keep | Action::Drop => cfg
+            .source_labels
+            .iter()
+            .all(|label| label == METRIC_NAME_LABEL),
+        Action::KeepEqual | Action::DropEqual => {
+            cfg.target_label == METRIC_NAME_LABEL
+                && cfg
+                    .source_labels
+                    .iter()
+                    .all(|label| label == METRIC_NAME_LABEL)
+        }
+        _ => false,
+    }
+}
+
+/// Splits `cfgs` into `(name_pushdown_prefix, remaining_cfgs)` for Stage 1 family-level
+/// `__name__` filtering in Layer 1 decoders.
+///
+/// `name_pushdown_prefix` is the longest leading prefix of rules that perform [`Action::Keep`],
+/// [`Action::Drop`], [`Action::KeepEqual`], or [`Action::DropEqual`] exclusively over
+/// [`METRIC_NAME_LABEL`] (`"__name__"`). Because those rules neither read non-`__name__` sample
+/// labels nor mutate any label, callers can evaluate [`keep_metric_name`] once per contiguous
+/// metric family or series-name transition and skip float parsing, label unescaping, string
+/// interning, and histogram/summary assembly whenever a family is dropped.
+#[must_use]
+pub fn split_metric_name_pushdown(cfgs: &[Config]) -> (&[Config], &[Config]) {
+    let prefix_len = cfgs
+        .iter()
+        .take_while(|cfg| is_metric_name_pushdown_filter(cfg))
+        .count();
+    cfgs.split_at(prefix_len)
+}
+
+/// Evaluates the leading `__name__`-only filter prefix returned by
+/// [`split_metric_name_pushdown`] against `metric_name` with zero heap allocations in the standard
+/// single-`__name__` case.
+///
+/// Returns `true` if `metric_name` passes all `__name__`-only filter rules in `cfgs`, or `false`
+/// if a rule drops the metric family. Stops at the first rule in `cfgs` that is not a
+/// `__name__`-only filter.
+#[must_use]
+pub fn keep_metric_name(metric_name: &str, cfgs: &[Config]) -> bool {
+    let mut scratch = String::new();
+    for cfg in cfgs {
+        if !is_metric_name_pushdown_filter(cfg) {
+            break;
+        }
+        let val: &str = match cfg.source_labels.len() {
+            0 => "",
+            1 => metric_name,
+            _ => {
+                scratch.clear();
+                for idx in 0..cfg.source_labels.len() {
+                    if idx > 0 {
+                        scratch.push_str(&cfg.separator);
+                    }
+                    scratch.push_str(metric_name);
+                }
+                scratch.as_str()
+            }
+        };
+        match cfg.action {
+            Action::Drop => {
+                if cfg.regex.is_match(val) {
+                    return false;
+                }
+            }
+            Action::Keep => {
+                if !cfg.regex.is_match(val) {
+                    return false;
+                }
+            }
+            Action::DropEqual => {
+                if val == metric_name {
+                    return false;
+                }
+            }
+            Action::KeepEqual => {
+                if val != metric_name {
+                    return false;
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    true
+}
+
+/// Resolves `honor_labels = false` key collisions across a deduplicated key dictionary
+/// `metric_keys` against `target_labels` in `O(unique_keys)` instead of per sample.
+///
+/// When `honor_labels` is `true`, or when no entry in `metric_keys` collides with a non-reserved,
+/// non-empty label in `target_labels` (the common case), `renamed_keys` is cleared and `false` is
+/// returned with zero heap allocations.
+///
+/// When `honor_labels` is `false` and at least one key in `metric_keys` collides with a public
+/// target label, `renamed_keys` is resized to `metric_keys.len()`, populating
+/// `Some(exported_name)` for each renamed dictionary entry (resolved in ascending key-length
+/// order matching Prometheus `resolveConflictingExposedLabels`) and `None` for unchanged entries,
+/// and `true` is returned.
+pub fn resolve_conflicting_exposed_keys<K: AsRef<str>>(
+    metric_keys: &[K],
+    target_labels: &LabelSet,
+    honor_labels: bool,
+    renamed_keys: &mut Vec<Option<String>>,
+) -> bool {
+    renamed_keys.clear();
+    if honor_labels || metric_keys.is_empty() || target_labels.is_empty() {
+        return false;
+    }
+
+    let is_public_target_key = |key: &str| -> bool {
+        !key.starts_with(RESERVED_LABEL_PREFIX)
+            && target_labels.get(key).is_some_and(|v| !v.is_empty())
+    };
+
+    if !metric_keys.iter().any(|k| is_public_target_key(k.as_ref())) {
+        return false;
+    }
+
+    renamed_keys.resize(metric_keys.len(), None);
+    let mut occupied: HashSet<String> = target_labels
+        .iter()
+        .filter(|(tk, tv)| !tk.starts_with(RESERVED_LABEL_PREFIX) && !tv.is_empty())
+        .map(|(tk, _)| tk.clone())
+        .collect();
+
+    let mut conflicting: Vec<(usize, &str)> = Vec::new();
+    for (idx, key) in metric_keys.iter().enumerate() {
+        let key_str = key.as_ref();
+        if is_public_target_key(key_str) {
+            conflicting.push((idx, key_str));
+        } else {
+            occupied.insert(key_str.to_owned());
+        }
+    }
+
+    // Resolve shorter conflicting sample names (`foo`) before longer already-prefixed
+    // names (`exported_foo`), matching Prometheus `resolveConflictingExposedLabels`.
+    conflicting.sort_by_key(|&(idx, name)| (name.len(), idx));
+    for (idx, name) in conflicting {
+        let mut candidate = String::with_capacity(EXPORTED_LABEL_PREFIX.len() + name.len());
+        candidate.push_str(EXPORTED_LABEL_PREFIX);
+        candidate.push_str(name);
+        while occupied.contains(&candidate) {
+            candidate.insert_str(0, EXPORTED_LABEL_PREFIX);
+        }
+        occupied.insert(candidate.clone());
+        renamed_keys[idx] = Some(candidate);
+    }
+
+    true
+}
+
+/// Evaluates a [`Action::LabelDrop`] or [`Action::LabelKeep`] rule once per unique key in
+/// `metric_keys`, writing per-key retention decisions into `keep_mask` (`true` to retain the key,
+/// `false` to drop it) and returning the number of dropped keys.
+///
+/// Returns `None` if `cfg.action` is neither [`Action::LabelDrop`] nor [`Action::LabelKeep`].
+pub fn eval_key_keep_mask<K: AsRef<str>>(
+    metric_keys: &[K],
+    cfg: &Config,
+    keep_mask: &mut Vec<bool>,
+) -> Option<usize> {
+    if !matches!(cfg.action, Action::LabelDrop | Action::LabelKeep) {
+        return None;
+    }
+    keep_mask.clear();
+    keep_mask.reserve(metric_keys.len());
+    let mut dropped = 0usize;
+    for key in metric_keys {
+        let keep = match cfg.action {
+            Action::LabelDrop => !cfg.regex.is_match(key.as_ref()),
+            Action::LabelKeep => cfg.regex.is_match(key.as_ref()),
+            _ => unreachable!(),
+        };
+        if !keep {
+            dropped += 1;
+        }
+        keep_mask.push(keep);
+    }
+    Some(dropped)
+}
+
+/// Summary of evaluating a single-source-label [`Action::Keep`] or [`Action::Drop`] rule across a
+/// deduplicated value dictionary via [`eval_single_label_keep_mask`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SingleLabelFilterSummary {
+    /// Whether a series that omits `source_labels[0]` (empty source value `""`) is kept.
+    pub keep_when_absent: bool,
+    /// Number of unique entries in `metric_values` that are kept (`keep_val_mask[val_id] == true`).
+    pub kept_values: usize,
+}
+
+/// Evaluates a single-source-label (`source_labels.len() == 1`) [`Action::Keep`] or
+/// [`Action::Drop`] rule once per unique value in `metric_values`, writing per-value keep
+/// decisions into `keep_val_mask`.
+///
+/// Returns `None` if `cfg.source_labels.len() != 1` or `cfg.action` is neither [`Action::Keep`]
+/// nor [`Action::Drop`].
+pub fn eval_single_label_keep_mask<V: AsRef<str>>(
+    metric_values: &[V],
+    cfg: &Config,
+    keep_val_mask: &mut Vec<bool>,
+) -> Option<SingleLabelFilterSummary> {
+    if cfg.source_labels.len() != 1 || !matches!(cfg.action, Action::Keep | Action::Drop) {
+        return None;
+    }
+    let eval_keep = |val: &str| match cfg.action {
+        Action::Keep => cfg.regex.is_match(val),
+        Action::Drop => !cfg.regex.is_match(val),
+        _ => unreachable!(),
+    };
+
+    let keep_when_absent = eval_keep("");
+    keep_val_mask.clear();
+    keep_val_mask.reserve(metric_values.len());
+    let mut kept_values = 0usize;
+    for val in metric_values {
+        let keep = eval_keep(val.as_ref());
+        if keep {
+            kept_values += 1;
+        }
+        keep_val_mask.push(keep);
+    }
+    Some(SingleLabelFilterSummary {
+        keep_when_absent,
+        kept_values,
+    })
+}
+
+/// Effect on `cfg.target_label` produced by a single-source-label value transformation rule for
+/// one dictionary entry in [`eval_single_label_value_transform`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DictionaryValueTransform {
+    /// `cfg.target_label` is left as-is on the series (either the regex did not match, the target
+    /// label name is invalid under the active validation scheme, or an in-place transformation
+    /// produced the same value as the input).
+    KeepExisting,
+    /// `cfg.target_label` must be removed from the series because the replacement expanded to
+    /// `""`.
+    DeleteTarget,
+    /// `cfg.target_label` must be set to this non-empty string value.
+    SetTarget(String),
+}
+
+/// Evaluates a single-source-label (`source_labels.len() == 1`) value transformation rule
+/// ([`Action::Replace`], [`Action::Lowercase`], [`Action::Uppercase`], or [`Action::HashMod`])
+/// with a static `target_label` (`!target_label.contains('$')`) once per unique value in
+/// `metric_values`.
+///
+/// Populates `transforms` with one [`DictionaryValueTransform`] per entry in `metric_values` and
+/// returns `Some(when_absent)` describing the effect on `cfg.target_label` when a series omits
+/// `source_labels[0]` (empty source value `""`). Returns `None` if `cfg` is not a
+/// single-source-label static-target value transformation.
+pub fn eval_single_label_value_transform<V: AsRef<str>>(
+    metric_values: &[V],
+    cfg: &Config,
+    transforms: &mut Vec<DictionaryValueTransform>,
+) -> Option<DictionaryValueTransform> {
+    if cfg.source_labels.len() != 1
+        || !matches!(
+            cfg.action,
+            Action::Replace | Action::Lowercase | Action::Uppercase | Action::HashMod
+        )
+        || var_in_regex_template(&cfg.target_label)
+    {
+        return None;
+    }
+
+    let in_place = cfg.target_label == cfg.source_labels[0];
+    let target_valid = cfg
+        .name_validation_scheme
+        .is_valid_label_name(&cfg.target_label);
+
+    let eval_one = |val_str: &str, is_present: bool| -> DictionaryValueTransform {
+        if !target_valid {
+            return DictionaryValueTransform::KeepExisting;
+        }
+        match cfg.action {
+            Action::Replace => {
+                if val_str.is_empty()
+                    && cfg.regex.is_default()
+                    && !var_in_regex_template(&cfg.replacement)
+                {
+                    return if cfg.replacement.is_empty() {
+                        if in_place && !is_present {
+                            DictionaryValueTransform::KeepExisting
+                        } else {
+                            DictionaryValueTransform::DeleteTarget
+                        }
+                    } else {
+                        DictionaryValueTransform::SetTarget(cfg.replacement.clone())
+                    };
+                }
+                let Some(caps) = cfg.regex.compiled.captures(val_str) else {
+                    return DictionaryValueTransform::KeepExisting;
+                };
+                let res = expand_template(&cfg.replacement, &caps);
+                if res.is_empty() {
+                    if in_place && !is_present {
+                        DictionaryValueTransform::KeepExisting
+                    } else {
+                        DictionaryValueTransform::DeleteTarget
+                    }
+                } else if in_place && is_present && res.as_ref() == val_str {
+                    DictionaryValueTransform::KeepExisting
+                } else {
+                    DictionaryValueTransform::SetTarget(res.into_owned())
+                }
+            }
+            Action::Lowercase => {
+                if val_str.is_empty() {
+                    if in_place {
+                        DictionaryValueTransform::KeepExisting
+                    } else {
+                        DictionaryValueTransform::DeleteTarget
+                    }
+                } else {
+                    let lower = val_str.to_lowercase();
+                    if in_place && is_present && lower == val_str {
+                        DictionaryValueTransform::KeepExisting
+                    } else {
+                        DictionaryValueTransform::SetTarget(lower)
+                    }
+                }
+            }
+            Action::Uppercase => {
+                if val_str.is_empty() {
+                    if in_place {
+                        DictionaryValueTransform::KeepExisting
+                    } else {
+                        DictionaryValueTransform::DeleteTarget
+                    }
+                } else {
+                    let upper = val_str.to_uppercase();
+                    if in_place && is_present && upper == val_str {
+                        DictionaryValueTransform::KeepExisting
+                    } else {
+                        DictionaryValueTransform::SetTarget(upper)
+                    }
+                }
+            }
+            Action::HashMod => {
+                if cfg.modulus == 0 {
+                    return DictionaryValueTransform::KeepExisting;
+                }
+                let digest = md5_sum(val_str.as_bytes());
+                let low = u64::from_be_bytes([
+                    digest[8], digest[9], digest[10], digest[11], digest[12], digest[13],
+                    digest[14], digest[15],
+                ]);
+                let modulo = (low % cfg.modulus).to_string();
+                if in_place && is_present && modulo == val_str {
+                    DictionaryValueTransform::KeepExisting
+                } else {
+                    DictionaryValueTransform::SetTarget(modulo)
+                }
+            }
+            _ => unreachable!(),
+        }
+    };
+
+    let when_absent = eval_one("", false);
+    transforms.clear();
+    transforms.reserve(metric_values.len());
+    for val in metric_values {
+        transforms.push(eval_one(val.as_ref(), true));
+    }
+    Some(when_absent)
 }
 
 /// Pure-Rust RFC 1321 MD5 implementation used by [`Action::HashMod`].

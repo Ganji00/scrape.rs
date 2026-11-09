@@ -19,9 +19,11 @@
 use std::collections::BTreeMap;
 
 use expfmt::relabel::{
-    Action, Config, DEFAULT_REPLACEMENT, LabelSet, Regexp, TargetPopulateConfig, ValidationScheme,
-    is_valid_legacy_target_label, merge_target_and_metric_labels, populate_discovered_labels,
-    populate_labels, process,
+    Action, Config, DEFAULT_REPLACEMENT, DictionaryValueTransform, LabelSet, METRIC_NAME_LABEL,
+    Regexp, SingleLabelFilterSummary, TargetPopulateConfig, ValidationScheme, eval_key_keep_mask,
+    eval_single_label_keep_mask, eval_single_label_value_transform, is_valid_legacy_target_label,
+    keep_metric_name, merge_target_and_metric_labels, populate_discovered_labels, populate_labels,
+    process, resolve_conflicting_exposed_keys, split_metric_name_pushdown,
 };
 
 fn label_set(pairs: &[(&str, &str)]) -> LabelSet {
@@ -949,5 +951,268 @@ fn deserialized_legacy_validation_and_template_expansion_edge_cases() {
         )
         .unwrap();
         assert!(res.contains_key("h"));
+    }
+}
+
+#[test]
+fn stage1_metric_name_pushdown_splits_and_filters_families() {
+    let cfgs = [
+        Config {
+            source_labels: strs(&[METRIC_NAME_LABEL]),
+            regex: Regexp::must_new("(http|rpc)_.*"),
+            action: Action::Keep,
+            ..Config::default()
+        },
+        Config {
+            source_labels: strs(&[METRIC_NAME_LABEL]),
+            regex: Regexp::must_new(".*_bucket"),
+            action: Action::Drop,
+            ..Config::default()
+        },
+        Config {
+            source_labels: strs(&["env"]),
+            regex: Regexp::must_new("prod"),
+            action: Action::Keep,
+            ..Config::default()
+        },
+        Config {
+            source_labels: strs(&[METRIC_NAME_LABEL]),
+            regex: Regexp::must_new("rpc_debug_.*"),
+            action: Action::Drop,
+            ..Config::default()
+        },
+    ];
+
+    let (pushdown, remaining) = split_metric_name_pushdown(&cfgs);
+    assert_eq!(pushdown.len(), 2);
+    assert_eq!(remaining.len(), 2);
+
+    assert!(keep_metric_name("http_requests_total", pushdown));
+    assert!(keep_metric_name("rpc_duration_seconds_sum", pushdown));
+    assert!(!keep_metric_name("go_gc_duration_seconds", pushdown));
+    assert!(!keep_metric_name("http_request_duration_bucket", pushdown));
+
+    // Multi-`__name__` join with custom separator and `KeepEqual` / `DropEqual`.
+    let multi_name_cfgs = [
+        Config {
+            source_labels: strs(&[METRIC_NAME_LABEL, METRIC_NAME_LABEL]),
+            separator: ":".to_owned(),
+            regex: Regexp::must_new("up:up"),
+            action: Action::Keep,
+            ..Config::default()
+        },
+        Config {
+            source_labels: strs(&[METRIC_NAME_LABEL]),
+            target_label: METRIC_NAME_LABEL.to_owned(),
+            action: Action::KeepEqual,
+            ..Config::default()
+        },
+    ];
+    let (multi_pushdown, multi_rem) = split_metric_name_pushdown(&multi_name_cfgs);
+    assert_eq!(multi_pushdown.len(), 2);
+    assert!(multi_rem.is_empty());
+    assert!(keep_metric_name("up", multi_pushdown));
+    assert!(!keep_metric_name("down", multi_pushdown));
+}
+
+#[test]
+fn stage2_dictionary_vectorized_honor_labels_and_attribute_transforms() {
+    let target_labels = label_set(&[
+        ("__address__", "10.0.0.1:9090"),
+        ("job", "api"),
+        ("instance", "10.0.0.1:9090"),
+        ("foo", "target-foo"),
+        ("exported_foo", "target-exported-foo"),
+    ]);
+
+    // 1. Fast path: no metric key collides with public target labels.
+    let mut renamed = Vec::new();
+    let clean_keys = ["method", "status", "le"];
+    assert!(!resolve_conflicting_exposed_keys(
+        &clean_keys,
+        &target_labels,
+        false,
+        &mut renamed,
+    ));
+    assert!(renamed.is_empty());
+
+    // 2. honor_labels = true: never renames metric keys even on collision.
+    let colliding_keys = ["foo", "exported_foo", "job", "method"];
+    assert!(!resolve_conflicting_exposed_keys(
+        &colliding_keys,
+        &target_labels,
+        true,
+        &mut renamed,
+    ));
+    assert!(renamed.is_empty());
+
+    // 3. honor_labels = false: resolves collisions in ascending key-length order across the key dictionary.
+    assert!(resolve_conflicting_exposed_keys(
+        &colliding_keys,
+        &target_labels,
+        false,
+        &mut renamed,
+    ));
+    assert_eq!(
+        renamed,
+        vec![
+            Some("exported_exported_foo".to_owned()),
+            Some("exported_exported_exported_foo".to_owned()),
+            Some("exported_job".to_owned()),
+            None,
+        ]
+    );
+
+    // 4. Dictionary `LabelDrop` and `LabelKeep`.
+    let dict_keys = ["__name__", "env", "ephemeral_id", "ephemeral_pod", "job"];
+    let mut key_mask = Vec::new();
+    let drop_cfg = Config {
+        regex: Regexp::must_new("ephemeral_.*"),
+        action: Action::LabelDrop,
+        ..Config::default()
+    };
+    assert_eq!(
+        eval_key_keep_mask(&dict_keys, &drop_cfg, &mut key_mask),
+        Some(2)
+    );
+    assert_eq!(key_mask, vec![true, true, false, false, true]);
+
+    let keep_cfg = Config {
+        regex: Regexp::must_new("__name__|env|job"),
+        action: Action::LabelKeep,
+        ..Config::default()
+    };
+    assert_eq!(
+        eval_key_keep_mask(&dict_keys, &keep_cfg, &mut key_mask),
+        Some(2)
+    );
+    assert_eq!(key_mask, vec![true, true, false, false, true]);
+
+    // 5. Dictionary single-label `Keep` and `Drop`.
+    let dict_vals = ["prod", "staging", "dev"];
+    let mut val_mask = Vec::new();
+    let keep_env = Config {
+        source_labels: strs(&["env"]),
+        regex: Regexp::must_new("prod|staging"),
+        action: Action::Keep,
+        ..Config::default()
+    };
+    assert_eq!(
+        eval_single_label_keep_mask(&dict_vals, &keep_env, &mut val_mask),
+        Some(SingleLabelFilterSummary {
+            keep_when_absent: false,
+            kept_values: 2,
+        })
+    );
+    assert_eq!(val_mask, vec![true, true, false]);
+
+    let drop_dev = Config {
+        source_labels: strs(&["env"]),
+        regex: Regexp::must_new("dev"),
+        action: Action::Drop,
+        ..Config::default()
+    };
+    assert_eq!(
+        eval_single_label_keep_mask(&dict_vals, &drop_dev, &mut val_mask),
+        Some(SingleLabelFilterSummary {
+            keep_when_absent: true,
+            kept_values: 2,
+        })
+    );
+    assert_eq!(val_mask, vec![true, true, false]);
+
+    // 6. Dictionary single-label value transformations (`Lowercase`, `Replace`, `HashMod`).
+    let mut transforms = Vec::new();
+    let lower_cfg = Config {
+        source_labels: strs(&["env"]),
+        target_label: "env".to_owned(),
+        action: Action::Lowercase,
+        ..Config::default()
+    };
+    let absent = eval_single_label_value_transform(
+        &["prod", "PROD", "Staging"],
+        &lower_cfg,
+        &mut transforms,
+    )
+    .unwrap();
+    assert_eq!(absent, DictionaryValueTransform::KeepExisting);
+    assert_eq!(
+        transforms,
+        vec![
+            DictionaryValueTransform::KeepExisting,
+            DictionaryValueTransform::SetTarget("prod".to_owned()),
+            DictionaryValueTransform::SetTarget("staging".to_owned()),
+        ]
+    );
+
+    let replace_cfg = Config {
+        source_labels: strs(&["pod"]),
+        regex: Regexp::must_new("([a-z]+)-[0-9a-f]+"),
+        target_label: "app".to_owned(),
+        replacement: "$1".to_owned(),
+        action: Action::Replace,
+        ..Config::default()
+    };
+    let absent_replace = eval_single_label_value_transform(
+        &["api-7f8b", "worker-12ab", "unmatched"],
+        &replace_cfg,
+        &mut transforms,
+    )
+    .unwrap();
+    assert_eq!(absent_replace, DictionaryValueTransform::KeepExisting);
+    assert_eq!(
+        transforms,
+        vec![
+            DictionaryValueTransform::SetTarget("api".to_owned()),
+            DictionaryValueTransform::SetTarget("worker".to_owned()),
+            DictionaryValueTransform::KeepExisting,
+        ]
+    );
+
+    // 7. End-to-end equivalence: Stage 1 `__name__` pushdown + Stage 2 dictionary transforms vs per-sample `process`.
+    let pipeline_cfgs = [
+        Config {
+            source_labels: strs(&[METRIC_NAME_LABEL]),
+            regex: Regexp::must_new("http_.*"),
+            action: Action::Keep,
+            ..Config::default()
+        },
+        Config {
+            regex: Regexp::must_new("debug_.*"),
+            action: Action::LabelDrop,
+            ..Config::default()
+        },
+        Config {
+            source_labels: strs(&["env"]),
+            target_label: "env".to_owned(),
+            action: Action::Lowercase,
+            ..Config::default()
+        },
+    ];
+    let (stage1, stage2) = split_metric_name_pushdown(&pipeline_cfgs);
+    assert_eq!(stage1.len(), 1);
+    assert_eq!(stage2.len(), 2);
+
+    let samples = [
+        label_set(&[
+            ("__name__", "http_requests_total"),
+            ("env", "PROD"),
+            ("debug_trace", "xyz"),
+        ]),
+        label_set(&[
+            ("__name__", "go_goroutines"),
+            ("env", "DEV"),
+            ("debug_trace", "abc"),
+        ]),
+    ];
+    for sample in &samples {
+        let oracle = process(sample, &pipeline_cfgs);
+        let name = sample.get(METRIC_NAME_LABEL).unwrap();
+        let staged = if keep_metric_name(name, stage1) {
+            process(sample, stage2)
+        } else {
+            None
+        };
+        assert_eq!(staged, oracle);
     }
 }
