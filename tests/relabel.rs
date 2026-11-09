@@ -544,6 +544,66 @@ fn relabel_validate_matches_prometheus() {
             .to_string(),
         "labeldrop action requires only 'regex', and no other fields"
     );
+
+    let mut hashmod_zero = Config {
+        source_labels: strs(&["a"]),
+        target_label: "b".to_owned(),
+        action: Action::HashMod,
+        modulus: 0,
+        ..Config::default()
+    };
+    assert_eq!(
+        hashmod_zero
+            .validate(ValidationScheme::Utf8)
+            .unwrap_err()
+            .to_string(),
+        "relabel configuration for hashmod requires non-zero modulus"
+    );
+
+    let mut lower_with_replacement = Config {
+        source_labels: strs(&["a"]),
+        target_label: "b".to_owned(),
+        replacement: "custom".to_owned(),
+        action: Action::Lowercase,
+        ..Config::default()
+    };
+    assert_eq!(
+        lower_with_replacement
+            .validate(ValidationScheme::Utf8)
+            .unwrap_err()
+            .to_string(),
+        "'replacement' can not be set for lowercase action"
+    );
+
+    let mut bad_legacy_labelmap = Config {
+        action: Action::LabelMap,
+        replacement: "-bad-$1".to_owned(),
+        name_validation_scheme: ValidationScheme::Legacy,
+        ..Config::default()
+    };
+    assert_eq!(
+        bad_legacy_labelmap
+            .validate(ValidationScheme::Legacy)
+            .unwrap_err()
+            .to_string(),
+        "\"-bad-$1\" is invalid 'replacement' for labelmap action"
+    );
+
+    let mut bad_legacy_hashmod = Config {
+        source_labels: strs(&["a"]),
+        target_label: "bad.target".to_owned(),
+        modulus: 4,
+        action: Action::HashMod,
+        name_validation_scheme: ValidationScheme::Legacy,
+        ..Config::default()
+    };
+    assert_eq!(
+        bad_legacy_hashmod
+            .validate(ValidationScheme::Legacy)
+            .unwrap_err()
+            .to_string(),
+        "\"bad.target\" is invalid 'target_label' for hashmod action"
+    );
 }
 
 #[test]
