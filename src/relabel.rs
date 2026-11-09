@@ -285,6 +285,10 @@ impl Regexp {
     pub fn is_default(&self) -> bool {
         self.raw == DEFAULT_REGEX_PATTERN
     }
+
+    const fn is_unmodified_default(&self) -> bool {
+        self.is_default_pattern
+    }
 }
 
 impl Serialize for Regexp {
@@ -329,7 +333,10 @@ pub struct Config {
     pub separator: String,
     /// Anchored regular expression against which the concatenated value is matched
     /// (defaults to `"(.*)"`).
-    #[serde(default = "Regexp::default_regexp")]
+    #[serde(
+        default = "Regexp::default_regexp",
+        skip_serializing_if = "Regexp::is_unmodified_default"
+    )]
     pub regex: Regexp,
     /// Modulus to take of the MD5 hash of the concatenated source label values (`hashmod`).
     #[serde(default, skip_serializing_if = "is_zero_u64")]
