@@ -562,6 +562,22 @@ fn var_in_regex_template(template: &str) -> bool {
     template.contains('$')
 }
 
+/// Returns the replacement slice without running regex captures when `cfg.regex` is the default
+/// `(.*)` pattern (where `$0` and `$1` always equal `val`) and `cfg.replacement` is either static
+/// or a direct `$0`/`$1` capture reference.
+fn direct_replacement<'a>(cfg: &'a Config, val: &'a str) -> Option<&'a str> {
+    if !cfg.regex.is_default() {
+        return None;
+    }
+    if !var_in_regex_template(&cfg.replacement) {
+        Some(cfg.replacement.as_str())
+    } else if matches!(cfg.replacement.as_str(), "$1" | "${1}" | "$0" | "${0}") {
+        Some(val)
+    } else {
+        None
+    }
+}
+
 /// Applies a slice of relabel [`Config`] rules in order to a cloned [`LabelSet`].
 ///
 /// Returns `Some(labels)` if the target/sample is kept, or `None` if a rule drops it.
@@ -631,25 +647,16 @@ fn apply_single(cfg: &Config, labels: &mut LabelSet, val: &mut String) -> bool {
             }
         }
         Action::Replace => {
-            // Fast path when `regex` is the default `(.*)` (which matches all strings with
-            // `$0 == $1 == val`) and `target_label` is static: skip regex capture allocation.
-            if cfg.regex.is_default() && !var_in_regex_template(&cfg.target_label) {
-                let direct_replacement = if !var_in_regex_template(&cfg.replacement) {
-                    Some(Cow::Borrowed(cfg.replacement.as_str()))
-                } else if matches!(cfg.replacement.as_str(), "$1" | "${1}" | "$0" | "${0}") {
-                    Some(Cow::Borrowed(val.as_str()))
-                } else {
-                    None
-                };
-                if let Some(res) = direct_replacement {
-                    if cfg
-                        .name_validation_scheme
-                        .is_valid_label_name(&cfg.target_label)
-                    {
-                        set_or_del(labels, Cow::Borrowed(&cfg.target_label), res);
-                    }
-                    return true;
+            if !var_in_regex_template(&cfg.target_label)
+                && let Some(res) = direct_replacement(cfg, val)
+            {
+                if cfg
+                    .name_validation_scheme
+                    .is_valid_label_name(&cfg.target_label)
+                {
+                    set_or_del(labels, Cow::Borrowed(&cfg.target_label), Cow::Borrowed(res));
                 }
+                return true;
             }
 
             let Some(caps) = cfg.regex.compiled.captures(val) else {
@@ -1449,27 +1456,18 @@ pub fn eval_single_label_value_transform<V: AsRef<str>>(
         }
         match cfg.action {
             Action::Replace => {
-                if cfg.regex.is_default() {
-                    let direct_replacement = if !var_in_regex_template(&cfg.replacement) {
-                        Some(cfg.replacement.as_str())
-                    } else if matches!(cfg.replacement.as_str(), "$1" | "${1}" | "$0" | "${0}") {
-                        Some(val_str)
-                    } else {
-                        None
-                    };
-                    if let Some(res) = direct_replacement {
-                        return if res.is_empty() {
-                            if in_place && !is_present {
-                                DictionaryValueTransform::KeepExisting
-                            } else {
-                                DictionaryValueTransform::DeleteTarget
-                            }
-                        } else if in_place && is_present && res == val_str {
+                if let Some(res) = direct_replacement(cfg, val_str) {
+                    return if res.is_empty() {
+                        if in_place && !is_present {
                             DictionaryValueTransform::KeepExisting
                         } else {
-                            DictionaryValueTransform::SetTarget(res.to_owned())
-                        };
-                    }
+                            DictionaryValueTransform::DeleteTarget
+                        }
+                    } else if in_place && is_present && res == val_str {
+                        DictionaryValueTransform::KeepExisting
+                    } else {
+                        DictionaryValueTransform::SetTarget(res.to_owned())
+                    };
                 }
                 let Some(caps) = cfg.regex.compiled.captures(val_str) else {
                     return DictionaryValueTransform::KeepExisting;
