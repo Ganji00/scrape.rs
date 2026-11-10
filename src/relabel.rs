@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::sync::OnceLock;
 
-use regex::{Captures, Regex};
+use regex::{CaptureLocations, Regex};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Reserved Prometheus label holding the metric name (`"__name__"`).
@@ -218,6 +218,7 @@ pub fn is_valid_legacy_target_label(target: &str) -> bool {
 pub struct Regexp {
     raw: String,
     compiled: Regex,
+    named_groups: Box<[(Box<str>, usize)]>,
     is_implicit_default: bool,
 }
 
@@ -244,9 +245,15 @@ impl Regexp {
         let anchored = format!("^(?s:{normalized})$");
         let compiled =
             Regex::new(&anchored).map_err(|e| RelabelError::InvalidRegex(e.to_string()))?;
+        let named_groups = compiled
+            .capture_names()
+            .enumerate()
+            .filter_map(|(idx, name)| name.map(|n| (n.into(), idx)))
+            .collect();
         Ok(Self {
             raw: pattern.to_owned(),
             compiled,
+            named_groups,
             is_implicit_default: false,
         })
     }
@@ -600,15 +607,30 @@ pub fn process_in_place(labels: &mut LabelSet, cfgs: &[Config]) -> bool {
     labels.retain(|_, v| !v.is_empty());
 
     let mut val_buf = String::new();
-    for cfg in cfgs {
-        if !apply_single(cfg, labels, &mut val_buf) {
+    let mut rule_locs: Vec<Option<CaptureLocations>> = Vec::new();
+    for (rule_idx, cfg) in cfgs.iter().enumerate() {
+        if !apply_single(
+            cfg,
+            rule_idx,
+            cfgs.len(),
+            labels,
+            &mut val_buf,
+            &mut rule_locs,
+        ) {
             return false;
         }
     }
     true
 }
 
-fn apply_single(cfg: &Config, labels: &mut LabelSet, val: &mut String) -> bool {
+fn apply_single(
+    cfg: &Config,
+    rule_idx: usize,
+    total_rules: usize,
+    labels: &mut LabelSet,
+    val: &mut String,
+    rule_locs: &mut Vec<Option<CaptureLocations>>,
+) -> bool {
     val.clear();
     for (idx, ln) in cfg.source_labels.iter().enumerate() {
         if idx > 0 {
@@ -659,14 +681,19 @@ fn apply_single(cfg: &Config, labels: &mut LabelSet, val: &mut String) -> bool {
                 return true;
             }
 
-            let Some(caps) = cfg.regex.compiled.captures(val) else {
+            if rule_locs.is_empty() {
+                rule_locs.resize_with(total_rules, || None);
+            }
+            let locs =
+                rule_locs[rule_idx].get_or_insert_with(|| cfg.regex.compiled.capture_locations());
+            if cfg.regex.compiled.captures_read(locs, val).is_none() {
                 return true;
-            };
-            let target = expand_template(&cfg.target_label, &caps);
+            }
+            let target = expand_template(&cfg.target_label, val, locs, &cfg.regex.named_groups);
             if !cfg.name_validation_scheme.is_valid_label_name(&target) {
                 return true;
             }
-            let res = expand_template(&cfg.replacement, &caps);
+            let res = expand_template(&cfg.replacement, val, locs, &cfg.regex.named_groups);
             set_or_del(labels, target, res);
         }
         Action::Lowercase => {
@@ -698,12 +725,18 @@ fn apply_single(cfg: &Config, labels: &mut LabelSet, val: &mut String) -> bool {
             }
         }
         Action::LabelMap => {
+            if rule_locs.is_empty() {
+                rule_locs.resize_with(total_rules, || None);
+            }
+            let locs =
+                rule_locs[rule_idx].get_or_insert_with(|| cfg.regex.compiled.capture_locations());
             let mut mapped = Vec::new();
             for (name, value) in labels.iter() {
                 if cfg.regex.is_match(name)
-                    && let Some(caps) = cfg.regex.compiled.captures(name)
+                    && cfg.regex.compiled.captures_read(locs, name).is_some()
                 {
-                    let res = expand_template(&cfg.replacement, &caps);
+                    let res =
+                        expand_template(&cfg.replacement, name, locs, &cfg.regex.named_groups);
                     if cfg.name_validation_scheme.is_valid_label_name(&res) {
                         mapped.push((res.into_owned(), value.clone()));
                     }
@@ -744,14 +777,19 @@ fn set_or_del(labels: &mut LabelSet, key: Cow<'_, str>, value: Cow<'_, str>) {
 }
 
 /// Expands Go `regexp.ExpandString`-compatible `$1`, `${1}`, `$name`, `${name}`, and `$$`
-/// references against `caps`.
-fn expand_template<'a>(template: &'a str, caps: &Captures<'a>) -> Cow<'a, str> {
+/// references against `locs` captured from `haystack`.
+fn expand_template<'a>(
+    template: &'a str,
+    haystack: &'a str,
+    locs: &CaptureLocations,
+    named_groups: &[(Box<str>, usize)],
+) -> Cow<'a, str> {
     if !template.contains('$') {
         return Cow::Borrowed(template);
     }
     if matches!(template, "$1" | "${1}" | "$0" | "${0}") {
         let idx = usize::from(matches!(template, "$1" | "${1}"));
-        return Cow::Borrowed(caps.get(idx).map_or("", |m| m.as_str()));
+        return Cow::Borrowed(locs.get(idx).map_or("", |(s, e)| &haystack[s..e]));
     }
 
     let mut out = String::with_capacity(template.len());
@@ -766,7 +804,7 @@ fn expand_template<'a>(template: &'a str, caps: &Captures<'a>) -> Cow<'a, str> {
             continue;
         }
         if let Some((name, num, remaining)) = extract_template_var(after_dollar) {
-            append_capture(&mut out, name, num, caps);
+            append_capture(&mut out, name, num, haystack, locs, named_groups);
             rest = remaining;
         } else {
             out.push('$');
@@ -846,13 +884,24 @@ fn extract_template_var(str_after_dollar: &str) -> Option<(&str, Option<usize>, 
     Some((name, num, remaining))
 }
 
-fn append_capture(out: &mut String, name: &str, num: Option<usize>, caps: &Captures<'_>) {
-    if let Some(idx) = num {
-        if let Some(m) = caps.get(idx) {
-            out.push_str(m.as_str());
-        }
-    } else if let Some(m) = caps.name(name) {
-        out.push_str(m.as_str());
+fn append_capture(
+    out: &mut String,
+    name: &str,
+    num: Option<usize>,
+    haystack: &str,
+    locs: &CaptureLocations,
+    named_groups: &[(Box<str>, usize)],
+) {
+    let group_idx = num.or_else(|| {
+        named_groups
+            .iter()
+            .find(|(n, _)| n.as_ref() == name)
+            .map(|&(_, idx)| idx)
+    });
+    if let Some(idx) = group_idx
+        && let Some((start, end)) = locs.get(idx)
+    {
+        out.push_str(&haystack[start..end]);
     }
 }
 
@@ -1449,8 +1498,10 @@ pub fn eval_single_label_value_transform<V: AsRef<str>>(
     let target_valid = cfg
         .name_validation_scheme
         .is_valid_label_name(&cfg.target_label);
+    let mut locs = (cfg.action == Action::Replace && target_valid)
+        .then(|| cfg.regex.compiled.capture_locations());
 
-    let eval_one = |val_str: &str, is_present: bool| -> DictionaryValueTransform {
+    let mut eval_one = |val_str: &str, is_present: bool| -> DictionaryValueTransform {
         if !target_valid {
             return DictionaryValueTransform::KeepExisting;
         }
@@ -1464,10 +1515,11 @@ pub fn eval_single_label_value_transform<V: AsRef<str>>(
                         is_present,
                     );
                 }
-                let Some(caps) = cfg.regex.compiled.captures(val_str) else {
+                let locs = locs.as_mut().expect("capture locations initialized");
+                if cfg.regex.compiled.captures_read(locs, val_str).is_none() {
                     return DictionaryValueTransform::KeepExisting;
-                };
-                let res = expand_template(&cfg.replacement, &caps);
+                }
+                let res = expand_template(&cfg.replacement, val_str, locs, &cfg.regex.named_groups);
                 classify_value_transform(res, val_str, in_place, is_present)
             }
             Action::Lowercase => {
