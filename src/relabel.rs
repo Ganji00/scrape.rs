@@ -732,9 +732,7 @@ fn apply_single(
                 rule_locs[rule_idx].get_or_insert_with(|| cfg.regex.compiled.capture_locations());
             let mut mapped = Vec::new();
             for (name, value) in labels.iter() {
-                if cfg.regex.is_match(name)
-                    && cfg.regex.compiled.captures_read(locs, name).is_some()
-                {
+                if cfg.regex.compiled.captures_read(locs, name).is_some() {
                     let res =
                         expand_template(&cfg.replacement, name, locs, &cfg.regex.named_groups);
                     if cfg.name_validation_scheme.is_valid_label_name(&res) {
