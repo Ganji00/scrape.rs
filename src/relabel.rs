@@ -1321,10 +1321,12 @@ pub fn keep_metric_name(metric_name: &str, cfgs: &[Config]) -> bool {
 /// When `honor_labels` is `false` and at least one key in `metric_keys` collides with a public
 /// target label, `renamed_keys` is resized to `metric_keys.len()`, populating
 /// `Some(exported_name)` for each renamed dictionary entry (resolved in ascending key-length
-/// order matching Prometheus `resolveConflictingExposedLabels`) and `None` for unchanged entries,
-/// and `true` is returned. Because resolution operates across the batch-wide `metric_keys`
-/// dictionary, any `exported_<name>` key present in `metric_keys` is treated as occupied for the
-/// entire dictionary.
+/// order) and `None` for unchanged entries, and `true` is returned. Unlike Go
+/// [`resolveConflictingExposedLabels`](https://github.com/prometheus/prometheus/blob/236a2b1fe8e0471586ff29cb8fd8929372643650/scrape/scrape.go#L682-L697)
+/// (and per-sample [`merge_target_and_metric_labels`]), which check `exported_<name>` occupancy per
+/// series, `resolve_conflicting_exposed_keys` intentionally treats any `exported_<name>` key
+/// present in the batch-wide `metric_keys` dictionary as occupied across the batch so dictionary
+/// key IDs remain uniform across series.
 pub fn resolve_conflicting_exposed_keys<K: AsRef<str>>(
     metric_keys: &[K],
     target_labels: &LabelSet,
