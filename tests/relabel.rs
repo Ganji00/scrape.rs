@@ -1381,21 +1381,23 @@ fn stage2_dictionary_vectorized_honor_labels_and_attribute_transforms() {
         action: Action::Replace,
         ..Config::default()
     };
-    let absent_replace = eval_single_label_value_transform(
-        &["api-7f8b", "worker-12ab", "dropme", "unmatched"],
-        &replace_cfg,
-        &mut transforms,
-    )
-    .unwrap();
+    let replace_inputs = ["api-7f8b", "worker-12ab", "dropme", "unmatched"];
+    let absent_replace =
+        eval_single_label_value_transform(&replace_inputs, &replace_cfg, &mut transforms).unwrap();
     assert_eq!(absent_replace, DictionaryValueTransform::KeepExisting);
     assert_eq!(
         transforms,
         vec![
-            DictionaryValueTransform::SetTarget("api".to_owned()),
-            DictionaryValueTransform::SetTarget("worker".to_owned()),
+            DictionaryValueTransform::SetTargetSlice { start: 0, end: 3 },
+            DictionaryValueTransform::SetTargetSlice { start: 0, end: 6 },
             DictionaryValueTransform::DeleteTarget,
             DictionaryValueTransform::KeepExisting,
         ]
+    );
+    assert_eq!(transforms[0].target_value(replace_inputs[0]), Some("api"));
+    assert_eq!(
+        transforms[1].target_value(replace_inputs[1]),
+        Some("worker")
     );
 
     // 7. End-to-end equivalence: Stage 1 `__name__` pushdown + Stage 2 dictionary primitives vs per-sample `process`.
@@ -1490,20 +1492,22 @@ fn stage2_dictionary_vectorized_honor_labels_and_attribute_transforms() {
             if !kept {
                 None
             } else {
-                let xform = match out.get("env") {
+                let (src_val, xform) = match out.get("env") {
                     Some(v) => {
                         let val_id = batch_vals.iter().position(|bv| bv == v).unwrap();
-                        &stage2_val_transforms[val_id]
+                        (batch_vals[val_id], &stage2_val_transforms[val_id])
                     }
-                    None => &absent_transform,
+                    None => ("", &absent_transform),
                 };
                 match xform {
                     DictionaryValueTransform::KeepExisting => {}
                     DictionaryValueTransform::DeleteTarget => {
                         out.remove("env");
                     }
-                    DictionaryValueTransform::SetTarget(new_v) => {
-                        out.insert("env".to_owned(), new_v.clone());
+                    DictionaryValueTransform::SetTargetSlice { .. }
+                    | DictionaryValueTransform::SetTarget(_) => {
+                        let new_v = xform.target_value(src_val).unwrap().to_owned();
+                        out.insert("env".to_owned(), new_v);
                     }
                 }
                 Some(out)

@@ -510,7 +510,11 @@ fn main() {
                                 Some(vid) => &val_transforms[vid],
                                 None => &pod_absent,
                             };
-                            if matches!(xform, DictionaryValueTransform::SetTarget(_)) {
+                            if matches!(
+                                xform,
+                                DictionaryValueTransform::SetTargetSlice { .. }
+                                    | DictionaryValueTransform::SetTarget(_)
+                            ) {
                                 kept_attrs += 1;
                             }
                         }

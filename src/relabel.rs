@@ -835,11 +835,7 @@ fn extract_template_var(str_after_dollar: &str) -> Option<(&str, Option<usize>, 
             // Fall back to Unicode General Categories `L` (`unicode.IsLetter`) and `Nd`
             // (`unicode.IsDigit`) so non-decimal numbers such as `'²'` (`No`) terminate `$1²`
             // just like Go `regexp.extract`.
-            static IDENT_TAIL_RE: OnceLock<Regex> = OnceLock::new();
-            let re = IDENT_TAIL_RE.get_or_init(|| {
-                Regex::new(r"^[\p{L}\p{Nd}_]+").expect("valid template var identifier regex")
-            });
-            if let Some(m) = re.find(&body[end..]) {
+            if let Some(m) = ident_tail_regex().find(&body[end..]) {
                 end += m.end();
             }
             break;
@@ -880,6 +876,13 @@ fn extract_template_var(str_after_dollar: &str) -> Option<(&str, Option<usize>, 
     };
 
     Some((name, num, remaining))
+}
+
+fn ident_tail_regex() -> &'static Regex {
+    static IDENT_TAIL_RE: OnceLock<Regex> = OnceLock::new();
+    IDENT_TAIL_RE.get_or_init(|| {
+        Regex::new(r"^[\p{L}\p{Nd}_]+").expect("valid template var identifier regex")
+    })
 }
 
 fn append_capture(
@@ -1464,8 +1467,30 @@ pub enum DictionaryValueTransform {
     /// `cfg.target_label` must be removed from the series because the replacement expanded to
     /// `""`.
     DeleteTarget,
-    /// `cfg.target_label` must be set to this non-empty string value.
+    /// `cfg.target_label` must be set to `&source_value[start..end]` without allocating a new
+    /// `String` (produced when `replacement` selects a single capture group such as `"$1"`).
+    SetTargetSlice {
+        /// Inclusive start byte offset in the input dictionary value.
+        start: usize,
+        /// Exclusive end byte offset in the input dictionary value.
+        end: usize,
+    },
+    /// `cfg.target_label` must be set to this synthesized non-empty string value.
     SetTarget(String),
+}
+
+impl DictionaryValueTransform {
+    /// Resolves the replacement value against `source_value` (`""` when absent), returning
+    /// `Some(value)` for [`Self::SetTargetSlice`] and [`Self::SetTarget`] or `None` for
+    /// [`Self::KeepExisting`] and [`Self::DeleteTarget`].
+    #[must_use]
+    pub fn target_value<'a>(&'a self, source_value: &'a str) -> Option<&'a str> {
+        match self {
+            Self::KeepExisting | Self::DeleteTarget => None,
+            Self::SetTargetSlice { start, end } => Some(&source_value[*start..*end]),
+            Self::SetTarget(s) => Some(s.as_str()),
+        }
+    }
 }
 
 /// Evaluates a single-source-label (`source_labels.len() == 1`) value transformation rule
@@ -1496,6 +1521,8 @@ pub fn eval_single_label_value_transform<V: AsRef<str>>(
     let target_valid = cfg
         .name_validation_scheme
         .is_valid_label_name(&cfg.target_label);
+    let single_capture_group = (cfg.action == Action::Replace)
+        .then(|| resolve_single_capture_replacement(&cfg.replacement, &cfg.regex));
     let mut locs = (cfg.action == Action::Replace && target_valid)
         .then(|| cfg.regex.compiled.capture_locations());
 
@@ -1505,6 +1532,17 @@ pub fn eval_single_label_value_transform<V: AsRef<str>>(
         }
         match cfg.action {
             Action::Replace => {
+                if cfg.regex.is_default()
+                    && matches!(cfg.replacement.as_str(), "$1" | "${1}" | "$0" | "${0}")
+                {
+                    return classify_slice_transform(
+                        0,
+                        val_str.len(),
+                        val_str,
+                        in_place,
+                        is_present,
+                    );
+                }
                 if let Some(res) = direct_replacement(cfg, val_str) {
                     return classify_value_transform(
                         Cow::Borrowed(res),
@@ -1516,6 +1554,14 @@ pub fn eval_single_label_value_transform<V: AsRef<str>>(
                 let locs = locs.as_mut().expect("capture locations initialized");
                 if cfg.regex.compiled.captures_read(locs, val_str).is_none() {
                     return DictionaryValueTransform::KeepExisting;
+                }
+                if let Some(single_group) = single_capture_group.flatten() {
+                    return match single_group.and_then(|idx| locs.get(idx)) {
+                        Some((start, end)) => {
+                            classify_slice_transform(start, end, val_str, in_place, is_present)
+                        }
+                        None => classify_slice_transform(0, 0, val_str, in_place, is_present),
+                    };
                 }
                 let res = expand_template(&cfg.replacement, val_str, locs, &cfg.regex.named_groups);
                 classify_value_transform(res, val_str, in_place, is_present)
@@ -1546,6 +1592,51 @@ pub fn eval_single_label_value_transform<V: AsRef<str>>(
         transforms.push(eval_one(val.as_ref(), true));
     }
     Some(when_absent)
+}
+
+/// If `replacement` consists of a single capture reference (`$1`, `${1}`, `$name`, `${name}`),
+/// returns `Some(Some(group_idx))` when that capture group exists on `regex` or `Some(None)` when
+/// the group does not exist (always expanding to `""`). Returns `None` for literal or multi-part
+/// templates.
+fn resolve_single_capture_replacement(replacement: &str, regex: &Regexp) -> Option<Option<usize>> {
+    let after_dollar = replacement.strip_prefix('$')?;
+    if after_dollar.starts_with('$') {
+        return None;
+    }
+    let (name, num, remaining) = extract_template_var(after_dollar)?;
+    if !remaining.is_empty() {
+        return None;
+    }
+    let resolved = match num {
+        Some(idx) if idx < regex.compiled.captures_len() => Some(idx),
+        Some(_) => None,
+        None => regex
+            .named_groups
+            .iter()
+            .find(|(n, _)| n.as_ref() == name)
+            .map(|&(_, idx)| idx),
+    };
+    Some(resolved)
+}
+
+fn classify_slice_transform(
+    start: usize,
+    end: usize,
+    val_str: &str,
+    in_place: bool,
+    is_present: bool,
+) -> DictionaryValueTransform {
+    if start == end {
+        if in_place && !is_present {
+            DictionaryValueTransform::KeepExisting
+        } else {
+            DictionaryValueTransform::DeleteTarget
+        }
+    } else if in_place && is_present && start == 0 && end == val_str.len() {
+        DictionaryValueTransform::KeepExisting
+    } else {
+        DictionaryValueTransform::SetTargetSlice { start, end }
+    }
 }
 
 fn classify_value_transform(
