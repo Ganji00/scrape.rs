@@ -42,67 +42,67 @@ fn strs(items: &[&str]) -> Vec<String> {
 fn relabel_matches_prometheus_relabel_test_suite() {
     // Ported from TestRelabel in model/relabel/relabel_test.go.
     let base_input = label_set(&[("a", "foo"), ("b", "bar"), ("c", "baz")]);
+    let eq_input = label_set(&[
+        ("__tmp_port", "1234"),
+        ("__port1", "1234"),
+        ("__port2", "5678"),
+    ]);
+    let multiline_input = label_set(&[("a", "line1\nline2"), ("b", "bar"), ("c", "baz")]);
 
-    // 1. No relabelings.
-    assert_eq!(process(&base_input, &[]), Some(base_input.clone()));
-
-    // 2. No matching rule.
-    assert_eq!(
-        process(
-            &base_input,
-            &[Config {
+    let cases: &[(&str, LabelSet, Vec<Config>, Option<LabelSet>)] = &[
+        (
+            "no relabelings",
+            base_input.clone(),
+            vec![],
+            Some(base_input.clone()),
+        ),
+        (
+            "no matching rule",
+            base_input.clone(),
+            vec![Config {
                 source_labels: strs(&["a", "b", "c"]),
                 regex: Regexp::must_new("bar"),
                 target_label: "d".to_owned(),
                 replacement: "foo".to_owned(),
                 action: Action::Replace,
                 ..Config::default()
-            }]
+            }],
+            Some(base_input.clone()),
         ),
-        Some(base_input.clone())
-    );
-
-    // 3. Matching rule without target label replacement ($1 empty).
-    assert_eq!(
-        process(
-            &base_input,
-            &[Config {
+        (
+            "matching rule with empty $1 capture",
+            base_input.clone(),
+            vec![Config {
                 source_labels: strs(&["a", "b", "c"]),
                 regex: Regexp::must_new("foo;bar;baz"),
                 target_label: "d".to_owned(),
                 action: Action::Replace,
                 ..Config::default()
-            }]
+            }],
+            Some(base_input.clone()),
         ),
-        Some(base_input.clone())
-    );
-
-    // 4. Matching rule with capture groups and new target label.
-    assert_eq!(
-        process(
-            &base_input,
-            &[Config {
+        (
+            "capture groups and new target label",
+            base_input.clone(),
+            vec![Config {
                 source_labels: strs(&["a"]),
                 regex: Regexp::must_new("f(.*)"),
                 target_label: "d".to_owned(),
                 replacement: "ch${1}ch${1}".to_owned(),
                 action: Action::Replace,
                 ..Config::default()
-            }]
+            }],
+            Some(label_set(&[
+                ("a", "foo"),
+                ("b", "bar"),
+                ("c", "baz"),
+                ("d", "choochoo"),
+            ])),
         ),
-        Some(label_set(&[
-            ("a", "foo"),
-            ("b", "bar"),
-            ("c", "baz"),
-            ("d", "choochoo"),
-        ]))
-    );
-
-    // 5. Matching rules chaining into existing and subsequent source labels.
-    assert_eq!(
-        process(
-            &base_input,
-            &[
+        (
+            "chaining rules into subsequent source labels",
+            base_input.clone(),
+            vec![
                 Config {
                     source_labels: strs(&["a", "b"]),
                     regex: Regexp::must_new("f(.*);(.*)r"),
@@ -119,21 +119,18 @@ fn relabel_matches_prometheus_relabel_test_suite() {
                     action: Action::Replace,
                     ..Config::default()
                 },
-            ]
+            ],
+            Some(label_set(&[
+                ("a", "boobam"),
+                ("b", "bar"),
+                ("c", "baz"),
+                ("d", "boooom"),
+            ])),
         ),
-        Some(label_set(&[
-            ("a", "boobam"),
-            ("b", "bar"),
-            ("c", "baz"),
-            ("d", "boooom"),
-        ]))
-    );
-
-    // 6. Replacement deleting an existing label when replacement expands to empty string.
-    assert_eq!(
-        process(
-            &base_input,
-            &[
+        (
+            "empty replacement deletes existing label",
+            base_input.clone(),
+            vec![
                 Config {
                     source_labels: strs(&["a"]),
                     regex: Regexp::must_new("foo"),
@@ -150,68 +147,59 @@ fn relabel_matches_prometheus_relabel_test_suite() {
                     action: Action::Replace,
                     ..Config::default()
                 },
-            ]
+            ],
+            Some(label_set(&[("c", "baz")])),
         ),
-        Some(label_set(&[("c", "baz")]))
-    );
-
-    // 7. Match with custom separator + Drop / Keep rules.
-    assert_eq!(
-        process(
-            &base_input,
-            &[Config {
+        (
+            "drop matching joined labels",
+            base_input.clone(),
+            vec![Config {
                 source_labels: strs(&["a", "b"]),
                 separator: ";".to_owned(),
                 regex: Regexp::must_new("foo;bar"),
                 action: Action::Drop,
                 ..Config::default()
-            }]
+            }],
+            None,
         ),
-        None
-    );
-    assert_eq!(
-        process(
-            &base_input,
-            &[Config {
+        (
+            "drop non-matching custom separator",
+            base_input.clone(),
+            vec![Config {
                 source_labels: strs(&["a", "b"]),
                 separator: ".*".to_owned(),
                 regex: Regexp::must_new("foo;bar"),
                 action: Action::Drop,
                 ..Config::default()
-            }]
+            }],
+            Some(base_input.clone()),
         ),
-        Some(base_input.clone())
-    );
-    assert_eq!(
-        process(
-            &base_input,
-            &[Config {
+        (
+            "keep non-matching drops sample",
+            base_input.clone(),
+            vec![Config {
                 source_labels: strs(&["a"]),
                 regex: Regexp::must_new("no-match"),
                 action: Action::Keep,
                 ..Config::default()
-            }]
+            }],
+            None,
         ),
-        None
-    );
-    assert_eq!(
-        process(
-            &base_input,
-            &[Config {
+        (
+            "keep matching retains sample",
+            base_input.clone(),
+            vec![Config {
                 source_labels: strs(&["a"]),
                 regex: Regexp::must_new("f.*"),
                 action: Action::Keep,
                 ..Config::default()
-            }]
+            }],
+            Some(base_input.clone()),
         ),
-        Some(base_input.clone())
-    );
-
-    // 8. Uppercase and Lowercase actions.
-    assert_eq!(
-        process(
-            &base_input,
-            &[
+        (
+            "uppercase and lowercase",
+            base_input.clone(),
+            vec![
                 Config {
                     source_labels: strs(&["a"]),
                     target_label: "a_upper".to_owned(),
@@ -224,76 +212,66 @@ fn relabel_matches_prometheus_relabel_test_suite() {
                     action: Action::Lowercase,
                     ..Config::default()
                 },
-            ]
+            ],
+            Some(label_set(&[
+                ("a", "foo"),
+                ("a_lower", "foo"),
+                ("a_upper", "FOO"),
+                ("b", "bar"),
+                ("c", "baz"),
+            ])),
         ),
-        Some(label_set(&[
-            ("a", "foo"),
-            ("a_lower", "foo"),
-            ("a_upper", "FOO"),
-            ("b", "bar"),
-            ("c", "baz"),
-        ]))
-    );
-
-    // 9. HashMod action (exact Prometheus test vectors: "baz" % 1000 == 976, "foo\nbar" % 1000 == 734).
-    assert_eq!(
-        process(
-            &base_input,
-            &[Config {
+        (
+            "hashmod baz % 1000 == 976",
+            base_input.clone(),
+            vec![Config {
                 source_labels: strs(&["c"]),
                 modulus: 1000,
                 target_label: "d".to_owned(),
                 action: Action::HashMod,
                 ..Config::default()
-            }]
+            }],
+            Some(label_set(&[
+                ("a", "foo"),
+                ("b", "bar"),
+                ("c", "baz"),
+                ("d", "976"),
+            ])),
         ),
-        Some(label_set(&[
-            ("a", "foo"),
-            ("b", "bar"),
-            ("c", "baz"),
-            ("d", "976"),
-        ]))
-    );
-    assert_eq!(
-        process(
-            &label_set(&[("a", "foo\nbar")]),
-            &[Config {
+        (
+            "hashmod multiline foo\\nbar % 1000 == 734",
+            label_set(&[("a", "foo\nbar")]),
+            vec![Config {
                 source_labels: strs(&["a"]),
                 modulus: 1000,
                 target_label: "b".to_owned(),
                 action: Action::HashMod,
                 ..Config::default()
-            }]
+            }],
+            Some(label_set(&[("a", "foo\nbar"), ("b", "734")])),
         ),
-        Some(label_set(&[("a", "foo\nbar"), ("b", "734")]))
-    );
-
-    // 10. Multi-line value matching with default `(?s:...)` dot-matches-newline flag.
-    assert_eq!(
-        process(
-            &label_set(&[("a", "line1\nline2"), ("b", "bar"), ("c", "baz")]),
-            &[Config {
+        (
+            "multiline dot-matches-newline",
+            multiline_input.clone(),
+            vec![Config {
                 source_labels: strs(&["a"]),
                 regex: Regexp::must_new("line1.*line2"),
                 target_label: "d".to_owned(),
                 replacement: "match${1}".to_owned(),
                 action: Action::Replace,
                 ..Config::default()
-            }]
+            }],
+            Some(label_set(&[
+                ("a", "line1\nline2"),
+                ("b", "bar"),
+                ("c", "baz"),
+                ("d", "match"),
+            ])),
         ),
-        Some(label_set(&[
-            ("a", "line1\nline2"),
-            ("b", "bar"),
-            ("c", "baz"),
-            ("d", "match"),
-        ]))
-    );
-
-    // 11. LabelMap, LabelDrop, LabelKeep.
-    assert_eq!(
-        process(
-            &base_input,
-            &[
+        (
+            "labelmap, labeldrop, labelkeep",
+            base_input.clone(),
+            vec![
                 Config {
                     regex: Regexp::must_new("a|b"),
                     replacement: "mapped_${0}".to_owned(),
@@ -310,71 +288,57 @@ fn relabel_matches_prometheus_relabel_test_suite() {
                     action: Action::LabelKeep,
                     ..Config::default()
                 },
-            ]
+            ],
+            Some(label_set(&[("mapped_a", "foo"), ("mapped_b", "bar")])),
         ),
-        Some(label_set(&[("mapped_a", "foo"), ("mapped_b", "bar")]))
-    );
-
-    // 12. KeepEqual and DropEqual.
-    let eq_input = label_set(&[
-        ("__tmp_port", "1234"),
-        ("__port1", "1234"),
-        ("__port2", "5678"),
-    ]);
-    assert_eq!(
-        process(
-            &eq_input,
-            &[Config {
+        (
+            "dropequal equal drops",
+            eq_input.clone(),
+            vec![Config {
                 source_labels: strs(&["__tmp_port"]),
                 target_label: "__port1".to_owned(),
                 action: Action::DropEqual,
                 ..Config::default()
-            }]
+            }],
+            None,
         ),
-        None
-    );
-    assert_eq!(
-        process(
-            &eq_input,
-            &[Config {
+        (
+            "keepequal equal keeps",
+            eq_input.clone(),
+            vec![Config {
                 source_labels: strs(&["__tmp_port"]),
                 target_label: "__port1".to_owned(),
                 action: Action::KeepEqual,
                 ..Config::default()
-            }]
+            }],
+            Some(eq_input.clone()),
         ),
-        Some(eq_input.clone())
-    );
-    assert_eq!(
-        process(
-            &eq_input,
-            &[Config {
+        (
+            "dropequal unequal keeps",
+            eq_input.clone(),
+            vec![Config {
                 source_labels: strs(&["__tmp_port"]),
                 target_label: "__port2".to_owned(),
                 action: Action::DropEqual,
                 ..Config::default()
-            }]
+            }],
+            Some(eq_input.clone()),
         ),
-        Some(eq_input.clone())
-    );
-    assert_eq!(
-        process(
-            &eq_input,
-            &[Config {
+        (
+            "keepequal unequal drops",
+            eq_input.clone(),
+            vec![Config {
                 source_labels: strs(&["__tmp_port"]),
                 target_label: "__port2".to_owned(),
                 action: Action::KeepEqual,
                 ..Config::default()
-            }]
+            }],
+            None,
         ),
-        None
-    );
-
-    // 13. UTF-8 and named capture groups (`(?<second>line2)`) with `$1`, `${1}`, `$second`, `${second}`.
-    assert_eq!(
-        process(
-            &label_set(&[("a", "line1\nline2"), ("b", "bar"), ("c", "baz")]),
-            &[
+        (
+            "named capture groups with braced and unbraced refs",
+            multiline_input,
+            vec![
                 Config {
                     source_labels: strs(&["a"]),
                     regex: Regexp::must_new("(line1).*(?<second>line2)"),
@@ -391,16 +355,24 @@ fn relabel_matches_prometheus_relabel_test_suite() {
                     action: Action::Replace,
                     ..Config::default()
                 },
-            ]
+            ],
+            Some(label_set(&[
+                ("a", "line1\nline2"),
+                ("b", "bar"),
+                ("c", "baz"),
+                ("label1_line1", "val_line2"),
+                ("label2_line1", "val_line2"),
+            ])),
         ),
-        Some(label_set(&[
-            ("a", "line1\nline2"),
-            ("b", "bar"),
-            ("c", "baz"),
-            ("label1_line1", "val_line2"),
-            ("label2_line1", "val_line2"),
-        ]))
-    );
+    ];
+
+    for (idx, (name, input, cfgs, expected)) in cases.iter().enumerate() {
+        assert_eq!(
+            &process(input, cfgs),
+            expected,
+            "TestRelabel case #{idx} ({name}) failed"
+        );
+    }
 }
 
 #[test]
