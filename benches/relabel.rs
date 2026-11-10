@@ -477,6 +477,9 @@ fn main() {
                     let mut run_once = |fixture: &ScrapeFixture| -> (usize, usize) {
                         let (stage1, stage2) =
                             split_metric_name_pushdown(black_box(&fixture.metric_relabel_configs));
+                        let [label_drop_cfg, keep_env_cfg, replace_pod_cfg] = stage2 else {
+                            panic!("expected 3 Stage 2 relabel rules in fixture");
+                        };
 
                         extra_key_arena.clear();
                         extra_key_spans.clear();
@@ -504,12 +507,12 @@ fn main() {
 
                         eval_key_keep_mask(
                             black_box(&fixture.key_dict),
-                            &stage2[0],
+                            label_drop_cfg,
                             &mut key_keep_mask,
                         )
                         .unwrap();
-                        assert!(keep_cache.prepare(fixture.val_dict.len(), &stage2[1]));
-                        assert!(xform_cache.prepare(fixture.val_dict.len(), &stage2[2]));
+                        assert!(keep_cache.prepare(fixture.val_dict.len(), keep_env_cfg));
+                        assert!(xform_cache.prepare(fixture.val_dict.len(), replace_pod_cfg));
 
                         extra_val_arena.clear();
                         extra_val_spans.clear();
@@ -530,7 +533,7 @@ fn main() {
                                     Some(vid) => keep_cache.keep_value(
                                         vid,
                                         black_box(&fixture.val_dict),
-                                        &stage2[1],
+                                        keep_env_cfg,
                                     ),
                                     None => keep_cache.keep_when_absent(),
                                 };
@@ -557,7 +560,7 @@ fn main() {
                                             let xform = xform_cache.transform_value(
                                                 vid,
                                                 black_box(&fixture.val_dict),
-                                                &stage2[2],
+                                                replace_pod_cfg,
                                             );
                                             xform.target_value(src).map(|new_val| {
                                                 let new_vid =
