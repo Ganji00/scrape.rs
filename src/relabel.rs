@@ -59,9 +59,6 @@ pub const DEFAULT_REGEX_PATTERN: &str = "(.*)";
 /// Ordered map of label names to label values matching Prometheus `model.LabelSet`.
 pub type LabelSet = BTreeMap<String, String>;
 
-/// Type alias for [`Config`] matching `relabel_configs` / `metric_relabel_configs` naming.
-pub type RelabelConfig = Config;
-
 /// Error returned when parsing, validating, or applying relabel configurations.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RelabelError {
