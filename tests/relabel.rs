@@ -20,10 +20,11 @@ use std::collections::BTreeMap;
 
 use expfmt::relabel::{
     Action, Config, DEFAULT_REPLACEMENT, DictionaryValueTransform, LabelSet, METRIC_NAME_LABEL,
-    Regexp, SingleLabelFilterSummary, TargetPopulateConfig, ValidationScheme, eval_key_keep_mask,
-    eval_single_label_keep_mask, eval_single_label_value_transform, is_valid_legacy_target_label,
-    keep_metric_name, merge_target_and_metric_labels, populate_discovered_labels, populate_labels,
-    process, resolve_conflicting_exposed_keys, split_metric_name_pushdown,
+    Regexp, SingleLabelFilterSummary, SingleLabelKeepCache, SingleLabelTransformCache,
+    TargetPopulateConfig, ValidationScheme, eval_key_keep_mask, eval_single_label_keep_mask,
+    eval_single_label_value_transform, is_valid_legacy_target_label, keep_metric_name,
+    merge_target_and_metric_labels, populate_discovered_labels, populate_labels, process,
+    resolve_conflicting_exposed_keys, split_metric_name_pushdown,
 };
 
 fn label_set(pairs: &[(&str, &str)]) -> LabelSet {
@@ -1398,6 +1399,33 @@ fn stage2_dictionary_vectorized_honor_labels_and_attribute_transforms() {
     assert_eq!(
         transforms[1].target_value(replace_inputs[1]),
         Some("worker")
+    );
+
+    // On-demand `SingleLabelKeepCache` and `SingleLabelTransformCache` evaluate only referenced `val_id`s.
+    let shared_vals = [
+        "prod",
+        "dev",
+        "api-7f8b",
+        "unrelated-uuid-0001",
+        "unrelated-uuid-0002",
+    ];
+    let mut keep_cache = SingleLabelKeepCache::new();
+    assert!(keep_cache.prepare(shared_vals.len(), &keep_env));
+    assert!(!keep_cache.keep_when_absent());
+    assert!(keep_cache.keep_value(0, &shared_vals, &keep_env));
+    assert!(!keep_cache.keep_value(1, &shared_vals, &keep_env));
+
+    let mut xform_cache = SingleLabelTransformCache::new();
+    assert!(xform_cache.prepare(shared_vals.len(), &replace_cfg));
+    assert_eq!(
+        xform_cache.when_absent(),
+        &DictionaryValueTransform::KeepExisting
+    );
+    assert_eq!(
+        xform_cache
+            .transform_value(2, &shared_vals, &replace_cfg)
+            .target_value(shared_vals[2]),
+        Some("api")
     );
 
     // 7. End-to-end equivalence: Stage 1 `__name__` pushdown + Stage 2 dictionary primitives vs per-sample `process`.

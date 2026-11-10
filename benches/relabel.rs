@@ -25,8 +25,8 @@ use std::hint::black_box;
 use benchfmt::{CountingAlloc, Suite};
 use expfmt::relabel::{
     Action, Config, DictionaryValueTransform, LabelSet, METRIC_NAME_LABEL, Regexp,
-    TargetPopulateConfig, ValidationScheme, eval_key_keep_mask, eval_single_label_keep_mask,
-    eval_single_label_value_transform, keep_metric_name, merge_target_and_metric_labels,
+    SingleLabelKeepCache, SingleLabelTransformCache, TargetPopulateConfig, ValidationScheme,
+    eval_key_keep_mask, keep_metric_name, merge_target_and_metric_labels,
     populate_discovered_labels, populate_labels, process_in_place,
     resolve_conflicting_exposed_keys, split_metric_name_pushdown,
 };
@@ -173,7 +173,7 @@ struct ScrapeFixture {
     interned_families: Vec<Vec<InternedSeries>>,
 }
 
-fn build_scrape_fixture() -> ScrapeFixture {
+fn build_scrape_fixture(high_cardinality: bool) -> ScrapeFixture {
     let target_labels = LabelSet::from([
         ("__address__".to_owned(), "10.0.0.1:9090".to_owned()),
         ("job".to_owned(), "api-server".to_owned()),
@@ -226,32 +226,37 @@ fn build_scrape_fixture() -> ScrapeFixture {
         key_dict.push(format!("dim_key_{}", key_dict.len()));
     }
 
-    // 128 unique label values in the scrape batch.
     let envs = ["prod", "staging", "dev"];
     let methods = ["GET", "POST", "PUT", "DELETE"];
     let statuses = ["200", "201", "400", "404", "500"];
-    let mut val_dict = Vec::with_capacity(128);
+    let mut val_dict = Vec::with_capacity(if high_cardinality { 22_050 } else { 128 });
     for e in envs {
-        val_dict.push(e.to_owned());
+        val_dict.push(e.to_owned()); // 0..3
     }
     for m in methods {
-        val_dict.push(m.to_owned());
+        val_dict.push(m.to_owned()); // 3..7
     }
     for s in statuses {
-        val_dict.push(s.to_owned());
-    }
-    for i in 0..64 {
-        val_dict.push(format!("checkout-service-{i:02}-{:04x}", 0x7f00 + i));
-    }
-    while val_dict.len() < 128 {
-        val_dict.push(format!("val_{}", val_dict.len()));
+        val_dict.push(s.to_owned()); // 7..12
     }
 
-    let intern_val = |s: &str, dict: &[String]| -> usize {
-        dict.iter()
-            .position(|v| v == s)
-            .expect("value present in dictionary")
-    };
+    let pod_base = val_dict.len();
+    let pod_count = if high_cardinality { 2_000 } else { 64 };
+    for i in 0..pod_count {
+        val_dict.push(format!("checkout-service-{i:04}-{:04x}", 0x7f00 + i));
+    }
+
+    let extra_base = val_dict.len();
+    if high_cardinality {
+        // 20,000 additional unique values across 10 per-series high-cardinality keys (22,012 total).
+        for i in 0..20_000 {
+            val_dict.push(format!("req-trace-uid-{i:05}"));
+        }
+    } else {
+        while val_dict.len() < 128 {
+            val_dict.push(format!("val_{}", val_dict.len()));
+        }
+    }
 
     let prefixes = ["http", "go", "rpc", "node"];
     let mut family_names = Vec::with_capacity(200);
@@ -267,35 +272,40 @@ fn build_scrape_fixture() -> ScrapeFixture {
         let mut interned_series = Vec::with_capacity(10);
 
         for s_idx in 0..10 {
-            let env_str = envs[(fam_idx + s_idx) % envs.len()];
-            let pod_str = &val_dict[12 + ((fam_idx * 10 + s_idx) % 64)];
-            let method_str = methods[s_idx % methods.len()];
-            let status_str = statuses[(fam_idx + s_idx) % statuses.len()];
-            let eph_str = &val_dict[76 + ((fam_idx + s_idx) % 40)];
+            let global_s_idx = fam_idx * 10 + s_idx;
+            let env_val_id = (fam_idx + s_idx) % envs.len();
+            let pod_val_id = pod_base + (global_s_idx % pod_count);
+            let method_val_id = 3 + (s_idx % methods.len());
+            let status_val_id = 7 + ((fam_idx + s_idx) % statuses.len());
+            let eph_val_id = extra_base + (global_s_idx % 40);
 
             let mut ls = LabelSet::new();
             ls.insert(METRIC_NAME_LABEL.to_owned(), family_name.clone());
-            ls.insert("env".to_owned(), env_str.to_owned());
-            ls.insert("pod".to_owned(), pod_str.clone());
-            ls.insert("method".to_owned(), method_str.to_owned());
-            ls.insert("status".to_owned(), status_str.to_owned());
-            ls.insert("ephemeral_debug".to_owned(), eph_str.clone());
+            ls.insert("env".to_owned(), val_dict[env_val_id].clone());
+            ls.insert("pod".to_owned(), val_dict[pod_val_id].clone());
+            ls.insert("method".to_owned(), val_dict[method_val_id].clone());
+            ls.insert("status".to_owned(), val_dict[status_val_id].clone());
+            ls.insert("ephemeral_debug".to_owned(), val_dict[eph_val_id].clone());
+
+            let mut attrs = vec![
+                (0, env_val_id),
+                (1, pod_val_id),
+                (2, method_val_id),
+                (3, status_val_id),
+                (4, eph_val_id),
+            ];
+            if high_cardinality {
+                for extra_k in 0..10 {
+                    let kid = 7 + extra_k;
+                    let vid = extra_base + global_s_idx * 10 + extra_k;
+                    ls.insert(key_dict[kid].clone(), val_dict[vid].clone());
+                    attrs.push((kid, vid));
+                }
+            }
             scalar_series.push(ls);
 
-            let env_val_id = intern_val(env_str, &val_dict);
-            let pod_val_id = intern_val(pod_str, &val_dict);
-            let method_val_id = intern_val(method_str, &val_dict);
-            let status_val_id = intern_val(status_str, &val_dict);
-            let eph_val_id = intern_val(eph_str, &val_dict);
-
             interned_series.push(InternedSeries {
-                attrs: vec![
-                    (0, env_val_id),
-                    (1, pod_val_id),
-                    (2, method_val_id),
-                    (3, status_val_id),
-                    (4, eph_val_id),
-                ],
+                attrs,
                 env_val_id: Some(env_val_id),
                 pod_val_id: Some(pod_val_id),
             });
@@ -371,7 +381,8 @@ fn main() {
     };
     let k8s_discovered = populate_discovered_labels(&k8s_target, &BTreeMap::new(), &k8s_pop_cfg);
 
-    let fixture = build_scrape_fixture();
+    let low_card_fixture = build_scrape_fixture(false);
+    let high_card_fixture = build_scrape_fixture(true);
 
     let mut suite = Suite::from_env("expfmt")
         .with_alloc(&ALLOC)
@@ -400,129 +411,135 @@ fn main() {
                     black_box(kept);
                 }
             },
-        )
-        .bench(
-            "Relabel/case=scrape_2000_series/mode=scalar_per_sample",
-            |b| {
-                let mut work = LabelSet::new();
-                b.report_allocs();
-                while b.keep_running() {
-                    let mut kept_series = 0usize;
-                    for family in black_box(&fixture.scalar_families) {
-                        for sample in family {
-                            work.clone_from(sample);
-                            merge_target_and_metric_labels(
-                                &mut work,
-                                black_box(&fixture.target_labels),
-                                false,
-                            );
-                            if process_in_place(
-                                &mut work,
-                                black_box(&fixture.metric_relabel_configs),
-                            ) {
-                                kept_series += 1;
+        );
+
+    for (case_name, fixture) in [
+        ("scrape_2000_series", low_card_fixture),
+        ("scrape_2000_series_22k_vals", high_card_fixture),
+    ] {
+        let fixture = std::rc::Rc::new(fixture);
+        let scalar_fixture = std::rc::Rc::clone(&fixture);
+        let dict_fixture = std::rc::Rc::clone(&fixture);
+
+        suite = suite
+            .bench(
+                format!("Relabel/case={case_name}/mode=scalar_per_sample"),
+                move |b| {
+                    let fixture = &*scalar_fixture;
+                    let mut work = LabelSet::new();
+                    b.report_allocs();
+                    while b.keep_running() {
+                        let mut kept_series = 0usize;
+                        for family in black_box(&fixture.scalar_families) {
+                            for sample in family {
+                                work.clone_from(sample);
+                                merge_target_and_metric_labels(
+                                    &mut work,
+                                    black_box(&fixture.target_labels),
+                                    false,
+                                );
+                                if process_in_place(
+                                    &mut work,
+                                    black_box(&fixture.metric_relabel_configs),
+                                ) {
+                                    kept_series += 1;
+                                }
                             }
                         }
+                        black_box(kept_series);
                     }
-                    black_box(kept_series);
-                }
-            },
-        )
-        .bench(
-            "Relabel/case=scrape_2000_series/mode=two_stage_dictionary",
-            |b| {
-                let mut renamed_keys = Vec::new();
-                let mut key_keep_mask = Vec::new();
-                let mut val_keep_mask = Vec::new();
-                let mut val_transforms = Vec::new();
+                },
+            )
+            .bench(
+                format!("Relabel/case={case_name}/mode=two_stage_dictionary"),
+                move |b| {
+                    let fixture = &*dict_fixture;
+                    let mut renamed_keys = Vec::new();
+                    let mut key_keep_mask = Vec::new();
+                    let mut keep_cache = SingleLabelKeepCache::new();
+                    let mut xform_cache = SingleLabelTransformCache::new();
 
-                // Warm scratch capacities once to measure steady-state scrape reuse.
-                let (_stage1, stage2) = split_metric_name_pushdown(&fixture.metric_relabel_configs);
-                resolve_conflicting_exposed_keys(
-                    &fixture.key_dict,
-                    &fixture.target_labels,
-                    false,
-                    &mut renamed_keys,
-                );
-                eval_key_keep_mask(&fixture.key_dict, &stage2[0], &mut key_keep_mask);
-                eval_single_label_keep_mask(&fixture.val_dict, &stage2[1], &mut val_keep_mask);
-                eval_single_label_value_transform(
-                    &fixture.val_dict,
-                    &stage2[2],
-                    &mut val_transforms,
-                );
-
-                b.report_allocs();
-                while b.keep_running() {
-                    let (stage1, stage2) =
-                        split_metric_name_pushdown(black_box(&fixture.metric_relabel_configs));
-
-                    // Stage 2 dictionary setup across unique keys (32) and unique values (128).
+                    // Warm scratch capacities once to measure steady-state scrape reuse.
+                    let (_stage1, stage2) =
+                        split_metric_name_pushdown(&fixture.metric_relabel_configs);
                     resolve_conflicting_exposed_keys(
-                        black_box(&fixture.key_dict),
-                        black_box(&fixture.target_labels),
+                        &fixture.key_dict,
+                        &fixture.target_labels,
                         false,
                         &mut renamed_keys,
                     );
-                    eval_key_keep_mask(
-                        black_box(&fixture.key_dict),
-                        &stage2[0],
-                        &mut key_keep_mask,
-                    )
-                    .unwrap();
-                    let env_filter = eval_single_label_keep_mask(
-                        black_box(&fixture.val_dict),
-                        &stage2[1],
-                        &mut val_keep_mask,
-                    )
-                    .unwrap();
-                    let pod_absent = eval_single_label_value_transform(
-                        black_box(&fixture.val_dict),
-                        &stage2[2],
-                        &mut val_transforms,
-                    )
-                    .unwrap();
+                    eval_key_keep_mask(&fixture.key_dict, &stage2[0], &mut key_keep_mask);
+                    keep_cache.prepare(fixture.val_dict.len(), &stage2[1]);
+                    xform_cache.prepare(fixture.val_dict.len(), &stage2[2]);
 
-                    let mut kept_series = 0usize;
-                    let mut kept_attrs = 0usize;
-                    for (fam_idx, family_name) in
-                        black_box(&fixture.family_names).iter().enumerate()
-                    {
-                        // Stage 1: evaluate `__name__` filter once per contiguous family transition.
-                        if !keep_metric_name(family_name, stage1) {
-                            continue;
-                        }
-                        for series in &fixture.interned_families[fam_idx] {
-                            let env_kept = match series.env_val_id {
-                                Some(vid) => val_keep_mask[vid],
-                                None => env_filter.keep_when_absent,
-                            };
-                            if !env_kept {
+                    b.report_allocs();
+                    while b.keep_running() {
+                        let (stage1, stage2) =
+                            split_metric_name_pushdown(black_box(&fixture.metric_relabel_configs));
+
+                        resolve_conflicting_exposed_keys(
+                            black_box(&fixture.key_dict),
+                            black_box(&fixture.target_labels),
+                            false,
+                            &mut renamed_keys,
+                        );
+                        eval_key_keep_mask(
+                            black_box(&fixture.key_dict),
+                            &stage2[0],
+                            &mut key_keep_mask,
+                        )
+                        .unwrap();
+                        assert!(keep_cache.prepare(fixture.val_dict.len(), &stage2[1]));
+                        assert!(xform_cache.prepare(fixture.val_dict.len(), &stage2[2]));
+
+                        let mut kept_series = 0usize;
+                        let mut kept_attrs = 0usize;
+                        for (fam_idx, family_name) in
+                            black_box(&fixture.family_names).iter().enumerate()
+                        {
+                            if !keep_metric_name(family_name, stage1) {
                                 continue;
                             }
-                            kept_series += 1;
-                            for &(kid, _vid) in &series.attrs {
-                                if key_keep_mask[kid] {
+                            for series in &fixture.interned_families[fam_idx] {
+                                let env_kept = match series.env_val_id {
+                                    Some(vid) => keep_cache.keep_value(
+                                        vid,
+                                        black_box(&fixture.val_dict),
+                                        &stage2[1],
+                                    ),
+                                    None => keep_cache.keep_when_absent(),
+                                };
+                                if !env_kept {
+                                    continue;
+                                }
+                                kept_series += 1;
+                                for &(kid, _vid) in &series.attrs {
+                                    if key_keep_mask[kid] {
+                                        kept_attrs += 1;
+                                    }
+                                }
+                                let xform = match series.pod_val_id {
+                                    Some(vid) => xform_cache.transform_value(
+                                        vid,
+                                        black_box(&fixture.val_dict),
+                                        &stage2[2],
+                                    ),
+                                    None => xform_cache.when_absent(),
+                                };
+                                if matches!(
+                                    xform,
+                                    DictionaryValueTransform::SetTargetSlice { .. }
+                                        | DictionaryValueTransform::SetTarget(_)
+                                ) {
                                     kept_attrs += 1;
                                 }
                             }
-                            let xform = match series.pod_val_id {
-                                Some(vid) => &val_transforms[vid],
-                                None => &pod_absent,
-                            };
-                            if matches!(
-                                xform,
-                                DictionaryValueTransform::SetTargetSlice { .. }
-                                    | DictionaryValueTransform::SetTarget(_)
-                            ) {
-                                kept_attrs += 1;
-                            }
                         }
+                        black_box((kept_series, kept_attrs));
                     }
-                    black_box((kept_series, kept_attrs));
-                }
-            },
-        );
+                },
+            );
+    }
 
     suite.run();
 }

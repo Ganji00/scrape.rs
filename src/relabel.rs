@@ -1456,6 +1456,70 @@ pub fn eval_single_label_keep_mask<V: AsRef<str>>(
     })
 }
 
+/// Reusable on-demand memoization table for evaluating a single-source-label [`Action::Keep`] or
+/// [`Action::Drop`] rule across a shared batch value dictionary (`val_interner`) without running
+/// the regex on dictionary entries that only appear under other label keys or on already-dropped
+/// series.
+#[derive(Clone, Debug, Default)]
+pub struct SingleLabelKeepCache {
+    /// `0` = unvisited, `1` = drop, `2` = keep.
+    states: Vec<u8>,
+    keep_when_absent: bool,
+}
+
+impl SingleLabelKeepCache {
+    /// Creates an empty [`SingleLabelKeepCache`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Resets the memoization table for `dict_len` dictionary values and `cfg`, reusing heap
+    /// capacity across scrapes. Returns `false` if `cfg` is not a single-source-label
+    /// [`Action::Keep`] or [`Action::Drop`] rule.
+    pub fn prepare(&mut self, dict_len: usize, cfg: &Config) -> bool {
+        if cfg.source_labels.len() != 1 || !matches!(cfg.action, Action::Keep | Action::Drop) {
+            self.states.clear();
+            return false;
+        }
+        self.keep_when_absent = match cfg.action {
+            Action::Keep => cfg.regex.is_match(""),
+            Action::Drop => !cfg.regex.is_match(""),
+            _ => unreachable!(),
+        };
+        self.states.clear();
+        self.states.resize(dict_len, 0);
+        true
+    }
+
+    /// Returns whether a series that omits `cfg.source_labels[0]` (`""`) is kept.
+    #[must_use]
+    pub const fn keep_when_absent(&self) -> bool {
+        self.keep_when_absent
+    }
+
+    /// Evaluates or returns the memoized keep decision for `metric_values[val_id]`.
+    pub fn keep_value<V: AsRef<str>>(
+        &mut self,
+        val_id: usize,
+        metric_values: &[V],
+        cfg: &Config,
+    ) -> bool {
+        let cached = self.states[val_id];
+        if cached != 0 {
+            return cached == 2;
+        }
+        let val_str = metric_values[val_id].as_ref();
+        let keep = match cfg.action {
+            Action::Keep => cfg.regex.is_match(val_str),
+            Action::Drop => !cfg.regex.is_match(val_str),
+            _ => unreachable!(),
+        };
+        self.states[val_id] = if keep { 2 } else { 1 };
+        keep
+    }
+}
+
 /// Effect on `cfg.target_label` produced by a single-source-label value transformation rule for
 /// one dictionary entry in [`eval_single_label_value_transform`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1522,67 +1586,21 @@ pub fn eval_single_label_value_transform<V: AsRef<str>>(
         .name_validation_scheme
         .is_valid_label_name(&cfg.target_label);
     let single_capture_group = (cfg.action == Action::Replace)
-        .then(|| resolve_single_capture_replacement(&cfg.replacement, &cfg.regex));
+        .then(|| resolve_single_capture_replacement(&cfg.replacement, &cfg.regex))
+        .flatten();
     let mut locs = (cfg.action == Action::Replace && target_valid)
         .then(|| cfg.regex.compiled.capture_locations());
 
     let mut eval_one = |val_str: &str, is_present: bool| -> DictionaryValueTransform {
-        if !target_valid {
-            return DictionaryValueTransform::KeepExisting;
-        }
-        match cfg.action {
-            Action::Replace => {
-                if cfg.regex.is_default()
-                    && matches!(cfg.replacement.as_str(), "$1" | "${1}" | "$0" | "${0}")
-                {
-                    return classify_slice_transform(
-                        0,
-                        val_str.len(),
-                        val_str,
-                        in_place,
-                        is_present,
-                    );
-                }
-                if let Some(res) = direct_replacement(cfg, val_str) {
-                    return classify_value_transform(
-                        Cow::Borrowed(res),
-                        val_str,
-                        in_place,
-                        is_present,
-                    );
-                }
-                let locs = locs.as_mut().expect("capture locations initialized");
-                if cfg.regex.compiled.captures_read(locs, val_str).is_none() {
-                    return DictionaryValueTransform::KeepExisting;
-                }
-                if let Some(single_group) = single_capture_group.flatten() {
-                    return match single_group.and_then(|idx| locs.get(idx)) {
-                        Some((start, end)) => {
-                            classify_slice_transform(start, end, val_str, in_place, is_present)
-                        }
-                        None => classify_slice_transform(0, 0, val_str, in_place, is_present),
-                    };
-                }
-                let res = expand_template(&cfg.replacement, val_str, locs, &cfg.regex.named_groups);
-                classify_value_transform(res, val_str, in_place, is_present)
-            }
-            Action::Lowercase => {
-                let lower = go_to_lowercase(val_str);
-                classify_value_transform(lower, val_str, in_place, is_present)
-            }
-            Action::Uppercase => {
-                let upper = go_to_uppercase(val_str);
-                classify_value_transform(upper, val_str, in_place, is_present)
-            }
-            Action::HashMod => {
-                if cfg.modulus == 0 {
-                    return DictionaryValueTransform::KeepExisting;
-                }
-                let modulo = hashmod_value(val_str, cfg.modulus);
-                classify_value_transform(Cow::Owned(modulo), val_str, in_place, is_present)
-            }
-            _ => unreachable!(),
-        }
+        eval_value_transform_one(
+            val_str,
+            is_present,
+            cfg,
+            in_place,
+            target_valid,
+            single_capture_group,
+            &mut locs,
+        )
     };
 
     let when_absent = eval_one("", false);
@@ -1592,6 +1610,155 @@ pub fn eval_single_label_value_transform<V: AsRef<str>>(
         transforms.push(eval_one(val.as_ref(), true));
     }
     Some(when_absent)
+}
+
+/// Reusable on-demand memoization table for evaluating a single-source-label static-target value
+/// transformation ([`Action::Replace`], [`Action::Lowercase`], [`Action::Uppercase`], or
+/// [`Action::HashMod`]) only on dictionary `val_id`s actually referenced by `source_labels[0]` on
+/// surviving series.
+#[derive(Clone, Debug, Default)]
+pub struct SingleLabelTransformCache {
+    entries: Vec<Option<DictionaryValueTransform>>,
+    when_absent: Option<DictionaryValueTransform>,
+    locs: Option<CaptureLocations>,
+    single_capture_group: Option<Option<usize>>,
+    in_place: bool,
+    target_valid: bool,
+}
+
+impl SingleLabelTransformCache {
+    /// Creates an empty [`SingleLabelTransformCache`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Resets the memoization table for `dict_len` dictionary values and `cfg`, reusing heap
+    /// capacity across scrapes. Returns `false` if `cfg` is not a single-source-label
+    /// static-target value transformation.
+    pub fn prepare(&mut self, dict_len: usize, cfg: &Config) -> bool {
+        if cfg.source_labels.len() != 1
+            || !matches!(
+                cfg.action,
+                Action::Replace | Action::Lowercase | Action::Uppercase | Action::HashMod
+            )
+            || var_in_regex_template(&cfg.target_label)
+        {
+            self.entries.clear();
+            self.when_absent = None;
+            return false;
+        }
+
+        self.in_place = cfg.target_label == cfg.source_labels[0];
+        self.target_valid = cfg
+            .name_validation_scheme
+            .is_valid_label_name(&cfg.target_label);
+        self.single_capture_group = (cfg.action == Action::Replace)
+            .then(|| resolve_single_capture_replacement(&cfg.replacement, &cfg.regex))
+            .flatten();
+        self.locs = (cfg.action == Action::Replace && self.target_valid)
+            .then(|| cfg.regex.compiled.capture_locations());
+        self.when_absent = Some(eval_value_transform_one(
+            "",
+            false,
+            cfg,
+            self.in_place,
+            self.target_valid,
+            self.single_capture_group,
+            &mut self.locs,
+        ));
+        self.entries.clear();
+        self.entries.resize(dict_len, None);
+        true
+    }
+
+    /// Returns the transformation applied when a series omits `cfg.source_labels[0]` (`""`).
+    #[must_use]
+    pub fn when_absent(&self) -> &DictionaryValueTransform {
+        self.when_absent
+            .as_ref()
+            .expect("SingleLabelTransformCache::prepare must succeed before calling when_absent")
+    }
+
+    /// Evaluates or returns the memoized transformation for `metric_values[val_id]`.
+    pub fn transform_value<V: AsRef<str>>(
+        &mut self,
+        val_id: usize,
+        metric_values: &[V],
+        cfg: &Config,
+    ) -> &DictionaryValueTransform {
+        if self.entries[val_id].is_none() {
+            let val_str = metric_values[val_id].as_ref();
+            let xform = eval_value_transform_one(
+                val_str,
+                true,
+                cfg,
+                self.in_place,
+                self.target_valid,
+                self.single_capture_group,
+                &mut self.locs,
+            );
+            self.entries[val_id] = Some(xform);
+        }
+        self.entries[val_id].as_ref().unwrap()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eval_value_transform_one(
+    val_str: &str,
+    is_present: bool,
+    cfg: &Config,
+    in_place: bool,
+    target_valid: bool,
+    single_capture_group: Option<Option<usize>>,
+    locs: &mut Option<CaptureLocations>,
+) -> DictionaryValueTransform {
+    if !target_valid {
+        return DictionaryValueTransform::KeepExisting;
+    }
+    match cfg.action {
+        Action::Replace => {
+            if cfg.regex.is_default()
+                && matches!(cfg.replacement.as_str(), "$1" | "${1}" | "$0" | "${0}")
+            {
+                return classify_slice_transform(0, val_str.len(), val_str, in_place, is_present);
+            }
+            if let Some(res) = direct_replacement(cfg, val_str) {
+                return classify_value_transform(Cow::Borrowed(res), val_str, in_place, is_present);
+            }
+            let locs = locs.as_mut().expect("capture locations initialized");
+            if cfg.regex.compiled.captures_read(locs, val_str).is_none() {
+                return DictionaryValueTransform::KeepExisting;
+            }
+            if let Some(single_group) = single_capture_group {
+                return match single_group.and_then(|idx| locs.get(idx)) {
+                    Some((start, end)) => {
+                        classify_slice_transform(start, end, val_str, in_place, is_present)
+                    }
+                    None => classify_slice_transform(0, 0, val_str, in_place, is_present),
+                };
+            }
+            let res = expand_template(&cfg.replacement, val_str, locs, &cfg.regex.named_groups);
+            classify_value_transform(res, val_str, in_place, is_present)
+        }
+        Action::Lowercase => {
+            let lower = go_to_lowercase(val_str);
+            classify_value_transform(lower, val_str, in_place, is_present)
+        }
+        Action::Uppercase => {
+            let upper = go_to_uppercase(val_str);
+            classify_value_transform(upper, val_str, in_place, is_present)
+        }
+        Action::HashMod => {
+            if cfg.modulus == 0 {
+                return DictionaryValueTransform::KeepExisting;
+            }
+            let modulo = hashmod_value(val_str, cfg.modulus);
+            classify_value_transform(Cow::Owned(modulo), val_str, in_place, is_present)
+        }
+        _ => unreachable!(),
+    }
 }
 
 /// If `replacement` consists of a single capture reference (`$1`, `${1}`, `$name`, `${name}`),
