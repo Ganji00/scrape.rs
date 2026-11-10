@@ -218,7 +218,7 @@ pub fn is_valid_legacy_target_label(target: &str) -> bool {
 pub struct Regexp {
     raw: String,
     compiled: Regex,
-    is_default_pattern: bool,
+    is_implicit_default: bool,
 }
 
 impl PartialEq for Regexp {
@@ -247,7 +247,7 @@ impl Regexp {
         Ok(Self {
             raw: pattern.to_owned(),
             compiled,
-            is_default_pattern: false,
+            is_implicit_default: false,
         })
     }
 
@@ -260,7 +260,7 @@ impl Regexp {
     /// Returns the default Prometheus relabel regex (`"(.*)"`).
     pub fn default_regexp() -> Self {
         let mut r = Self::must_new(DEFAULT_REGEX_PATTERN);
-        r.is_default_pattern = true;
+        r.is_implicit_default = true;
         r
     }
 
@@ -284,8 +284,8 @@ impl Regexp {
         self.raw == DEFAULT_REGEX_PATTERN
     }
 
-    const fn is_unmodified_default(&self) -> bool {
-        self.is_default_pattern
+    const fn is_implicit_default(&self) -> bool {
+        self.is_implicit_default
     }
 }
 
@@ -405,7 +405,7 @@ pub struct Config {
     /// (defaults to `"(.*)"`).
     #[serde(
         default = "Regexp::default_regexp",
-        skip_serializing_if = "Regexp::is_unmodified_default"
+        skip_serializing_if = "Regexp::is_implicit_default"
     )]
     pub regex: Regexp,
     /// Modulus to take of the MD5 hash of the concatenated source label values (`hashmod`).
@@ -530,7 +530,7 @@ impl Config {
         }
 
         if matches!(self.action, Action::DropEqual | Action::KeepEqual)
-            && (!self.regex.is_default_pattern
+            && (!self.regex.is_implicit_default
                 || self.modulus != 0
                 || self.separator != DEFAULT_SEPARATOR
                 || self.replacement != DEFAULT_REPLACEMENT)
