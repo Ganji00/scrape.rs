@@ -12,7 +12,9 @@
 // limitations under the License.
 
 //! Throughput and allocation benchmarks for `expfmt::relabel` target discovery relabeling,
-//! per-sample scalar metric relabeling, and two-stage dictionary-vectorized metric relabeling.
+//! per-sample scalar `LabelSet` (`BTreeMap<String, String>`) metric relabeling, and two-stage
+//! dictionary-vectorized metric relabeling over `ArrowDecoder`-style interned `(key_id, val_id)`
+//! series buffers.
 //!
 //! Recommended CLI invocation:
 //! ```sh
@@ -24,11 +26,10 @@ use std::hint::black_box;
 
 use benchfmt::{CountingAlloc, Suite};
 use expfmt::relabel::{
-    Action, Config, DictionaryValueTransform, LabelSet, METRIC_NAME_LABEL, Regexp,
-    SingleLabelKeepCache, SingleLabelTransformCache, TargetPopulateConfig, ValidationScheme,
-    eval_key_keep_mask, keep_metric_name, merge_target_and_metric_labels,
-    populate_discovered_labels, populate_labels, process_in_place,
-    resolve_conflicting_exposed_keys, split_metric_name_pushdown,
+    Action, Config, LabelSet, METRIC_NAME_LABEL, Regexp, SingleLabelKeepCache,
+    SingleLabelTransformCache, TargetPopulateConfig, ValidationScheme, eval_key_keep_mask,
+    keep_metric_name, merge_target_and_metric_labels, populate_discovered_labels, populate_labels,
+    process_in_place, resolve_conflicting_exposed_keys, split_metric_name_pushdown,
 };
 
 #[global_allocator]
@@ -179,6 +180,7 @@ fn build_scrape_fixture(high_cardinality: bool) -> ScrapeFixture {
         ("job".to_owned(), "api-server".to_owned()),
         ("instance".to_owned(), "10.0.0.1:9090".to_owned()),
         ("cluster".to_owned(), "prod-eu-west-1".to_owned()),
+        ("method".to_owned(), "target-method".to_owned()),
     ]);
 
     let mut metric_relabel_configs = vec![
@@ -454,35 +456,52 @@ fn main() {
                 format!("Relabel/case={case_name}/mode=two_stage_dictionary"),
                 move |b| {
                     let fixture = &*dict_fixture;
+                    let app_key_id = fixture
+                        .key_dict
+                        .iter()
+                        .position(|k| k == "app")
+                        .expect("app key in dictionary");
                     let mut renamed_keys = Vec::new();
+                    let mut remapped_key_ids = Vec::new();
                     let mut key_keep_mask = Vec::new();
                     let mut keep_cache = SingleLabelKeepCache::new();
                     let mut xform_cache = SingleLabelTransformCache::new();
+                    let mut mapped_val_ids: Vec<Option<usize>> = Vec::new();
+                    let mut extra_key_arena = String::new();
+                    let mut extra_key_spans: Vec<(usize, usize)> = Vec::new();
+                    let mut extra_val_arena = String::new();
+                    let mut extra_val_spans: Vec<(usize, usize)> = Vec::new();
+                    let mut out_attrs: Vec<(usize, usize)> = Vec::new();
+                    let mut out_series_offsets: Vec<usize> = Vec::new();
 
-                    // Warm scratch capacities once to measure steady-state scrape reuse.
-                    let (_stage1, stage2) =
-                        split_metric_name_pushdown(&fixture.metric_relabel_configs);
-                    resolve_conflicting_exposed_keys(
-                        &fixture.key_dict,
-                        &fixture.target_labels,
-                        false,
-                        &mut renamed_keys,
-                    );
-                    eval_key_keep_mask(&fixture.key_dict, &stage2[0], &mut key_keep_mask);
-                    keep_cache.prepare(fixture.val_dict.len(), &stage2[1]);
-                    xform_cache.prepare(fixture.val_dict.len(), &stage2[2]);
-
-                    b.report_allocs();
-                    while b.keep_running() {
+                    let mut run_once = |fixture: &ScrapeFixture| -> (usize, usize) {
                         let (stage1, stage2) =
                             split_metric_name_pushdown(black_box(&fixture.metric_relabel_configs));
 
-                        resolve_conflicting_exposed_keys(
+                        extra_key_arena.clear();
+                        extra_key_spans.clear();
+                        let has_collision = resolve_conflicting_exposed_keys(
                             black_box(&fixture.key_dict),
                             black_box(&fixture.target_labels),
                             false,
                             &mut renamed_keys,
                         );
+                        remapped_key_ids.clear();
+                        if has_collision {
+                            remapped_key_ids.reserve(fixture.key_dict.len());
+                            for (kid, renamed) in renamed_keys.iter().enumerate() {
+                                if let Some(exported) = renamed {
+                                    let new_kid = fixture.key_dict.len() + extra_key_spans.len();
+                                    let start = extra_key_arena.len();
+                                    extra_key_arena.push_str(exported);
+                                    extra_key_spans.push((start, extra_key_arena.len()));
+                                    remapped_key_ids.push(new_kid);
+                                } else {
+                                    remapped_key_ids.push(kid);
+                                }
+                            }
+                        }
+
                         eval_key_keep_mask(
                             black_box(&fixture.key_dict),
                             &stage2[0],
@@ -492,8 +511,14 @@ fn main() {
                         assert!(keep_cache.prepare(fixture.val_dict.len(), &stage2[1]));
                         assert!(xform_cache.prepare(fixture.val_dict.len(), &stage2[2]));
 
-                        let mut kept_series = 0usize;
-                        let mut kept_attrs = 0usize;
+                        extra_val_arena.clear();
+                        extra_val_spans.clear();
+                        mapped_val_ids.clear();
+                        mapped_val_ids.resize(fixture.val_dict.len(), None);
+                        out_attrs.clear();
+                        out_series_offsets.clear();
+                        out_series_offsets.push(0);
+
                         for (fam_idx, family_name) in
                             black_box(&fixture.family_names).iter().enumerate()
                         {
@@ -512,30 +537,68 @@ fn main() {
                                 if !env_kept {
                                     continue;
                                 }
-                                kept_series += 1;
-                                for &(kid, _vid) in &series.attrs {
-                                    if key_keep_mask[kid] {
-                                        kept_attrs += 1;
+                                for &(kid, vid) in &series.attrs {
+                                    if key_keep_mask[kid] && kid != app_key_id {
+                                        let out_kid = if has_collision {
+                                            remapped_key_ids[kid]
+                                        } else {
+                                            kid
+                                        };
+                                        out_attrs.push((out_kid, vid));
                                     }
                                 }
-                                let xform = match series.pod_val_id {
-                                    Some(vid) => xform_cache.transform_value(
-                                        vid,
-                                        black_box(&fixture.val_dict),
-                                        &stage2[2],
-                                    ),
-                                    None => xform_cache.when_absent(),
-                                };
-                                if matches!(
-                                    xform,
-                                    DictionaryValueTransform::SetTargetSlice { .. }
-                                        | DictionaryValueTransform::SetTarget(_)
-                                ) {
-                                    kept_attrs += 1;
+                                match series.pod_val_id {
+                                    Some(vid) => {
+                                        let out_vid = if let Some(cached_vid) = mapped_val_ids[vid]
+                                        {
+                                            Some(cached_vid)
+                                        } else {
+                                            let src = &fixture.val_dict[vid];
+                                            let xform = xform_cache.transform_value(
+                                                vid,
+                                                black_box(&fixture.val_dict),
+                                                &stage2[2],
+                                            );
+                                            xform.target_value(src).map(|new_val| {
+                                                let new_vid =
+                                                    fixture.val_dict.len() + extra_val_spans.len();
+                                                let start = extra_val_arena.len();
+                                                extra_val_arena.push_str(new_val);
+                                                extra_val_spans
+                                                    .push((start, extra_val_arena.len()));
+                                                mapped_val_ids[vid] = Some(new_vid);
+                                                new_vid
+                                            })
+                                        };
+                                        if let Some(new_vid) = out_vid {
+                                            out_attrs.push((app_key_id, new_vid));
+                                        }
+                                    }
+                                    None => {
+                                        if let Some(new_val) =
+                                            xform_cache.when_absent().target_value("")
+                                        {
+                                            let new_vid =
+                                                fixture.val_dict.len() + extra_val_spans.len();
+                                            let start = extra_val_arena.len();
+                                            extra_val_arena.push_str(new_val);
+                                            extra_val_spans.push((start, extra_val_arena.len()));
+                                            out_attrs.push((app_key_id, new_vid));
+                                        }
+                                    }
                                 }
+                                out_series_offsets.push(out_attrs.len());
                             }
                         }
-                        black_box((kept_series, kept_attrs));
+                        (out_series_offsets.len() - 1, out_attrs.len())
+                    };
+
+                    // Warm scratch capacities once to measure steady-state scrape reuse.
+                    black_box(run_once(fixture));
+
+                    b.report_allocs();
+                    while b.keep_running() {
+                        black_box(run_once(fixture));
                     }
                 },
             );
