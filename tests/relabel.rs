@@ -1009,7 +1009,7 @@ fn deserialized_legacy_validation_and_template_expansion_edge_cases() {
     };
     assert!(default_lower.validate(ValidationScheme::Legacy).is_err());
 
-    // Go `regexp.ExpandString` edge cases: `$$`, trailing `$`, `${}`, `${a-b}`, `${foo$1}`, unclosed `${1`, and leading-zero `$01`/`${01}`.
+    // Go `regexp.ExpandString` edge cases: `$$`, trailing `$`, `${}`, `${a-b}`, `${foo$1}`, unclosed `${1`, leading-zero `$01`/`${01}`, and non-decimal superscript `$1²`.
     let input = label_set(&[("a", "hello")]);
     let expanded = process(
         &input,
@@ -1017,7 +1017,7 @@ fn deserialized_legacy_validation_and_template_expansion_edge_cases() {
             source_labels: strs(&["a"]),
             regex: Regexp::must_new("(he)(llo)"),
             target_label: "out".to_owned(),
-            replacement: "$$-${}-${a-b}-${foo$1}-${1-$01-${01}-$1-$2-$".to_owned(),
+            replacement: "$$-${}-${a-b}-${foo$1}-${1-$01-${01}-$1-$2-$1²-$".to_owned(),
             action: Action::Replace,
             ..Config::default()
         }],
@@ -1025,7 +1025,7 @@ fn deserialized_legacy_validation_and_template_expansion_edge_cases() {
     .unwrap();
     assert_eq!(
         expanded.get("out").map(String::as_str),
-        Some("$-${}-${a-b}-${foohe}-${1---he-llo-$")
+        Some("$-${}-${a-b}-${foohe}-${1---he-llo-he²-$")
     );
 
     // Static `Action::Replace` fast path respects `ValidationScheme::Legacy`.

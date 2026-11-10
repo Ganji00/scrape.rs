@@ -805,12 +805,27 @@ fn extract_template_var(str_after_dollar: &str) -> Option<(&str, Option<usize>, 
         (false, str_after_dollar)
     };
 
+    let body_bytes = body.as_bytes();
     let mut end = 0;
-    for (idx, ch) in body.char_indices() {
-        if !ch.is_alphabetic() && !ch.is_numeric() && ch != '_' {
+    while end < body_bytes.len() {
+        let b = body_bytes[end];
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            end += 1;
+        } else if b >= 0x80 {
+            // Fall back to Unicode General Categories `L` (`unicode.IsLetter`) and `Nd`
+            // (`unicode.IsDigit`) so non-decimal numbers such as `'²'` (`No`) terminate `$1²`
+            // just like Go `regexp.extract`.
+            static IDENT_TAIL_RE: OnceLock<Regex> = OnceLock::new();
+            let re = IDENT_TAIL_RE.get_or_init(|| {
+                Regex::new(r"^[\p{L}\p{Nd}_]+").expect("valid template var identifier regex")
+            });
+            if let Some(m) = re.find(&body[end..]) {
+                end += m.end();
+            }
+            break;
+        } else {
             break;
         }
-        end = idx + ch.len_utf8();
     }
     if end == 0 {
         return None;
