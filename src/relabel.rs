@@ -683,8 +683,8 @@ fn apply_single(cfg: &Config, labels: &mut LabelSet, val: &mut String) -> bool {
                 .name_validation_scheme
                 .is_valid_label_name(&cfg.target_label)
             {
-                let lower = val.to_lowercase();
-                set_or_del(labels, Cow::Borrowed(&cfg.target_label), Cow::Owned(lower));
+                let lower = go_to_lowercase(val);
+                set_or_del(labels, Cow::Borrowed(&cfg.target_label), lower);
             }
         }
         Action::Uppercase => {
@@ -692,8 +692,8 @@ fn apply_single(cfg: &Config, labels: &mut LabelSet, val: &mut String) -> bool {
                 .name_validation_scheme
                 .is_valid_label_name(&cfg.target_label)
             {
-                let upper = val.to_uppercase();
-                set_or_del(labels, Cow::Borrowed(&cfg.target_label), Cow::Owned(upper));
+                let upper = go_to_uppercase(val);
+                set_or_del(labels, Cow::Borrowed(&cfg.target_label), upper);
             }
         }
         Action::HashMod => {
@@ -1503,11 +1503,11 @@ pub fn eval_single_label_value_transform<V: AsRef<str>>(
                         DictionaryValueTransform::DeleteTarget
                     }
                 } else {
-                    let lower = val_str.to_lowercase();
-                    if in_place && is_present && lower == val_str {
+                    let lower = go_to_lowercase(val_str);
+                    if in_place && is_present && lower.as_ref() == val_str {
                         DictionaryValueTransform::KeepExisting
                     } else {
-                        DictionaryValueTransform::SetTarget(lower)
+                        DictionaryValueTransform::SetTarget(lower.into_owned())
                     }
                 }
             }
@@ -1519,11 +1519,11 @@ pub fn eval_single_label_value_transform<V: AsRef<str>>(
                         DictionaryValueTransform::DeleteTarget
                     }
                 } else {
-                    let upper = val_str.to_uppercase();
-                    if in_place && is_present && upper == val_str {
+                    let upper = go_to_uppercase(val_str);
+                    if in_place && is_present && upper.as_ref() == val_str {
                         DictionaryValueTransform::KeepExisting
                     } else {
-                        DictionaryValueTransform::SetTarget(upper)
+                        DictionaryValueTransform::SetTarget(upper.into_owned())
                     }
                 }
             }
@@ -1554,6 +1554,85 @@ pub fn eval_single_label_value_transform<V: AsRef<str>>(
         transforms.push(eval_one(val.as_ref(), true));
     }
     Some(when_absent)
+}
+
+/// Maps `s` to lowercase using Go `strings.ToLower` (`unicode.ToLower`) simple 1-to-1 per-rune
+/// case mapping rather than Unicode `SpecialCasing` multi-character or context-sensitive rules.
+fn go_to_lowercase(s: &str) -> Cow<'_, str> {
+    if s.is_ascii() {
+        if !s.bytes().any(|b| b.is_ascii_uppercase()) {
+            return Cow::Borrowed(s);
+        }
+        return Cow::Owned(s.to_ascii_lowercase());
+    }
+    for (idx, ch) in s.char_indices() {
+        let mapped = go_lowercase_char(ch);
+        if mapped != ch {
+            let mut out = String::with_capacity(s.len());
+            out.push_str(&s[..idx]);
+            out.push(mapped);
+            for rest_ch in s[idx + ch.len_utf8()..].chars() {
+                out.push(go_lowercase_char(rest_ch));
+            }
+            return Cow::Owned(out);
+        }
+    }
+    Cow::Borrowed(s)
+}
+
+/// Maps `s` to uppercase using Go `strings.ToUpper` (`unicode.ToUpper`) simple 1-to-1 per-rune
+/// case mapping (so `"straße"` maps to `"STRAßE"`, matching Prometheus).
+fn go_to_uppercase(s: &str) -> Cow<'_, str> {
+    if s.is_ascii() {
+        if !s.bytes().any(|b| b.is_ascii_lowercase()) {
+            return Cow::Borrowed(s);
+        }
+        return Cow::Owned(s.to_ascii_uppercase());
+    }
+    for (idx, ch) in s.char_indices() {
+        let mapped = go_uppercase_char(ch);
+        if mapped != ch {
+            let mut out = String::with_capacity(s.len());
+            out.push_str(&s[..idx]);
+            out.push(mapped);
+            for rest_ch in s[idx + ch.len_utf8()..].chars() {
+                out.push(go_uppercase_char(rest_ch));
+            }
+            return Cow::Owned(out);
+        }
+    }
+    Cow::Borrowed(s)
+}
+
+fn go_lowercase_char(ch: char) -> char {
+    if ch.is_ascii() {
+        return ch.to_ascii_lowercase();
+    }
+    if ch == '\u{0130}' {
+        return 'i';
+    }
+    let mut it = ch.to_lowercase();
+    let first = it.next().unwrap_or(ch);
+    if it.next().is_none() { first } else { ch }
+}
+
+fn go_uppercase_char(ch: char) -> char {
+    if ch.is_ascii() {
+        return ch.to_ascii_uppercase();
+    }
+    match ch as u32 {
+        cp @ (0x1F80..=0x1F87 | 0x1F90..=0x1F97 | 0x1FA0..=0x1FA7) => {
+            char::from_u32(cp + 8).unwrap_or(ch)
+        }
+        0x1FB3 => '\u{1FBC}',
+        0x1FC3 => '\u{1FCC}',
+        0x1FF3 => '\u{1FFC}',
+        _ => {
+            let mut it = ch.to_uppercase();
+            let first = it.next().unwrap_or(ch);
+            if it.next().is_none() { first } else { ch }
+        }
+    }
 }
 
 /// Pure-Rust RFC 1321 MD5 implementation used by [`Action::HashMod`].

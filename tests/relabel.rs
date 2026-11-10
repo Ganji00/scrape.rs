@@ -1078,6 +1078,55 @@ fn deserialized_legacy_validation_and_template_expansion_edge_cases() {
     assert!(re_quoted.is_match(r"\d+"));
     assert!(re_quoted.is_match(r"\d"));
     assert!(!re_quoted.is_match("99"));
+
+    // Go `strings.ToUpper` / `strings.ToLower` simple per-rune case mapping (`"straße"` -> `"STRAßE"`, `"İ"` -> `"i"`, `"ΟΣ"` -> `"οσ"`).
+    let case_res = process(
+        &label_set(&[("de", "straße"), ("tr", "İ"), ("gr", "ΟΣ")]),
+        &[
+            Config {
+                source_labels: strs(&["de"]),
+                target_label: "de_up".to_owned(),
+                action: Action::Uppercase,
+                ..Config::default()
+            },
+            Config {
+                source_labels: strs(&["tr"]),
+                target_label: "tr_lo".to_owned(),
+                action: Action::Lowercase,
+                ..Config::default()
+            },
+            Config {
+                source_labels: strs(&["gr"]),
+                target_label: "gr_lo".to_owned(),
+                action: Action::Lowercase,
+                ..Config::default()
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(case_res.get("de_up").map(String::as_str), Some("STRAßE"));
+    assert_eq!(case_res.get("tr_lo").map(String::as_str), Some("i"));
+    assert_eq!(case_res.get("gr_lo").map(String::as_str), Some("οσ"));
+
+    let mut dict_case_transforms = Vec::new();
+    eval_single_label_value_transform(
+        &["straße", "STRAßE"],
+        &Config {
+            source_labels: strs(&["de"]),
+            target_label: "de".to_owned(),
+            action: Action::Uppercase,
+            ..Config::default()
+        },
+        &mut dict_case_transforms,
+    )
+    .unwrap();
+    assert_eq!(
+        dict_case_transforms,
+        vec![
+            DictionaryValueTransform::SetTarget("STRAßE".to_owned()),
+            DictionaryValueTransform::KeepExisting,
+        ]
+    );
 }
 
 #[test]
