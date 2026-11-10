@@ -607,30 +607,15 @@ pub fn process_in_place(labels: &mut LabelSet, cfgs: &[Config]) -> bool {
     labels.retain(|_, v| !v.is_empty());
 
     let mut val_buf = String::new();
-    let mut rule_locs: Vec<Option<CaptureLocations>> = Vec::new();
-    for (rule_idx, cfg) in cfgs.iter().enumerate() {
-        if !apply_single(
-            cfg,
-            rule_idx,
-            cfgs.len(),
-            labels,
-            &mut val_buf,
-            &mut rule_locs,
-        ) {
+    for cfg in cfgs {
+        if !apply_single(cfg, labels, &mut val_buf) {
             return false;
         }
     }
     true
 }
 
-fn apply_single(
-    cfg: &Config,
-    rule_idx: usize,
-    total_rules: usize,
-    labels: &mut LabelSet,
-    val: &mut String,
-    rule_locs: &mut Vec<Option<CaptureLocations>>,
-) -> bool {
+fn apply_single(cfg: &Config, labels: &mut LabelSet, val: &mut String) -> bool {
     val.clear();
     for (idx, ln) in cfg.source_labels.iter().enumerate() {
         if idx > 0 {
@@ -681,19 +666,15 @@ fn apply_single(
                 return true;
             }
 
-            if rule_locs.is_empty() {
-                rule_locs.resize_with(total_rules, || None);
-            }
-            let locs =
-                rule_locs[rule_idx].get_or_insert_with(|| cfg.regex.compiled.capture_locations());
-            if cfg.regex.compiled.captures_read(locs, val).is_none() {
+            let mut locs = cfg.regex.compiled.capture_locations();
+            if cfg.regex.compiled.captures_read(&mut locs, val).is_none() {
                 return true;
             }
-            let target = expand_template(&cfg.target_label, val, locs, &cfg.regex.named_groups);
+            let target = expand_template(&cfg.target_label, val, &locs, &cfg.regex.named_groups);
             if !cfg.name_validation_scheme.is_valid_label_name(&target) {
                 return true;
             }
-            let res = expand_template(&cfg.replacement, val, locs, &cfg.regex.named_groups);
+            let res = expand_template(&cfg.replacement, val, &locs, &cfg.regex.named_groups);
             set_or_del(labels, target, res);
         }
         Action::Lowercase => {
@@ -725,16 +706,12 @@ fn apply_single(
             }
         }
         Action::LabelMap => {
-            if rule_locs.is_empty() {
-                rule_locs.resize_with(total_rules, || None);
-            }
-            let locs =
-                rule_locs[rule_idx].get_or_insert_with(|| cfg.regex.compiled.capture_locations());
+            let mut locs = cfg.regex.compiled.capture_locations();
             let mut mapped = Vec::new();
             for (name, value) in labels.iter() {
-                if cfg.regex.compiled.captures_read(locs, name).is_some() {
+                if cfg.regex.compiled.captures_read(&mut locs, name).is_some() {
                     let res =
-                        expand_template(&cfg.replacement, name, locs, &cfg.regex.named_groups);
+                        expand_template(&cfg.replacement, name, &locs, &cfg.regex.named_groups);
                     if cfg.name_validation_scheme.is_valid_label_name(&res) {
                         mapped.push((res.into_owned(), value.clone()));
                     }
