@@ -1,6 +1,6 @@
-# `expfmt` specification and implementation plan
+# `scrape.rs` specification and implementation plan
 
-The `expfmt` crate in `scrape.rs` provides official Rust decoders for Prometheus and OpenMetrics wire exposition formats.
+`scrape.rs` (`expfmt` crate) provides official Rust decoders for Prometheus and OpenMetrics wire exposition formats along with integrated Prometheus target and metric relabeling (`relabel`).
 
 ## Background and goals
 

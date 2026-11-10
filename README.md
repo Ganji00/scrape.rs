@@ -28,8 +28,8 @@ The project serves two main use cases:
 
 | Component | Status | Specification | Scope |
 | :--- | :--- | :--- | :--- |
-| `expfmt` | In progress | [specs/expfmt/SPEC.md](./specs/expfmt/SPEC.md) | `Content-Type` and `Accept` negotiation, zero-copy streaming parsers for Prometheus Text 0.0.4, OpenMetrics 1.0, OpenMetrics 2.0, and Prometheus Protobuf, primary Apache Arrow / OTAP decoder (`ArrowDecoder`), and [`MetricFamily`](https://github.com/prometheus/prometheus/blob/main/prompb/io/prometheus/client/metrics.proto) protobuf DTO decoder. |
-| `relabel` | In progress | [specs/expfmt/SPEC.md](./specs/expfmt/SPEC.md#target-and-metric-relabeling-architecture) | Prometheus-compatible target and metric relabeling (`replace`, `keep`, `drop`, `hashmod`, `labelmap`, `labeldrop`, `labelkeep`, `lowercase`, `uppercase`, `keepequal`, `dropequal`), Stage 1 `__name__` family filter pushdown, and Stage 2 dictionary-vectorized relabeling and `honor_labels` resolution. |
+| `expfmt` | In progress | [specs/SPEC.md](./specs/SPEC.md) | `Content-Type` and `Accept` negotiation, zero-copy streaming parsers for Prometheus Text 0.0.4, OpenMetrics 1.0, OpenMetrics 2.0, and Prometheus Protobuf, primary Apache Arrow / OTAP decoder (`ArrowDecoder`), and [`MetricFamily`](https://github.com/prometheus/prometheus/blob/main/prompb/io/prometheus/client/metrics.proto) protobuf DTO decoder. |
+| `relabel` | In progress | [specs/SPEC.md](./specs/SPEC.md#target-and-metric-relabeling-architecture) | Prometheus-compatible target and metric relabeling (`replace`, `keep`, `drop`, `hashmod`, `labelmap`, `labeldrop`, `labelkeep`, `lowercase`, `uppercase`, `keepequal`, `dropequal`), Stage 1 `__name__` filter pushdown, and Stage 2 dictionary-vectorized relabeling and `honor_labels` resolution. |
 | `discovery` | Planned | TBD | Standard Prometheus service discovery mechanisms (static targets, file-based SD, HTTP SD, DNS SD, Kubernetes SD) emitting target groups and `__meta_*` labels. |
 | `scrape` | Planned | TBD | Bounded HTTP scrape scheduling, target pool lifecycle, compression and content negotiation, stale marker handling, target state reporting, and self-telemetry. |
 
