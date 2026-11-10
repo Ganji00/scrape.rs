@@ -686,13 +686,7 @@ fn apply_single(cfg: &Config, labels: &mut LabelSet, val: &mut String) -> bool {
                     .name_validation_scheme
                     .is_valid_label_name(&cfg.target_label)
             {
-                let digest = md5_sum(val.as_bytes());
-                // Prometheus uses the last 8 bytes of the 16-byte MD5 digest as big-endian u64.
-                let low = u64::from_be_bytes([
-                    digest[8], digest[9], digest[10], digest[11], digest[12], digest[13],
-                    digest[14], digest[15],
-                ]);
-                let modulo = (low % cfg.modulus).to_string();
+                let modulo = hashmod_value(val, cfg.modulus);
                 set_or_del(labels, Cow::Borrowed(&cfg.target_label), Cow::Owned(modulo));
             }
         }
@@ -1529,12 +1523,7 @@ pub fn eval_single_label_value_transform<V: AsRef<str>>(
                 if cfg.modulus == 0 {
                     return DictionaryValueTransform::KeepExisting;
                 }
-                let digest = md5_sum(val_str.as_bytes());
-                let low = u64::from_be_bytes([
-                    digest[8], digest[9], digest[10], digest[11], digest[12], digest[13],
-                    digest[14], digest[15],
-                ]);
-                let modulo = (low % cfg.modulus).to_string();
+                let modulo = hashmod_value(val_str, cfg.modulus);
                 if in_place && is_present && modulo == val_str {
                     DictionaryValueTransform::KeepExisting
                 } else {
@@ -1631,6 +1620,17 @@ fn go_uppercase_char(ch: char) -> char {
             if it.next().is_none() { first } else { ch }
         }
     }
+}
+
+/// Computes the Prometheus `hashmod` decimal string from the lower 64 big-endian bits of MD5.
+fn hashmod_value(val: &str, modulus: u64) -> String {
+    let digest = md5_sum(val.as_bytes());
+    // Prometheus uses the last 8 bytes of the 16-byte MD5 digest as big-endian u64.
+    let low = u64::from_be_bytes([
+        digest[8], digest[9], digest[10], digest[11], digest[12], digest[13], digest[14],
+        digest[15],
+    ]);
+    (low % modulus).to_string()
 }
 
 /// Pure-Rust RFC 1321 MD5 implementation used by [`Action::HashMod`].
