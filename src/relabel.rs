@@ -79,9 +79,6 @@ pub enum RelabelError {
 /// Relabeling action matching Prometheus `relabel.Action`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Action {
-    /// Empty/unset action (only produced when constructing an uninitialized [`Config`] manually;
-    /// deserialized configs default to [`Action::Replace`]).
-    Empty,
     /// Performs a regular expression replacement on `target_label` (default).
     #[default]
     Replace,
@@ -111,7 +108,6 @@ impl Action {
     /// Returns the lowercase Prometheus string representation of this action.
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Empty => "",
             Self::Replace => "replace",
             Self::Keep => "keep",
             Self::Drop => "drop",
@@ -398,10 +394,6 @@ const fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
 
-const fn is_empty_action(a: &Action) -> bool {
-    matches!(a, Action::Empty)
-}
-
 /// Configuration for a single relabeling step matching Prometheus `relabel.Config`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -430,7 +422,7 @@ pub struct Config {
     #[serde(default = "default_replacement")]
     pub replacement: String,
     /// Relabeling action to perform (defaults to [`Action::Replace`]).
-    #[serde(default, skip_serializing_if = "is_empty_action")]
+    #[serde(default)]
     pub action: Action,
     /// Label name validation scheme (not serialized in YAML/JSON, matching Prometheus).
     #[serde(skip)]
@@ -455,11 +447,6 @@ impl Default for Config {
 impl Config {
     /// Validates this relabel configuration according to Prometheus `relabel.Config.Validate`.
     pub fn validate(&mut self, default_scheme: ValidationScheme) -> Result<(), RelabelError> {
-        if self.action == Action::Empty {
-            return Err(RelabelError::InvalidConfig(
-                "relabel action cannot be empty".to_owned(),
-            ));
-        }
         if self.modulus == 0 && self.action == Action::HashMod {
             return Err(RelabelError::InvalidConfig(
                 "relabel configuration for hashmod requires non-zero modulus".to_owned(),
@@ -734,7 +721,6 @@ fn apply_single(cfg: &Config, labels: &mut LabelSet, val: &mut String) -> bool {
         Action::LabelKeep => {
             labels.retain(|name, _| cfg.regex.is_match(name));
         }
-        Action::Empty => {}
     }
 
     true

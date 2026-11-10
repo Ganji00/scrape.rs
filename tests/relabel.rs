@@ -405,18 +405,6 @@ fn relabel_matches_prometheus_relabel_test_suite() {
 #[test]
 fn relabel_validate_matches_prometheus() {
     // Ported from TestRelabelValidate in model/relabel/relabel_test.go.
-    let mut empty_action = Config {
-        action: Action::Empty,
-        ..Config::default()
-    };
-    assert_eq!(
-        empty_action
-            .validate(ValidationScheme::Utf8)
-            .unwrap_err()
-            .to_string(),
-        "relabel action cannot be empty"
-    );
-
     let mut replace_no_target = Config {
         action: Action::Replace,
         target_label: String::new(),
