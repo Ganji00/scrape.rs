@@ -1238,15 +1238,15 @@ fn is_metric_name_pushdown_filter(cfg: &Config) -> bool {
     }
 }
 
-/// Splits `cfgs` into `(name_pushdown_prefix, remaining_cfgs)` for Stage 1 family-level
+/// Splits `cfgs` into `(name_pushdown_prefix, remaining_cfgs)` for Stage 1 wire-series
 /// `__name__` filtering in Layer 1 decoders.
 ///
 /// `name_pushdown_prefix` is the longest leading prefix of rules that perform [`Action::Keep`],
 /// [`Action::Drop`], [`Action::KeepEqual`], or [`Action::DropEqual`] exclusively over
 /// [`METRIC_NAME_LABEL`] (`"__name__"`). Because those rules neither read non-`__name__` sample
 /// labels nor mutate any label, callers can evaluate [`keep_metric_name`] once per contiguous
-/// metric family or series-name transition and skip float parsing, label unescaping, string
-/// interning, and histogram/summary assembly whenever a family is dropped.
+/// wire series-name transition (e.g. `foo_bucket`, `foo_count`) and skip float parsing, label
+/// unescaping, string interning, and histogram/summary assembly whenever a series run is dropped.
 #[must_use]
 pub fn split_metric_name_pushdown(cfgs: &[Config]) -> (&[Config], &[Config]) {
     let prefix_len = cfgs

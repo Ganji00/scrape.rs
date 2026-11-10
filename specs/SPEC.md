@@ -8,7 +8,7 @@ Rust metric pipelines and tools currently lack an official, spec-compliant parse
 
 This repository targets two use cases:
 
-1. High-throughput columnar ingestion for OpenTelemetry Arrow. [`open-telemetry/otel-arrow#3277`](https://github.com/open-telemetry/otel-arrow/issues/3277) defines an OTAP-native `prometheus_scrape` receiver in Rust. Its steady-state path streams scrape bytes through early `__name__` family filtering, metric family assembly, and dictionary-vectorized relabeling directly into Apache Arrow metric records. That avoids intermediate Go-style `pmetric` or SDK `metricdata` object graphs and fits thread-per-core `!Send` runtimes with bounded memory.
+1. High-throughput columnar ingestion for OpenTelemetry Arrow. [`open-telemetry/otel-arrow#3277`](https://github.com/open-telemetry/otel-arrow/issues/3277) defines an OTAP-native `prometheus_scrape` receiver in Rust. Its steady-state path streams scrape bytes through early `__name__` series filtering, metric family assembly, and dictionary-vectorized relabeling directly into Apache Arrow metric records. That avoids intermediate Go-style `pmetric` or SDK `metricdata` object graphs and fits thread-per-core `!Send` runtimes with bounded memory.
 2. Programmatic inspection and ecosystem tooling. Validation tools like OpenTelemetry Weaver live-checking `/metrics` endpoints against semantic conventions, test harnesses, and Rust CLIs need an ergonomic API that decodes any Prometheus or OpenMetrics payload into standard [`io.prometheus.client.MetricFamily`](https://github.com/prometheus/prometheus/blob/main/prompb/io/prometheus/client/metrics.proto) protobuf structs, matching Go's [`prometheus/common/expfmt`](https://github.com/prometheus/common/tree/main/expfmt).
 
 ## Supported formats and content negotiation
@@ -45,7 +45,7 @@ Decoding is split into three chained layers so streaming callers pay zero per-sa
                                      ▼  Primary API
         ┌─────────────────────────────────────────────────────────┐
         │  Layer 1: Arrow / OTAP decoder                          │
-        │  - Stage 1 pushdown: family `__name__` keep/drop filter │
+        │  - Stage 1 pushdown: series `__name__` keep/drop filter │
         │  - Metric family assembly & arena string interners      │
         │  - Stage 2: dictionary-vectorized relabeling &          │
         │    `honor_labels` key resolution                        │
@@ -116,7 +116,7 @@ This is the primary API, designed for the [`open-telemetry/otel-arrow#3277`](htt
 ```text
 scrape bytes
   -> streaming parser
-  -> Stage 1: family `__name__` keep/drop filter pushdown
+  -> Stage 1: series `__name__` keep/drop filter pushdown
   -> metric family assembler & arena string interners (`key_interner`, `val_interner`)
   -> Stage 2: dictionary-vectorized relabeling & `honor_labels`
   -> direct OTAP metric records (ready for DataFusion / Arrow SIMD execution)
@@ -125,7 +125,7 @@ scrape bytes
 - `ArrowDecoder` appends parsed metrics, attributes, number data points, summary data points, classic and exponential histogram data points, and exemplars directly into Arrow array builders (`arrow-array` and `arrow-schema`), matching the relational `id` and `parent_id` tables in [`rust/otap-dataflow/crates/pdata`](https://github.com/open-telemetry/otel-arrow/tree/main/rust/otap-dataflow/crates/pdata). Callers can materialize one batch set per scrape with `ArrowDecoder::decode`, pull bounded chunks on demand with `ArrowDecoder::decode_stream` to cap scratch memory and stay within OTAP's `u16` per-batch metric ID limit, or yield cooperatively between bounded steps with `DecodeBudget`, `DecodeStep`, `DecodeStream::step`, `DecodeCursor` (`ArrowDecoder::start_decode` / `start_decode_stream` / `step_decode`), `ArrowDecoder::decode_cooperative`, and `DecodeStream::next_cooperative` so multi-megabyte scrapes do not starve timers or peer tasks on single-threaded `!Send` `LocalSet` runtimes.
 - Metric families in text exposition are decoded as contiguous runs, with `# HELP`, `# TYPE`, and `# UNIT` metadata lines preceding that family's samples. Like OpenMetrics 1.0/2.0 and Prometheus's scrape loop, `ArrowDecoder` tracks only the active family cursor instead of maintaining a whole-scrape hash table to reassemble or reject previously seen names, so a non-contiguous repetition of an earlier metric name starts a fresh untyped run unless preceded by its own metadata.
 - Rather than materializing a per-sample `BTreeMap` or running regular expressions on every scraped text line, `metric_relabel_configs` and `honor_labels` split into a two-stage pipeline (see [Target and metric relabeling architecture](#target-and-metric-relabeling-architecture)):
-  1. **Stage 1 (`__name__` family filter pushdown)**: Leading `keep`, `drop`, `keepequal`, and `dropequal` rules that inspect only `__name__` run once per contiguous family / series-name transition so dropped metric families skip float parsing, label unescaping, string interning, and family assembly.
+  1. **Stage 1 (`__name__` series filter pushdown)**: Leading `keep`, `drop`, `keepequal`, and `dropequal` rules that inspect only `__name__` run once per contiguous wire series-name transition (e.g. `foo_bucket`, `foo_sum`, `foo_count`, matching Prometheus `scrape/scrape.go`) so dropped series runs skip float parsing, label unescaping, string interning, and family assembly.
   2. **Stage 2 (dictionary-vectorized relabeling and `honor_labels`)**: Once kept series have been assembled into metric families (collapsing classic histogram `_bucket`, `_sum`, and `_count` lines into a single `HistogramDataPoints` row) and their label keys and values have been deduplicated in `key_interner` and `val_interner`, attribute-level `honor_labels` collision resolution, `labeldrop` / `labelkeep`, and single-label value transformations (`replace`, `lowercase`, `uppercase`, `hashmod`) execute in $O(U_{\text{keys}} + U_{\text{vals}})$ across the unique dictionary entries instead of $O(N_{\text{samples}})$.
 - The metric family assembler groups classic histogram `_bucket`, `_sum`, and `_count` lines and summary `quantile`, `_sum`, and `_count` lines (plus OpenMetrics `_created` start timestamps) into complete metric families.
 - Configurable translation policies control counter `_total` and unit suffix handling and untyped series handling.
@@ -141,7 +141,7 @@ The `relabel` module implements Prometheus `relabel_configs`, `metric_relabel_co
    - Non-reserved target labels (`PopulatedTarget::public_labels()`) attach once per scrape to the batch's `ResourceAttrs` (`job` -> `service.name`, `instance` -> `service.instance.id`) rather than duplicating unchanged target labels onto every data-point attribute row. When a `metric_relabel_configs` rule reads or mutates a public target label key (such as `source_labels: ["job"]`, `target_label: "job"`, `labeldrop`, `labelkeep`, or `labelmap`), Stage 2 resolves that key against the post-`honor_labels` target label value (using the target label when `honor_labels = false` or when the series omits that key under `honor_labels = true`) and materializes per-point attribute overrides only if a rule mutates or drops the target label.
 2. **Stage 1 pre-staging `__name__` filter pushdown (Layer 1 ingestion)**:
    - `relabel::split_metric_name_pushdown` extracts the leading prefix of `metric_relabel_configs` rules (`keep`, `drop`, `keepequal`, `dropequal`) that depend exclusively on `__name__`.
-   - `ArrowDecoder` evaluates `relabel::keep_metric_name` once when transitioning to a new contiguous family / series name (~200 times per scrape instead of once per sample), discarding dropped families before parsing sample floats, unescaping labels, interning strings, or staging histogram buckets.
+   - Layer 1 evaluates `relabel::keep_metric_name` against the wire series `__name__` (such as `foo_bucket` or `foo_count`, not the stripped family base name `foo`) once when transitioning to a new contiguous series-name run, discarding dropped series runs before parsing sample floats, unescaping labels, interning strings, or staging histogram buckets.
 3. **Stage 2 dictionary-vectorized relabeling and Layer 3 DataFusion SIMD execution**:
    - After `ArrowDecoder` interns label keys into `key_interner` ($U_{\text{keys}}$ unique keys, typically ~32) and label values into `val_interner` ($U_{\text{vals}}$ unique values, typically a few hundred), dictionary-level primitives in `relabel` avoid per-sample regex and string allocations:
      - **`honor_labels = false` (`relabel::resolve_conflicting_exposed_keys`)**: Checks `key_interner` against public target labels in $O(U_{\text{keys}})$. When no sample label key collides with a target label key (the common case), `honor_labels` is a zero-copy no-op. When a collision occurs, only the colliding dictionary entries are renamed to `exported_<name>` in ascending key-length order (matching Prometheus `resolveConflictingExposedLabels`).
