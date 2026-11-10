@@ -877,12 +877,13 @@ pub fn populate_discovered_labels(
     out
 }
 
-/// Populates discovered labels, applies `relabel_configs`, validates `__address__`, strips
-/// `__meta_*` labels, and sets the default `instance` label, matching Prometheus
-/// `scrape.PopulateLabels`.
+/// Populates discovered labels, applies `relabel_configs`, validates `__address__`,
+/// `__scrape_interval__`, and `__scrape_timeout__`, strips `__meta_*` labels, and sets the default
+/// `instance` label, matching Prometheus `scrape.PopulateLabels`.
 ///
 /// Returns `Ok(Some(PopulatedTarget))` if the target is kept, `Ok(None)` if dropped by
-/// `relabel_configs`, or `Err(RelabelError::TargetError)` if `__address__` is missing or invalid.
+/// `relabel_configs`, or `Err(RelabelError::TargetError)` if `__address__`, `__scrape_interval__`,
+/// or `__scrape_timeout__` is missing or invalid.
 pub fn populate_labels(
     target: &LabelSet,
     group_labels: &LabelSet,
@@ -903,8 +904,53 @@ pub fn populate_labels(
     }
     if addr.contains('/') {
         return Err(RelabelError::TargetError(format!(
-            "address {addr:?} cannot contain '/'"
+            "{addr:?} is not a valid hostname"
         )));
+    }
+
+    let interval_str = labels.get(SCRAPE_INTERVAL_LABEL).map_or("", String::as_str);
+    let interval_ns = parse_prometheus_duration(interval_str)
+        .map_err(|e| RelabelError::TargetError(format!("error parsing scrape interval: {e}")))?;
+    if interval_ns == 0 {
+        return Err(RelabelError::TargetError(
+            "scrape interval cannot be 0".to_owned(),
+        ));
+    }
+
+    let timeout_str = labels.get(SCRAPE_TIMEOUT_LABEL).map_or("", String::as_str);
+    let timeout_ns = parse_prometheus_duration(timeout_str)
+        .map_err(|e| RelabelError::TargetError(format!("error parsing scrape timeout: {e}")))?;
+    if timeout_ns == 0 {
+        return Err(RelabelError::TargetError(
+            "scrape timeout cannot be 0".to_owned(),
+        ));
+    }
+
+    if timeout_ns > interval_ns {
+        return Err(RelabelError::TargetError(format!(
+            "scrape timeout cannot be greater than scrape interval ({timeout_str:?} > {interval_str:?})"
+        )));
+    }
+
+    for (label_name, desc) in [
+        (
+            "__convert_classic_histograms_to_nhcb__",
+            "convert classic histograms to nhcb",
+        ),
+        (
+            "__always_scrape_classic_histograms__",
+            "always scrape classic histograms",
+        ),
+        ("__scrape_native_histograms__", "scrape native histograms"),
+    ] {
+        if let Some(val) = labels.get(label_name)
+            && !val.is_empty()
+            && !is_valid_go_bool(val)
+        {
+            return Err(RelabelError::TargetError(format!(
+                "error parsing {desc}: invalid syntax {val:?}"
+            )));
+        }
     }
 
     // Remove all `__meta_*` labels after target relabeling.
@@ -919,6 +965,82 @@ pub fn populate_labels(
         labels,
         discovered_labels,
     }))
+}
+
+/// Parses a non-negative Prometheus duration string into nanoseconds matching
+/// `github.com/prometheus/common/model.ParseDuration` (`y`, `w`, `d`, `h`, `m`, `s`, `ms` in
+/// strictly decreasing unit order, plus `"0"`).
+fn parse_prometheus_duration(s: &str) -> Result<u64, String> {
+    if s == "0" {
+        return Ok(0);
+    }
+    if s.is_empty() {
+        return Err("empty duration string".to_owned());
+    }
+
+    const MS_NS: u64 = 1_000_000;
+    const SEC_NS: u64 = 1_000 * MS_NS;
+    const MIN_NS: u64 = 60 * SEC_NS;
+    const HOUR_NS: u64 = 60 * MIN_NS;
+    const DAY_NS: u64 = 24 * HOUR_NS;
+    const WEEK_NS: u64 = 7 * DAY_NS;
+    const YEAR_NS: u64 = 365 * DAY_NS;
+    const MAX_DURATION_NS: u64 = i64::MAX as u64;
+
+    let orig = s;
+    let mut rest = s;
+    let mut total_ns = 0u64;
+    let mut last_unit_pos = 0u8;
+
+    while !rest.is_empty() {
+        let digit_len = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if digit_len == 0 {
+            return Err(format!("not a valid duration string: {orig:?}"));
+        }
+        let val: u64 = rest[..digit_len]
+            .parse()
+            .map_err(|_| format!("not a valid duration string: {orig:?}"))?;
+        rest = &rest[digit_len..];
+
+        let unit_len = rest.bytes().take_while(|b| !b.is_ascii_digit()).count();
+        if unit_len == 0 {
+            return Err(format!("not a valid duration string: {orig:?}"));
+        }
+        let unit = &rest[..unit_len];
+        rest = &rest[unit_len..];
+
+        let (pos, mult) = match unit {
+            "y" => (1u8, YEAR_NS),
+            "w" => (2, WEEK_NS),
+            "d" => (3, DAY_NS),
+            "h" => (4, HOUR_NS),
+            "m" => (5, MIN_NS),
+            "s" => (6, SEC_NS),
+            "ms" => (7, MS_NS),
+            _ => return Err(format!("unknown unit {unit:?} in duration {orig:?}")),
+        };
+        if pos <= last_unit_pos {
+            return Err(format!("not a valid duration string: {orig:?}"));
+        }
+        last_unit_pos = pos;
+
+        if val > (1u64 << 63) / mult {
+            return Err("duration out of range".to_owned());
+        }
+        total_ns = total_ns
+            .checked_add(val * mult)
+            .filter(|&d| d <= MAX_DURATION_NS)
+            .ok_or_else(|| "duration out of range".to_owned())?;
+    }
+
+    Ok(total_ns)
+}
+
+fn is_valid_go_bool(s: &str) -> bool {
+    matches!(
+        s,
+        "1" | "t" | "T" | "true" | "TRUE" | "True" | "0" | "f" | "F" | "false" | "FALSE" | "False"
+    )
 }
 
 /// Merges non-reserved target labels onto a scraped sample's `metric_labels` according to

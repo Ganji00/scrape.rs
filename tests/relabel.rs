@@ -896,6 +896,52 @@ fn populate_labels_and_honor_labels_merging_match_prometheus() {
     let slash_addr = label_set(&[("__address__", "127.0.0.1:9090/metrics")]);
     assert!(populate_labels(&slash_addr, &group_labels, &pop_cfg, &[]).is_err());
 
+    // Scrape interval / timeout validation matching Go `scrape.PopulateLabels`.
+    let timeout_gt_interval = label_set(&[
+        ("__address__", "127.0.0.1:9090"),
+        ("__scrape_interval__", "15s"),
+        ("__scrape_timeout__", "30s"),
+    ]);
+    assert_eq!(
+        populate_labels(&timeout_gt_interval, &group_labels, &pop_cfg, &[])
+            .unwrap_err()
+            .to_string(),
+        "scrape timeout cannot be greater than scrape interval (\"30s\" > \"15s\")"
+    );
+
+    let zero_interval = label_set(&[
+        ("__address__", "127.0.0.1:9090"),
+        ("__scrape_interval__", "0"),
+    ]);
+    assert_eq!(
+        populate_labels(&zero_interval, &group_labels, &pop_cfg, &[])
+            .unwrap_err()
+            .to_string(),
+        "scrape interval cannot be 0"
+    );
+
+    let bad_unit_order = label_set(&[
+        ("__address__", "127.0.0.1:9090"),
+        ("__scrape_interval__", "1m1d"),
+    ]);
+    assert!(
+        populate_labels(&bad_unit_order, &group_labels, &pop_cfg, &[])
+            .unwrap_err()
+            .to_string()
+            .contains("error parsing scrape interval")
+    );
+
+    let compound_interval = label_set(&[
+        ("__address__", "127.0.0.1:9090"),
+        ("__scrape_interval__", "1m30s"),
+        ("__scrape_timeout__", "45s500ms"),
+    ]);
+    assert!(
+        populate_labels(&compound_interval, &group_labels, &pop_cfg, &[])
+            .unwrap()
+            .is_some()
+    );
+
     // honor_labels = false: conflicting sample labels are renamed to `exported_<name>`.
     let mut sample_labels = label_set(&[
         ("job", "sample-job"),
