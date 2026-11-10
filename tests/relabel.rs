@@ -1058,6 +1058,26 @@ fn deserialized_legacy_validation_and_template_expansion_edge_cases() {
         .unwrap();
         assert_eq!(res.get("h").map(String::as_str), Some(expected_mod));
     }
+
+    // Go RE2 ASCII Perl classes (`\d`, `\w`, `\s`, `\b`) reject non-ASCII digits/letters while `.` stays Unicode-aware.
+    let re_digits = Regexp::must_new(r"\d+");
+    assert!(re_digits.is_match("123"));
+    assert!(!re_digits.is_match("١٢٣"));
+    assert_eq!(re_digits.as_str(), r"\d+");
+
+    let re_word_space = Regexp::must_new(r"[\w]+[\s]+[\d_]+");
+    assert!(re_word_space.is_match("abc_1 \t 42_0"));
+    assert!(!re_word_space.is_match("αβγ 42"));
+    assert!(!re_word_space.is_match("abc\u{00A0}42"));
+
+    let re_boundary = Regexp::must_new(r".*\bfoo\b.*");
+    assert!(re_boundary.is_match("١foo"));
+    assert!(!re_boundary.is_match("1foo"));
+
+    let re_quoted = Regexp::must_new(r"\Q\d+\E|\\d");
+    assert!(re_quoted.is_match(r"\d+"));
+    assert!(re_quoted.is_match(r"\d"));
+    assert!(!re_quoted.is_match("99"));
 }
 
 #[test]

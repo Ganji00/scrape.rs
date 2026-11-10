@@ -244,9 +244,11 @@ impl Default for Regexp {
 
 impl Regexp {
     /// Compiles a new anchored regular expression `^(?s:<pattern>)$` matching Prometheus
-    /// `relabel.NewRegexp`.
+    /// `relabel.NewRegexp` (including Go RE2 ASCII semantics for `\d`, `\D`, `\w`, `\W`, `\s`,
+    /// `\S`, `\b`, and `\B`).
     pub fn new(pattern: &str) -> Result<Self, RelabelError> {
-        let anchored = format!("^(?s:{pattern})$");
+        let normalized = rewrite_re2_ascii_perl_escapes(pattern);
+        let anchored = format!("^(?s:{normalized})$");
         let compiled =
             Regex::new(&anchored).map_err(|e| RelabelError::InvalidRegex(e.to_string()))?;
         Ok(Self {
@@ -306,6 +308,82 @@ impl<'de> Deserialize<'de> for Regexp {
         let pattern = opt.unwrap_or_default();
         Self::new(&pattern).map_err(serde::de::Error::custom)
     }
+}
+
+/// Rewrites Go RE2 ASCII Perl escapes (`\d`, `\D`, `\w`, `\W`, `\s`, `\S`, `\b`, `\B`) so
+/// `regex::Regex` keeps `.` and `\p{...}` Unicode-aware while matching ASCII-only Perl classes
+/// like Go `regexp/syntax`.
+fn rewrite_re2_ascii_perl_escapes(pattern: &str) -> Cow<'_, str> {
+    if !pattern.contains('\\') {
+        return Cow::Borrowed(pattern);
+    }
+
+    let mut out = String::with_capacity(pattern.len() + 8);
+    let mut chars = pattern.chars().peekable();
+    let mut bracket_depth = 0usize;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => match chars.next() {
+                None => out.push('\\'),
+                Some('Q') => {
+                    let mut quoted = String::new();
+                    while let Some(qch) = chars.next() {
+                        if qch == '\\' && chars.peek() == Some(&'E') {
+                            chars.next();
+                            break;
+                        }
+                        quoted.push(qch);
+                    }
+                    out.push_str(&regex::escape(&quoted));
+                }
+                Some('d') => out.push_str("[0-9]"),
+                Some('D') => out.push_str("[^0-9]"),
+                Some('w') => out.push_str("[0-9A-Za-z_]"),
+                Some('W') => out.push_str("[^0-9A-Za-z_]"),
+                Some('s') => out.push_str("[\t\n\x0c\r ]"),
+                Some('S') => out.push_str("[^\t\n\x0c\r ]"),
+                Some('b') if bracket_depth == 0 => out.push_str(r"(?-u:\b)"),
+                Some('B') if bracket_depth == 0 => out.push_str(r"(?-u:\B)"),
+                Some(esc) => {
+                    out.push('\\');
+                    out.push(esc);
+                }
+            },
+            '[' => {
+                out.push('[');
+                if bracket_depth > 0 && chars.peek() == Some(&':') {
+                    chars.next();
+                    out.push(':');
+                    while let Some(pch) = chars.next() {
+                        out.push(pch);
+                        if pch == ':' && chars.peek() == Some(&']') {
+                            chars.next();
+                            out.push(']');
+                            break;
+                        }
+                    }
+                } else {
+                    bracket_depth += 1;
+                    if chars.peek() == Some(&'^') {
+                        chars.next();
+                        out.push('^');
+                    }
+                    if chars.peek() == Some(&']') {
+                        chars.next();
+                        out.push(']');
+                    }
+                }
+            }
+            ']' if bracket_depth > 0 => {
+                bracket_depth -= 1;
+                out.push(']');
+            }
+            other => out.push(other),
+        }
+    }
+
+    Cow::Owned(out)
 }
 
 fn default_separator() -> String {
