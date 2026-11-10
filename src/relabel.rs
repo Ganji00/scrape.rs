@@ -1457,76 +1457,33 @@ pub fn eval_single_label_value_transform<V: AsRef<str>>(
         match cfg.action {
             Action::Replace => {
                 if let Some(res) = direct_replacement(cfg, val_str) {
-                    return if res.is_empty() {
-                        if in_place && !is_present {
-                            DictionaryValueTransform::KeepExisting
-                        } else {
-                            DictionaryValueTransform::DeleteTarget
-                        }
-                    } else if in_place && is_present && res == val_str {
-                        DictionaryValueTransform::KeepExisting
-                    } else {
-                        DictionaryValueTransform::SetTarget(res.to_owned())
-                    };
+                    return classify_value_transform(
+                        Cow::Borrowed(res),
+                        val_str,
+                        in_place,
+                        is_present,
+                    );
                 }
                 let Some(caps) = cfg.regex.compiled.captures(val_str) else {
                     return DictionaryValueTransform::KeepExisting;
                 };
                 let res = expand_template(&cfg.replacement, &caps);
-                if res.is_empty() {
-                    if in_place && !is_present {
-                        DictionaryValueTransform::KeepExisting
-                    } else {
-                        DictionaryValueTransform::DeleteTarget
-                    }
-                } else if in_place && is_present && res.as_ref() == val_str {
-                    DictionaryValueTransform::KeepExisting
-                } else {
-                    DictionaryValueTransform::SetTarget(res.into_owned())
-                }
+                classify_value_transform(res, val_str, in_place, is_present)
             }
             Action::Lowercase => {
-                if val_str.is_empty() {
-                    if in_place && !is_present {
-                        DictionaryValueTransform::KeepExisting
-                    } else {
-                        DictionaryValueTransform::DeleteTarget
-                    }
-                } else {
-                    let lower = go_to_lowercase(val_str);
-                    if in_place && is_present && lower.as_ref() == val_str {
-                        DictionaryValueTransform::KeepExisting
-                    } else {
-                        DictionaryValueTransform::SetTarget(lower.into_owned())
-                    }
-                }
+                let lower = go_to_lowercase(val_str);
+                classify_value_transform(lower, val_str, in_place, is_present)
             }
             Action::Uppercase => {
-                if val_str.is_empty() {
-                    if in_place && !is_present {
-                        DictionaryValueTransform::KeepExisting
-                    } else {
-                        DictionaryValueTransform::DeleteTarget
-                    }
-                } else {
-                    let upper = go_to_uppercase(val_str);
-                    if in_place && is_present && upper.as_ref() == val_str {
-                        DictionaryValueTransform::KeepExisting
-                    } else {
-                        DictionaryValueTransform::SetTarget(upper.into_owned())
-                    }
-                }
+                let upper = go_to_uppercase(val_str);
+                classify_value_transform(upper, val_str, in_place, is_present)
             }
             Action::HashMod => {
                 if cfg.modulus == 0 {
                     return DictionaryValueTransform::KeepExisting;
                 }
                 let modulo = hashmod_value(val_str, cfg.modulus);
-                if in_place && is_present && modulo == val_str {
-                    DictionaryValueTransform::KeepExisting
-                } else {
-                    DictionaryValueTransform::SetTarget(modulo)
-                }
+                classify_value_transform(Cow::Owned(modulo), val_str, in_place, is_present)
             }
             _ => unreachable!(),
         }
@@ -1539,6 +1496,25 @@ pub fn eval_single_label_value_transform<V: AsRef<str>>(
         transforms.push(eval_one(val.as_ref(), true));
     }
     Some(when_absent)
+}
+
+fn classify_value_transform(
+    new_val: Cow<'_, str>,
+    val_str: &str,
+    in_place: bool,
+    is_present: bool,
+) -> DictionaryValueTransform {
+    if new_val.is_empty() {
+        if in_place && !is_present {
+            DictionaryValueTransform::KeepExisting
+        } else {
+            DictionaryValueTransform::DeleteTarget
+        }
+    } else if in_place && is_present && new_val.as_ref() == val_str {
+        DictionaryValueTransform::KeepExisting
+    } else {
+        DictionaryValueTransform::SetTarget(new_val.into_owned())
+    }
 }
 
 /// Maps `s` to lowercase using Go `strings.ToLower` (`unicode.ToLower`) simple 1-to-1 per-rune
