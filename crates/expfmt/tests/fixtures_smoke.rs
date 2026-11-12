@@ -19,7 +19,7 @@ use std::path::Path;
 
 #[test]
 fn synced_testdata_corpus_is_present() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata");
     let manifest_path = root.join("manifest.json");
     let manifest = fs::read_to_string(&manifest_path).expect("testdata/manifest.json must exist");
     assert!(manifest.contains("github.com/prometheus/common"));
@@ -48,10 +48,10 @@ fn synced_testdata_corpus_is_present() {
 #[cfg(feature = "dto")]
 #[test]
 fn decode_upstream_expfmt_protobuf_fixtures() {
-    use expfmt::dto::MetricFamily;
+    use prometheus_expfmt::dto::MetricFamily;
     use prost::Message;
 
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/expfmt");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/expfmt");
 
     for fixture in ["protobuf", "protobuf-multimessage"] {
         let raw = fs::read(root.join(fixture)).expect("protobuf fixture should be readable");

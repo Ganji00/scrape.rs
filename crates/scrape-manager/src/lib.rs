@@ -11,15 +11,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Prometheus and OpenMetrics wire exposition format decoders.
+//! Prometheus service discovery, HTTP scrape client configuration, and target scrape management.
+//!
+//! Re-exports [`prometheus_expfmt`] and [`prometheus_relabel`] and hosts the async runtime I/O
+//! layers (`http_config`, `discovery`, and `scrape`) for [`prometheus/scrape.rs`](https://github.com/prometheus/scrape.rs).
 
-#[cfg(feature = "arrow")]
-pub mod arrow;
-#[cfg(feature = "dto")]
-pub mod dto;
-pub mod format;
-// Layer 0 parsers remain crate-internal; `arrow` and `dto` expose the public decoding APIs.
-#[allow(dead_code, unused_imports)]
-pub(crate) mod parse;
-#[cfg(feature = "relabel")]
-pub mod relabel;
+pub use prometheus_expfmt as expfmt;
+pub use prometheus_relabel as relabel;

@@ -14,11 +14,9 @@
 //! Integration tests for Prometheus target and metric relabeling (`model/relabel` and
 //! `scrape/target.go`).
 
-#![cfg(feature = "relabel")]
-
 use std::collections::BTreeMap;
 
-use expfmt::relabel::{
+use prometheus_relabel::{
     Action, Config, DEFAULT_REPLACEMENT, DictionaryValueTransform, LabelSet, METRIC_NAME_LABEL,
     Regexp, SingleLabelFilterSummary, SingleLabelKeepCache, SingleLabelTransformCache,
     TargetPopulateConfig, ValidationScheme, eval_key_keep_mask, eval_single_label_keep_mask,

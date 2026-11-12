@@ -11,12 +11,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Throughput and allocation benchmarks for `expfmt::arrow::ArrowDecoder` over the upstream
-//! Prometheus `model/textparse` fixture corpus.
+//! Throughput and allocation benchmarks for `prometheus_expfmt::arrow::ArrowDecoder` over the
+//! upstream Prometheus `model/textparse` fixture corpus.
 //!
 //! Recommended CLI invocation:
 //! ```sh
-//! cargo bench --bench decode -- -bench '^BenchmarkDecode' -benchtime 1s -count 6 -cpu 2 -benchmem | tee ${bench}.txt
+//! cargo bench -p prometheus-expfmt --bench decode -- -bench '^BenchmarkDecode' -benchtime 1s -count 6 -cpu 2 -benchmem | tee ${bench}.txt
 //! ```
 
 use std::fs;
@@ -27,8 +27,8 @@ use std::pin::{Pin, pin};
 use std::task::{Context, Poll, Waker};
 
 use benchfmt::{CountingAlloc, Suite};
-use expfmt::arrow::{ArrowDecoder, DecodeBudget, DecodeOptions, DecodeStep};
-use expfmt::format::Format;
+use prometheus_expfmt::arrow::{ArrowDecoder, DecodeBudget, DecodeOptions, DecodeStep};
+use prometheus_expfmt::format::Format;
 
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc::new();
@@ -103,7 +103,7 @@ fn filter_counter_gauge_families(raw: &str) -> Vec<u8> {
 }
 
 fn main() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/textparse");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/textparse");
     let nometa = fs::read(root.join("alltypes.237mfs.nometa.prom.txt")).unwrap();
     let full = fs::read_to_string(root.join("alltypes.237mfs.prom.txt")).unwrap();
     let typed_simple = filter_counter_gauge_families(&full);
@@ -113,7 +113,7 @@ fn main() {
     let stream_256_opts = opts.with_max_data_points_per_batch(256);
     let budget = DecodeBudget::default();
 
-    let mut suite = Suite::from_env("expfmt").with_alloc(&ALLOC);
+    let mut suite = Suite::from_env("prometheus-expfmt").with_alloc(&ALLOC);
 
     for (case, payload) in [
         ("alltypes.237mfs.nometa", nometa.as_slice()),

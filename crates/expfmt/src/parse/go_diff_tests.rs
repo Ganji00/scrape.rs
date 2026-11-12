@@ -195,7 +195,7 @@ fn expected_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// Compares every expected file under `testdata/<dir>/` with `render` of its input.
 fn assert_matches_go(dir: &str, render: impl Fn(&[u8]) -> Vec<u8>) {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata");
     let mut expected = Vec::new();
     expected_files(&root.join(dir), &mut expected);
     assert!(

@@ -19,10 +19,12 @@ use std::fs;
 use std::path::Path;
 use std::rc::Rc;
 
-use expfmt::arrow::{ArrowDecoder, DecodeBudget, DecodeOptions, DecodeStep, OtapMetricRecords};
-use expfmt::format::Format;
 use otel_arrow_dfe_pdata::otap::{Metrics, OtapArrowRecords, OtapBatchStore};
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
+use prometheus_expfmt::arrow::{
+    ArrowDecoder, DecodeBudget, DecodeOptions, DecodeStep, OtapMetricRecords,
+};
+use prometheus_expfmt::format::Format;
 
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;

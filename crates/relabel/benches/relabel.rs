@@ -11,21 +11,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Throughput and allocation benchmarks for `expfmt::relabel` target discovery relabeling,
+//! Throughput and allocation benchmarks for `prometheus_relabel` target discovery relabeling,
 //! per-sample scalar `LabelSet` (`BTreeMap<String, String>`) metric relabeling, and two-stage
 //! dictionary-vectorized metric relabeling over `ArrowDecoder`-style interned `(key_id, val_id)`
 //! series buffers.
 //!
 //! Recommended CLI invocation:
 //! ```sh
-//! cargo bench --bench relabel -- -bench '^BenchmarkRelabel' -benchtime 1s -count 6 -cpu 2 -benchmem | tee ${bench}.txt
+//! cargo bench -p prometheus-relabel --bench relabel -- -bench '^BenchmarkRelabel' -benchtime 1s -count 6 -cpu 2 -benchmem | tee ${bench}.txt
 //! ```
 
 use std::collections::BTreeMap;
 use std::hint::black_box;
 
 use benchfmt::{CountingAlloc, Suite};
-use expfmt::relabel::{
+use prometheus_relabel::{
     Action, Config, LabelSet, METRIC_NAME_LABEL, Regexp, SingleLabelKeepCache,
     SingleLabelTransformCache, TargetPopulateConfig, ValidationScheme, eval_key_keep_mask,
     keep_metric_name, merge_target_and_metric_labels, populate_discovered_labels, populate_labels,
@@ -386,7 +386,7 @@ fn main() {
     let low_card_fixture = build_scrape_fixture(false);
     let high_card_fixture = build_scrape_fixture(true);
 
-    let mut suite = Suite::from_env("expfmt")
+    let mut suite = Suite::from_env("prometheus-relabel")
         .with_alloc(&ALLOC)
         .bench("Relabel/case=kubernetes_target/mode=populate_labels", |b| {
             let empty_group = BTreeMap::new();

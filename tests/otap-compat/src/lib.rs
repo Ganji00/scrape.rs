@@ -11,4 +11,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Integration test harness validating `expfmt::arrow` output against `otel-arrow-dfe-pdata`.
+//! Integration test harness validating `prometheus_expfmt::arrow` output against `otel-arrow-dfe-pdata`.

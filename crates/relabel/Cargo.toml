@@ -1,0 +1,31 @@
+[package]
+name = "prometheus-relabel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Prometheus-compatible target and metric label relabeling (relabel_configs and metric_relabel_configs)"
+readme = "README.md"
+keywords = ["prometheus", "openmetrics", "metrics", "relabel", "observability"]
+categories = ["config", "text-processing"]
+exclude = [
+    "benches/**",
+    "tests/**",
+]
+
+[dependencies]
+regex = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+benchfmt = { workspace = true }
+serde_json = { workspace = true }
+
+[[bench]]
+name = "relabel"
+harness = false
+
+[lints]
+workspace = true

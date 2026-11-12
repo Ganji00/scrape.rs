@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Integration tests verifying `expfmt::arrow::ArrowDecoder` against `otel-arrow-dfe-pdata`
+//! Integration tests verifying `prometheus_expfmt::arrow::ArrowDecoder` against `otel-arrow-dfe-pdata`
 //! schema checks, transport-optimized ID encoding and decoding, and OTLP semantic equivalence.
 
 use std::fs;
@@ -19,12 +19,6 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
-use expfmt::arrow::{
-    ArrowDecoder, CounterSuffixPolicy, DecodeBudget, DecodeCursor, DecodeError, DecodeOptions,
-    DecodeStep, MetricPayloadType, OtapMetricRecords, PROMETHEUS_TYPE_METADATA_KEY,
-    UnitSuffixPolicy, UntypedPolicy,
-};
-use expfmt::format::Format;
 use otel_arrow_dfe_pdata::otap::{Metrics, OtapArrowRecords, OtapBatchStore};
 use otel_arrow_dfe_pdata::proto::OtlpProtoMessage;
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
@@ -39,6 +33,12 @@ use otel_arrow_dfe_pdata::schema::{
 };
 use otel_arrow_dfe_pdata::testing::equiv::assert_equivalent;
 use otel_arrow_dfe_pdata::testing::round_trip::{otap_to_otlp, to_metrics_data};
+use prometheus_expfmt::arrow::{
+    ArrowDecoder, CounterSuffixPolicy, DecodeBudget, DecodeCursor, DecodeError, DecodeOptions,
+    DecodeStep, MetricPayloadType, OtapMetricRecords, PROMETHEUS_TYPE_METADATA_KEY,
+    UnitSuffixPolicy, UntypedPolicy,
+};
+use prometheus_expfmt::format::Format;
 
 fn assert_matches_otap_schema(records: &OtapMetricRecords) {
     for (payload_type, batch) in records.iter() {
