@@ -1,6 +1,6 @@
-# `expfmt` specification and implementation plan
+# `scrape.rs` specification and implementation plan
 
-The `expfmt` crate in `scrape.rs` provides official Rust decoders for Prometheus and OpenMetrics wire exposition formats.
+`scrape.rs` (`expfmt` crate) provides official Rust decoders for Prometheus and OpenMetrics wire exposition formats along with integrated Prometheus target and metric relabeling (`relabel`).
 
 ## Background and goals
 
@@ -8,7 +8,7 @@ Rust metric pipelines and tools currently lack an official, spec-compliant parse
 
 This repository targets two use cases:
 
-1. High-throughput columnar ingestion for OpenTelemetry Arrow. [`open-telemetry/otel-arrow#3277`](https://github.com/open-telemetry/otel-arrow/issues/3277) defines an OTAP-native `prometheus_scrape` receiver in Rust. Its steady-state path streams scrape bytes through pre-allocation relabeling and metric family assembly directly into Apache Arrow metric records. That avoids intermediate Go-style `pmetric` or SDK `metricdata` object graphs and fits thread-per-core `!Send` runtimes with bounded memory.
+1. High-throughput columnar ingestion for OpenTelemetry Arrow. [`open-telemetry/otel-arrow#3277`](https://github.com/open-telemetry/otel-arrow/issues/3277) defines an OTAP-native `prometheus_scrape` receiver in Rust. Its steady-state path streams scrape bytes through early `__name__` series filtering, metric family assembly, and dictionary-vectorized relabeling directly into Apache Arrow metric records. That avoids intermediate Go-style `pmetric` or SDK `metricdata` object graphs and fits thread-per-core `!Send` runtimes with bounded memory.
 2. Programmatic inspection and ecosystem tooling. Validation tools like OpenTelemetry Weaver live-checking `/metrics` endpoints against semantic conventions, test harnesses, and Rust CLIs need an ergonomic API that decodes any Prometheus or OpenMetrics payload into standard [`io.prometheus.client.MetricFamily`](https://github.com/prometheus/prometheus/blob/main/prompb/io/prometheus/client/metrics.proto) protobuf structs, matching Go's [`prometheus/common/expfmt`](https://github.com/prometheus/common/tree/main/expfmt).
 
 ## Supported formats and content negotiation
@@ -40,16 +40,17 @@ Decoding is split into three chained layers so streaming callers pay zero per-sa
         │  Layer 0: Streaming event parser (text / proto)         │
         │  - Zero-copy borrowed slices (&[u8] / &str)             │
         │  - Yields Entry::{Help, Type, Unit, Series, Histogram}  │
-        │  - Pre-allocation metric relabel and drop hook          │
         └────────────────────────────┬────────────────────────────┘
                                      │
                                      ▼  Primary API
         ┌─────────────────────────────────────────────────────────┐
         │  Layer 1: Arrow / OTAP decoder                          │
-        │  - Metric family assembly                               │
-        │  - Direct Arrow RecordBatches                           │
-        │  - Reusable builders/interners                          │
-        │  - Fits otel-arrow#3277                                 │
+        │  - Stage 1 pushdown: series `__name__` keep/drop filter │
+        │  - Metric family assembly & arena string interners      │
+        │  - Stage 2: dictionary-vectorized relabeling &          │
+        │    `honor_labels` key resolution                        │
+        │  - Direct Arrow RecordBatches (fits otel-arrow#3277     │
+        │    and DataFusion SIMD execution)                       │
         └────────────────────────────┬────────────────────────────┘
                                      │
                                      ▼  Ergonomic API
@@ -115,17 +116,38 @@ This is the primary API, designed for the [`open-telemetry/otel-arrow#3277`](htt
 ```text
 scrape bytes
   -> streaming parser
-  -> metric relabel/drop
-  -> metric family assembler
-  -> direct OTAP metric records
+  -> Stage 1: series `__name__` keep/drop filter pushdown
+  -> metric family assembler & arena string interners (`key_interner`, `val_interner`)
+  -> Stage 2: dictionary-vectorized relabeling & `honor_labels`
+  -> direct OTAP metric records (ready for DataFusion / Arrow SIMD execution)
 ```
 
 - `ArrowDecoder` appends parsed metrics, attributes, number data points, summary data points, classic and exponential histogram data points, and exemplars directly into Arrow array builders (`arrow-array` and `arrow-schema`), matching the relational `id` and `parent_id` tables in [`rust/otap-dataflow/crates/pdata`](https://github.com/open-telemetry/otel-arrow/tree/main/rust/otap-dataflow/crates/pdata). Callers can materialize one batch set per scrape with `ArrowDecoder::decode`, pull bounded chunks on demand with `ArrowDecoder::decode_stream` to cap scratch memory and stay within OTAP's `u16` per-batch metric ID limit, or yield cooperatively between bounded steps with `DecodeBudget`, `DecodeStep`, `DecodeStream::step`, `DecodeCursor` (`ArrowDecoder::start_decode` / `start_decode_stream` / `step_decode`), `ArrowDecoder::decode_cooperative`, and `DecodeStream::next_cooperative` so multi-megabyte scrapes do not starve timers or peer tasks on single-threaded `!Send` `LocalSet` runtimes.
 - Metric families in text exposition are decoded as contiguous runs, with `# HELP`, `# TYPE`, and `# UNIT` metadata lines preceding that family's samples. Like OpenMetrics 1.0/2.0 and Prometheus's scrape loop, `ArrowDecoder` tracks only the active family cursor instead of maintaining a whole-scrape hash table to reassemble or reject previously seen names, so a non-contiguous repetition of an earlier metric name starts a fresh untyped run unless preceded by its own metadata.
-- A `LabelFilter` / `Relabeler` hook runs on the borrowed `LabelsBuffer` from Layer 0 so dropped series never allocate in Arrow builders or metric family state.
+- Rather than materializing a per-sample `BTreeMap` or running regular expressions on every scraped text line, `metric_relabel_configs` and `honor_labels` will wire into `ArrowDecoder` (Phase 4, `#35`) as a two-stage pipeline (see [Target and metric relabeling architecture](#target-and-metric-relabeling-architecture)):
+  1. **Stage 1 (`__name__` series filter pushdown)**: Leading `keep`, `drop`, `keepequal`, and `dropequal` rules that inspect only `__name__` will run once per contiguous wire series-name transition (e.g. `foo_bucket`, `foo_sum`, `foo_count`, matching Prometheus `scrape/scrape.go`) so dropped series runs skip float parsing, label unescaping, string interning, and family assembly.
+  2. **Stage 2 (dictionary-vectorized relabeling and `honor_labels`)**: Once kept series have been assembled into metric families (collapsing classic histogram `_bucket`, `_sum`, and `_count` lines into a single `HistogramDataPoints` row) and their label keys and values have been deduplicated in `key_interner` and `val_interner`, attribute-level `honor_labels` collision resolution, `labeldrop` / `labelkeep`, and single-label `keep` / `drop` / value transformations (`replace`, `lowercase`, `uppercase`, `hashmod`) will execute across unique dictionary entries (memoized per `source_labels[0]` value ID) instead of $O(N_{\text{samples}})$.
 - The metric family assembler groups classic histogram `_bucket`, `_sum`, and `_count` lines and summary `quantile`, `_sum`, and `_count` lines (plus OpenMetrics `_created` start timestamps) into complete metric families.
 - Configurable translation policies control counter `_total` and unit suffix handling and untyped series handling.
 - `ArrowDecoder` owns its scratch buffers and Arrow builders without internal locks or global state, so a per-core `!Send` receiver can reuse allocations across scrapes with bounded memory.
+
+### Target and metric relabeling architecture
+
+The `relabel` module implements Prometheus `relabel_configs`, `metric_relabel_configs`, and `honor_labels` across three execution tiers matched to data cardinality:
+
+1. **Pre-scrape target discovery relabeling (`relabel_configs`)**:
+   - Runs once per discovered target endpoint (cold path) over `relabel::LabelSet` (`BTreeMap<String, String>`) via `populate_discovered_labels` and `populate_labels`.
+   - Populates reserved discovery labels (`__address__`, `__scheme__`, `__metrics_path__`, `__scrape_interval__`, `__scrape_timeout__`, `__param_*`, `job`), executes all 11 Prometheus relabel actions, strips `__meta_*` labels, and defaults `instance` to `__address__`.
+   - Non-reserved target labels (`PopulatedTarget::public_labels()`) attach once per scrape to the batch's `ResourceAttrs` (`job` -> `service.name`, `instance` -> `service.instance.id`) rather than duplicating unchanged target labels onto every data-point attribute row. When a `metric_relabel_configs` rule reads or mutates a public target label key (such as `source_labels: ["job"]`, `target_label: "job"`, `labeldrop`, `labelkeep`, or `labelmap`), Stage 2 resolves that key against the post-`honor_labels` target label value (using the target label when `honor_labels = false` or when the series omits that key under `honor_labels = true`) and materializes per-point attribute overrides only if a rule mutates or drops the target label.
+2. **Stage 1 pre-staging `__name__` filter pushdown (Layer 1 ingestion, wired in Phase 4 / `#35`)**:
+   - `relabel::split_metric_name_pushdown` extracts the leading prefix of `metric_relabel_configs` rules (`keep`, `drop`, `keepequal`, `dropequal`) that depend exclusively on `__name__`.
+   - `ArrowDecoder` will evaluate `relabel::keep_metric_name` against the wire series `__name__` (such as `foo_bucket` or `foo_count`, not the stripped family base name `foo`) once when transitioning to a new contiguous series-name run, discarding dropped series runs before parsing sample floats, unescaping labels, interning strings, or staging histogram buckets.
+3. **Stage 2 dictionary-vectorized relabeling and Layer 3 DataFusion SIMD execution (`ArrowDecoder` wiring in Phase 4 / `#35`)**:
+   - After `ArrowDecoder` interns label keys into `key_interner` ($U_{\text{keys}}$ unique keys, typically ~32) and label values into `val_interner` ($U_{\text{vals}}$ unique values across all keys), dictionary-level primitives in `relabel` avoid per-sample regex and string allocations:
+     - **`honor_labels = false` (`relabel::resolve_conflicting_exposed_keys`)**: Checks `key_interner` against public target labels in $O(U_{\text{keys}})$. When no sample label key collides with a target label key (the common case), `honor_labels` is a zero-copy no-op. When a collision occurs, only the colliding dictionary entries are renamed to `exported_<name>` in ascending key-length order. Note that whereas Go [`resolveConflictingExposedLabels`](https://github.com/prometheus/prometheus/blob/236a2b1fe8e0471586ff29cb8fd8929372643650/scrape/scrape.go#L682-L697) checks `exported_<name>` occupancy per series (like scalar `merge_target_and_metric_labels`), `resolve_conflicting_exposed_keys` intentionally resolves collisions once across the batch-wide `key_interner` dictionary so key indices do not have to be rewritten per series; if another series in the same batch already exposes `exported_<name>`, `<name>` is renamed to `exported_exported_<name>` across the batch dictionary.
+     - **`labeldrop` / `labelkeep` (`relabel::eval_key_keep_mask`)**: Evaluates the key regex once per unique entry in `key_interner` ($O(U_{\text{keys}})$) to build a boolean key-ID mask used to filter `(key_id, val_id)` attribute rows.
+     - **Single-label `keep` / `drop` (`relabel::SingleLabelKeepCache`, `relabel::eval_single_label_keep_mask`) and value transformations (`relabel::SingleLabelTransformCache`, `relabel::eval_single_label_value_transform`)**: Memoizes single-source-label predicates and transformations (`replace`, `lowercase`, `uppercase`, `hashmod`) lazily across only the `val_id`s seen under `source_labels[0]` on surviving series ($\le \min(U_{\text{source\_key}}, N_{\text{kept\_series}})$), avoiding touching unrelated high-cardinality values in `val_interner`.
+     - **Layer 3 DataFusion / Arrow compute in `otel-arrow`**: Downstream cross-series aggregations, SQL projections, and vectorized SIMD filtering execute directly on the dictionary-encoded `OtapArrowRecords` (`RecordBatch`es) inside `open-telemetry/otel-arrow`'s DataFusion engine without pulling `datafusion` into `expfmt`.
 
 ### Layer 2: Proto DTO decoder
 
@@ -192,7 +214,7 @@ To verify that `ArrowDecoder` meets the [`open-telemetry/otel-arrow#3277`](https
 - Extend the Go `expfmt` encoder harness to cover `FmtOpenMetrics_2_0_0` and `FmtProtoDelim`.
 
 ### Phase 4: Relabeling hooks, pooling, benchmarks, fuzzing, and initial release
-- Add the pre-allocation `LabelFilter` and relabeling hook on Layer 0 `LabelsBuffer` and dictionary/buffer reuse across scrapes in `ArrowDecoder`.
+- Add Stage 1 family `__name__` filter pushdown and Stage 2 dictionary-vectorized `honor_labels` and attribute relabeling on `ArrowDecoder` interners, plus dictionary/buffer reuse across scrapes.
 - Add `cargo-fuzz` targets comparing Rust decoding against Go `expfmt` and `textparse`.
 - Add `criterion` benchmarks measuring throughput in MB/s and allocations per sample across Layer 0 `Parser`, Layer 1 `ArrowDecoder`, and Layer 2 `dto`.
 - Publish the `0.1.0` crate release and integrate with `open-telemetry/otel-arrow`.

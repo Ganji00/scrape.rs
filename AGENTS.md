@@ -24,7 +24,7 @@ Do not use Rust language or std features newer than `rust-version` in `Cargo.tom
 
 ## Spec
 
-[specs/expfmt/SPEC.md](specs/expfmt/SPEC.md) is the contract for `expfmt`. If you change behavior the spec describes, update the spec in the same PR.
+[specs/SPEC.md](specs/SPEC.md) is the specification contract for `scrape.rs` (`expfmt`, `relabel`, and scrape pipeline integration). If you change behavior the spec describes, update the spec in the same PR.
 
 ## Test data
 

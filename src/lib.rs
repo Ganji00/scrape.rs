@@ -21,3 +21,5 @@ pub mod format;
 // Layer 0 parsers remain crate-internal; `arrow` and `dto` expose the public decoding APIs.
 #[allow(dead_code, unused_imports)]
 pub(crate) mod parse;
+#[cfg(feature = "relabel")]
+pub mod relabel;
