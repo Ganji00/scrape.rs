@@ -200,24 +200,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "expfmt"
-version = "0.1.0"
-dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-schema",
- "benchfmt",
- "prost",
- "prost-build",
- "prost-types",
- "protox",
- "regex",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -555,6 +537,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "prometheus-expfmt"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-schema",
+ "benchfmt",
+ "prost",
+ "prost-build",
+ "prost-types",
+ "protox",
+ "thiserror",
+]
+
+[[package]]
+name = "prometheus-relabel"
+version = "0.1.0"
+dependencies = [
+ "benchfmt",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "prometheus-scrape-manager"
+version = "0.1.0"
+dependencies = [
+ "prometheus-expfmt",
+ "prometheus-relabel",
 ]
 
 [[package]]

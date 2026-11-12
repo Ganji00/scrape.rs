@@ -1,0 +1,24 @@
+[package]
+name = "prometheus-scrape-manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Prometheus service discovery, HTTP client configuration, and scrape pool management"
+readme = "README.md"
+keywords = ["prometheus", "openmetrics", "metrics", "scrape", "service-discovery"]
+categories = ["network-programming", "asynchronous"]
+# Kept unpublished while initial service discovery, HTTP config, and scrape pool modules land.
+publish = false
+
+[features]
+default = ["arrow"]
+arrow = ["prometheus-expfmt/arrow"]
+
+[dependencies]
+prometheus-expfmt = { workspace = true }
+prometheus-relabel = { workspace = true }
+
+[lints]
+workspace = true

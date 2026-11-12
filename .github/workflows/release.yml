@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run cargo publish --dry-run without uploading to crates.io"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify release tag matches workspace crate versions
+        if: github.event_name == 'release'
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          expected="${TAG_NAME#v}"
+          if [ "$expected" = "$TAG_NAME" ]; then
+            echo "Release tag '${TAG_NAME}' must start with 'v' (for example, v0.1.0)"
+            exit 1
+          fi
+          actual=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.publish == null or (.publish | length > 0)) | "\(.name)@\(.version)"')
+          echo "Publishable crates:"
+          echo "$actual"
+          mismatched=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r --arg expected "$expected" \
+              '.packages[] | select(.publish == null or (.publish | length > 0)) | select(.version != $expected) | "\(.name)@\(.version)"')
+          if [ -n "$mismatched" ]; then
+            echo "Release tag ${TAG_NAME} (version ${expected}) does not match crate versions:"
+            echo "$mismatched"
+            exit 1
+          fi
+
+      - name: Run workspace tests and doc checks
+        env:
+          RUSTDOCFLAGS: "--deny warnings"
+        run: |
+          cargo test --workspace --locked --all-features
+          cargo test --workspace --locked --no-default-features
+          cargo doc --workspace --locked --no-deps --all-features
+
+      - name: Dry-run workspace publish
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+        run: cargo publish --workspace --locked --dry-run
+
+      - name: Authenticate with crates.io (OIDC Trusted Publishing)
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+
+      - name: Publish workspace crates to crates.io
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+        run: cargo publish --workspace --locked
