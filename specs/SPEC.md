@@ -1,6 +1,6 @@
 # `scrape.rs` specification and implementation plan
 
-`scrape.rs` (`expfmt` crate) provides official Rust decoders for Prometheus and OpenMetrics wire exposition formats along with integrated Prometheus target and metric relabeling (`relabel`).
+`scrape.rs` provides official Rust decoders for Prometheus and OpenMetrics wire exposition formats (`prometheus-expfmt`), Prometheus target and metric relabeling (`prometheus-relabel`), and service discovery and scrape management (`prometheus-scrape-manager`).
 
 ## Background and goals
 
