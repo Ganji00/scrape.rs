@@ -1,0 +1,48 @@
+# HELP http_requests Total HTTP requests.\nSecond line with a \\ backslash.
+# TYPE http_requests counter
+http_requests_total{code="200",method="GET"} 1027.0 1.700000000123e+09 # {span_id="0123456789abcdef",trace_id="0123456789abcdef0123456789abcdef"} 1.0 1.7000000005e+09
+http_requests_created{code="200",method="GET"} 500.25
+http_requests_total{code="400",method="POST"} 3.0
+# HELP my_dot_events_ Counter with a UTF-8 name.
+# TYPE my_dot_events_ counter
+my_dot_events__total{event_dot_kind="click"} 42.0
+my_dot_events__created{event_dot_kind="click"} 1000.0
+# HELP process_temperature_celsius Gauge with special values.
+# TYPE process_temperature_celsius gauge
+# UNIT process_temperature_celsius celsius
+process_temperature_celsius{sensor="a"} -1.5
+process_temperature_celsius{sensor="b"} 1e-300
+process_temperature_celsius{sensor="c"} +Inf
+process_temperature_celsius{sensor="d"} -Inf
+process_temperature_celsius{sensor="e"} 1.23456789012345e+14 1.0
+# HELP label_escapes Label values with \"quotes\", \\ backslashes, and\nnewlines.
+# TYPE label_escapes gauge
+label_escapes{path="C:\\Temp\\\"x\"\nline ✓"} 1.0
+# HELP http_dot_server_dot_request_dot_duration__seconds Histogram with a UTF-8 name.
+# TYPE http_dot_server_dot_request_dot_duration__seconds histogram
+# UNIT http_dot_server_dot_request_dot_duration__seconds seconds
+http_dot_server_dot_request_dot_duration__seconds_bucket{http_dot_method="GET",route="/",le="0.1"} 1 # {pod="a"} 0.05 123.456
+http_dot_server_dot_request_dot_duration__seconds_bucket{http_dot_method="GET",route="/",le="1.0"} 3 # {pod="b"} 0.5
+http_dot_server_dot_request_dot_duration__seconds_bucket{http_dot_method="GET",route="/",le="+Inf"} 4
+http_dot_server_dot_request_dot_duration__seconds_sum{http_dot_method="GET",route="/"} 2.5
+http_dot_server_dot_request_dot_duration__seconds_count{http_dot_method="GET",route="/"} 4
+http_dot_server_dot_request_dot_duration__seconds_created{http_dot_method="GET",route="/"} 1000.5
+# HELP rpc_duration_seconds Summary.
+# TYPE rpc_duration_seconds summary
+rpc_duration_seconds{service="a",quantile="0.5"} 1.0
+rpc_duration_seconds{service="a",quantile="0.99"} 2.0
+rpc_duration_seconds_sum{service="a"} 10.0
+rpc_duration_seconds_count{service="a"} 5
+rpc_duration_seconds_created{service="a"} 2000.0
+rpc_duration_seconds_sum{service="b"} 0.0 1.7e+09
+rpc_duration_seconds_count{service="b"} 0 1.7e+09
+# HELP queue_size Gauge histogram.
+# TYPE queue_size gaugehistogram
+queue_size_bucket{le="1.0"} 2
+queue_size_bucket{le="+Inf"} 3
+queue_size_sum 1.0
+queue_size_count 3
+# TYPE mystery unknown
+mystery 1.0
+mystery{x="y"} -2.0 5.0
+# EOF

@@ -26,6 +26,10 @@
 // the entries textparse.NewProtobufParser returns to testdata/protobufparse/, with
 // classic histograms converted to NHCB. It also marshals the hand-written NHCB
 // cases from testdata/nhcb/*.prototxt to testdata/nhcb/*.pb.
+// Finally, it encodes canonical MetricFamily inputs with expfmt.NewEncoder for
+// Prometheus text 0.0.4 and OpenMetrics 1.0 across all escaping schemes, and
+// writes each payload with the families a decoder must return for it to
+// testdata/roundtrip/.
 package main
 
 import (
@@ -174,6 +178,12 @@ func run() error {
 		return err
 	}
 	synced = append(synced, protobufParseFiles...)
+
+	roundTripFiles, err := writeRoundTrip(outRoot)
+	if err != nil {
+		return err
+	}
+	synced = append(synced, roundTripFiles...)
 
 	sort.Strings(synced)
 	m := manifest{
