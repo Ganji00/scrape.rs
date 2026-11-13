@@ -11,8 +11,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Throughput and allocation benchmarks for `prometheus_expfmt::arrow::ArrowDecoder` over the
-//! upstream Prometheus `model/textparse` fixture corpus.
+//! Throughput and allocation benchmarks for `prometheus_expfmt::arrow::ArrowDecoder` and, with the
+//! `dto` feature, `prometheus_expfmt::dto::arrow_to_metric_families` over the upstream Prometheus
+//! `model/textparse` fixture corpus.
 //!
 //! Recommended CLI invocation:
 //! ```sh
@@ -217,6 +218,26 @@ fn main() {
                     }
                 },
             );
+
+        #[cfg(feature = "dto")]
+        {
+            suite = suite.bench(format!("Decode/case={case}/mode=dto"), move |b| {
+                let mut decoder = ArrowDecoder::new();
+                let records = decoder.decode(payload, &Format::TEXT, &opts).unwrap();
+                black_box(prometheus_expfmt::dto::arrow_to_metric_families(&records).unwrap());
+
+                b.set_bytes(bytes);
+                b.report_allocs();
+                while b.keep_running() {
+                    let records = decoder
+                        .decode(black_box(payload), &Format::TEXT, &opts)
+                        .unwrap();
+                    let families =
+                        prometheus_expfmt::dto::arrow_to_metric_families(&records).unwrap();
+                    black_box(families);
+                }
+            });
+        }
     }
 
     suite.run();

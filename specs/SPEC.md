@@ -167,6 +167,15 @@ pub fn arrow_to_metric_families(
 ) -> Result<Vec<dto::MetricFamily>, DecodeError>;
 ```
 
+Both functions require the `arrow` and `dto` features. OTAP and `MetricFamily` model some details differently, so the conversion follows these rules:
+
+- The `prometheus.type` metric attribute selects the `MetricType`. `unknown` maps to `UNTYPED`, and the OpenMetrics `info` and `stateset` types, which have no `io.prometheus.client` equivalent, map to `GAUGE`.
+- `MetricFamily.name` is `UnivariateMetrics.name`, so non-default `CounterSuffixPolicy` and `UnitSuffixPolicy` values change it.
+- Classic histogram buckets are emitted as cumulative counts in ascending `upper_bound` order. A histogram with bucket samples always ends with a `+Inf` bucket.
+- Histogram exemplars are not tied to a bucket in OTAP, so each one is attached to the first bucket whose `upper_bound` is greater than or equal to the exemplar value, as in `prometheus/client_golang`. Because `Bucket` holds a single exemplar, a later exemplar replaces an earlier one in the same bucket, as [`updateExemplar`](https://github.com/prometheus/client_golang/blob/v1.24.1/prometheus/histogram.go#L1153-L1165) does.
+- Exemplar `trace_id` and `span_id` columns are restored as lowercase hex labels, and an exemplar `time_unix_nano` of `0` leaves `Exemplar.timestamp` unset.
+- Data point and exemplar labels are sorted by name.
+
 ### Bounded scrape scheduling and memory pools
 
 `prometheus-scrape-manager` (`crates/scrape-manager`) schedules periodic HTTP scrapes and feeds wire payloads into `ArrowDecoder` with bounded scratch memory. Go Prometheus spawns one goroutine, `scrapeCache`, and `gzip.Reader` per target in [`scrape/scrape.go`](https://github.com/prometheus/prometheus/blob/v0.315.1/scrape/scrape.go#L510-L584) and pulls from an unbounded `sync.Pool` buffer allocator in [`scrapeAndReport`](https://github.com/prometheus/prometheus/blob/v0.315.1/scrape/scrape.go#L1568-L1575), so working-set memory grows when many targets return responses at the same time. `ScrapeManager` decouples schedule concurrency from buffer and decoder residency:

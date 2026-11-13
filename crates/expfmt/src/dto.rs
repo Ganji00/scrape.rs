@@ -14,15 +14,24 @@
 //! Prometheus `io.prometheus.client` protobuf data transfer objects (`MetricFamily` and related
 //! message types) compiled from [`io.prometheus.client`](https://buf.build/prometheus/prometheus/docs/main%3Aio.prometheus.client)
 //! ([`prompb/io/prometheus/client/metrics.proto`](https://github.com/prometheus/prometheus/blob/main/prompb/io/prometheus/client/metrics.proto)).
+//!
+//! With the `arrow` feature, `decode_to_metric_families` and `arrow_to_metric_families` decode
+//! exposition payloads into these types through `ArrowDecoder`.
 
 #[allow(missing_docs, clippy::all)]
 #[path = "dto/io.prometheus.client.rs"]
 mod proto;
 
+#[cfg(feature = "arrow")]
+mod decode;
+
 pub use proto::{
     Bucket, BucketSpan, Counter, Exemplar, Gauge, Histogram, LabelPair, Metric, MetricFamily,
     MetricType, Quantile, Summary, Untyped,
 };
+
+#[cfg(feature = "arrow")]
+pub use decode::{arrow_to_metric_families, decode_to_metric_families};
 
 #[cfg(test)]
 mod tests {
