@@ -20,9 +20,12 @@
 // It also writes the entries textparse.NewPromParser returns for each Prometheus
 // text fixture to testdata/promparse/, and the entries
 // textparse.NewOpenMetricsParser returns for each OpenMetrics fixture to
-// testdata/omparse/. It also marshals the createTestProtoBuf inputs from
-// protobufparse_test.go into testdata/textparse/TestProtobufParse.pb and writes
-// the entries textparse.NewProtobufParser returns to testdata/protobufparse/.
+// testdata/omparse/. It also marshals the createTestProtoBuf and
+// TestProtobufParseWithNHCB inputs from protobufparse_test.go into
+// testdata/textparse/TestProtobufParse.pb and TestProtobufParseWithNHCB.pb, and writes
+// the entries textparse.NewProtobufParser returns to testdata/protobufparse/, with
+// classic histograms converted to NHCB. It also marshals the hand-written NHCB
+// cases from testdata/nhcb/*.prototxt to testdata/nhcb/*.pb.
 package main
 
 import (
@@ -142,11 +145,17 @@ func run() error {
 		synced = append(synced, filepath.ToSlash(rel))
 	}
 
-	protobufInput, err := writeProtobufParseInput(outRoot, filepath.Join(promMod.Dir, "model", "textparse", "protobufparse_test.go"))
+	protobufInputs, err := writeProtobufParseInputs(outRoot, filepath.Join(promMod.Dir, "model", "textparse", "protobufparse_test.go"))
 	if err != nil {
 		return err
 	}
-	synced = append(synced, protobufInput)
+	synced = append(synced, protobufInputs...)
+
+	nhcbInputs, err := writeNHCBInputs(outRoot)
+	if err != nil {
+		return err
+	}
+	synced = append(synced, nhcbInputs...)
 
 	promParseFiles, err := writePromParseExpected(outRoot)
 	if err != nil {
@@ -160,7 +169,7 @@ func run() error {
 	}
 	synced = append(synced, omParseFiles...)
 
-	protobufParseFiles, err := writeProtobufParseExpected(outRoot)
+	protobufParseFiles, err := writeProtobufParseExpected(outRoot, nhcbInputs)
 	if err != nil {
 		return err
 	}
