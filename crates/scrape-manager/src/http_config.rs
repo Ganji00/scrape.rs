@@ -12,13 +12,51 @@
 // limitations under the License.
 
 //! HTTP client and TLS configuration types with 1:1 parity with `prometheus/common/config`.
+//!
+//! # Secret redaction
+//!
+//! [`Secret`] values and passwords embedded in [`ProxyConfig::proxy_url`] are irreversibly
+//! redacted in both [`fmt::Debug`] and [`serde::Serialize`] (to `"<secret>"` and `"xxxxx"`
+//! respectively), matching Prometheus config marshaling. Round-tripping through `Serialize` ->
+//! `Deserialize` does not preserve secret values.
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fs;
 use std::path::Path;
 
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+/// Error returned when validating or constructing a [`reqwest::Client`] or request from
+/// [`HttpClientConfig`].
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum HttpConfigError {
+    /// Configuration validation or unsupported runtime option error.
+    #[error("{0}")]
+    InvalidConfig(String),
+    /// I/O error reading a referenced credentials, certificate, or header file.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// HTTP client or request error (with any embedded URL password stripped).
+    #[error("HTTP error: {0}")]
+    Http(#[source] reqwest::Error),
+}
+
+impl From<reqwest::Error> for HttpConfigError {
+    fn from(mut err: reqwest::Error) -> Self {
+        // Strip passwords from `reqwest::Error`'s embedded URL so error strings never leak
+        // proxy or target credentials.
+        if let Some(url) = err.url_mut()
+            && url.password().is_some()
+        {
+            let _ = url.set_password(None);
+        }
+        Self::Http(err)
+    }
+}
 
 /// Placeholder emitted when marshaling non-empty [`Secret`] values to YAML or JSON.
 pub const SECRET_TOKEN: &str = "<secret>";
@@ -212,6 +250,18 @@ impl TlsVersion {
             other => Err(format!("unknown TLS version: {other}")),
         }
     }
+
+    fn to_reqwest(self) -> Result<reqwest::tls::Version, HttpConfigError> {
+        match self {
+            Self::TLS10 => Ok(reqwest::tls::Version::TLS_1_0),
+            Self::TLS11 => Ok(reqwest::tls::Version::TLS_1_1),
+            Self::TLS12 => Ok(reqwest::tls::Version::TLS_1_2),
+            Self::TLS13 => Ok(reqwest::tls::Version::TLS_1_3),
+            Self::Custom(code) => Err(HttpConfigError::InvalidConfig(format!(
+                "unknown TLS version: {code}"
+            ))),
+        }
+    }
 }
 
 impl PartialOrd for TlsVersion {
@@ -402,6 +452,96 @@ impl TlsConfig {
         }
         Ok(())
     }
+
+    fn using_client_cert(&self) -> bool {
+        !self.cert.is_empty() || !self.cert_file.is_empty() || !self.cert_ref.is_empty()
+    }
+
+    fn apply_to_builder(
+        &self,
+        mut builder: reqwest::ClientBuilder,
+    ) -> Result<reqwest::ClientBuilder, HttpConfigError> {
+        self.validate_version_bounds()
+            .map_err(HttpConfigError::InvalidConfig)?;
+        if !self.ca_ref.is_empty() || !self.cert_ref.is_empty() || !self.key_ref.is_empty() {
+            return Err(HttpConfigError::InvalidConfig(
+                "cannot use secret ref without manager".to_owned(),
+            ));
+        }
+        if !self.server_name.is_empty() {
+            return Err(HttpConfigError::InvalidConfig(
+                "tls_config.server_name override is not yet supported".to_owned(),
+            ));
+        }
+        if self.insecure_skip_verify {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+        if !self.ca.is_empty() || !self.ca_file.is_empty() {
+            let ca_pem = if !self.ca.is_empty() {
+                self.ca.as_bytes().to_vec()
+            } else {
+                fs::read(&self.ca_file)?
+            };
+            let certs = reqwest::Certificate::from_pem_bundle(&ca_pem)?;
+            if certs.is_empty() {
+                return Err(HttpConfigError::InvalidConfig(
+                    "unable to parse CA certificate PEM".to_owned(),
+                ));
+            }
+            builder = builder.tls_certs_only(certs);
+        }
+        if self.using_client_cert() {
+            let cert_pem = if !self.cert.is_empty() {
+                self.cert.as_bytes().to_vec()
+            } else {
+                fs::read(&self.cert_file)?
+            };
+            let key_pem = if !self.key.is_empty() {
+                self.key.as_str().as_bytes().to_vec()
+            } else {
+                fs::read(&self.key_file)?
+            };
+            // Match Go `crypto/tls.X509KeyPair`: extract only `CERTIFICATE` blocks from the cert
+            // input and the first private key block from the key input, skipping non-matching
+            // blocks so a combined `tls.pem` (pointed to by both `cert_file` and `key_file`) or
+            // auxiliary blocks like `EC PARAMETERS` work without duplicating certificates. All
+            // base64, DER, and cryptographic verification still happens in `reqwest`/`rustls`.
+            let cert_blocks = extract_pem_blocks(&cert_pem, &[b"CERTIFICATE"], None)?;
+            if cert_blocks.is_empty() {
+                return Err(HttpConfigError::InvalidConfig(
+                    "client cert PEM must contain at least one CERTIFICATE block".to_owned(),
+                ));
+            }
+            let key_blocks = extract_pem_blocks(
+                &key_pem,
+                &[b"PRIVATE KEY", b"RSA PRIVATE KEY", b"EC PRIVATE KEY"],
+                Some(1),
+            )?;
+            if key_blocks.is_empty() {
+                return Err(HttpConfigError::InvalidConfig(
+                    "client key PEM must contain a private key block".to_owned(),
+                ));
+            }
+            let mut combined = Vec::with_capacity(cert_blocks.len() + key_blocks.len());
+            combined.extend_from_slice(&cert_blocks);
+            combined.extend_from_slice(&key_blocks);
+            let identity = reqwest::Identity::from_pem(&combined)?;
+            builder = builder.identity(identity);
+        }
+        if let Some(min) = self.min_version {
+            builder = builder.tls_version_min(min.to_reqwest()?);
+        }
+        if let Some(max) = self.max_version {
+            let max_req = max.to_reqwest()?;
+            if max < TlsVersion::TLS12 {
+                return Err(HttpConfigError::InvalidConfig(
+                    "tls_config.max_version below TLS12 is not supported by rustls".to_owned(),
+                ));
+            }
+            builder = builder.tls_version_max(max_req);
+        }
+        Ok(builder)
+    }
 }
 
 /// HTTP Basic authentication credentials (`common/config.BasicAuth`).
@@ -449,6 +589,22 @@ impl BasicAuth {
         self.password_file = join_dir(dir, &self.password_file);
         self.username_file = join_dir(dir, &self.username_file);
     }
+
+    fn resolve_username(&self) -> Result<String, HttpConfigError> {
+        if !self.username_file.is_empty() {
+            Ok(fs::read_to_string(&self.username_file)?.trim().to_owned())
+        } else {
+            Ok(self.username.clone())
+        }
+    }
+
+    fn resolve_password(&self) -> Result<String, HttpConfigError> {
+        if !self.password_file.is_empty() {
+            Ok(fs::read_to_string(&self.password_file)?.trim().to_owned())
+        } else {
+            Ok(self.password.as_str().to_owned())
+        }
+    }
 }
 
 /// HTTP `Authorization` header configuration (`common/config.Authorization`).
@@ -484,14 +640,36 @@ impl Authorization {
     pub fn set_directory(&mut self, dir: &str) {
         self.credentials_file = join_dir(dir, &self.credentials_file);
     }
+
+    fn resolve_header_value(&self) -> Result<String, HttpConfigError> {
+        let creds = if !self.credentials_file.is_empty() {
+            fs::read_to_string(&self.credentials_file)?
+                .trim()
+                .to_owned()
+        } else {
+            self.credentials.as_str().to_owned()
+        };
+        let scheme = if self.auth_type.trim().is_empty() {
+            "Bearer"
+        } else {
+            self.auth_type.trim()
+        };
+        Ok(format!("{scheme} {creds}"))
+    }
 }
 
 /// Proxy configuration embedded in [`HttpClientConfig`] and [`OAuth2`] (`common/config.ProxyConfig`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// [`fmt::Debug`] and [`serde::Serialize`] redact passwords in `proxy_url` to `"xxxxx"` and
+/// [`Secret`] entries in `proxy_connect_header` to `"<secret>"`.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProxyConfig {
     /// HTTP proxy server URL.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_opt_url"
+    )]
     pub proxy_url: Option<String>,
     /// Comma-separated addresses that bypass the proxy.
     #[serde(
@@ -505,6 +683,18 @@ pub struct ProxyConfig {
     /// Headers sent to proxies during `CONNECT` requests.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub proxy_connect_header: BTreeMap<String, Vec<Secret>>,
+}
+
+impl fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redacted_url = self.proxy_url.as_deref().map(redact_url);
+        f.debug_struct("ProxyConfig")
+            .field("proxy_url", &redacted_url)
+            .field("no_proxy", &self.no_proxy)
+            .field("proxy_from_environment", &self.proxy_from_environment)
+            .field("proxy_connect_header", &self.proxy_connect_header)
+            .finish()
+    }
 }
 
 fn is_false(b: &bool) -> bool {
@@ -733,9 +923,14 @@ impl Headers {
     /// Validates that no reserved headers are configured (`Headers.Validate`).
     pub fn validate(&self) -> Result<(), String> {
         for name in self.headers.keys() {
-            let canonical = canonical_header_key(name);
-            if RESERVED_HEADERS.contains(&canonical.as_str()) {
-                return Err(format!("setting header {canonical:?} is not allowed"));
+            if RESERVED_HEADERS
+                .iter()
+                .any(|reserved| reserved.eq_ignore_ascii_case(name))
+            {
+                return Err(format!(
+                    "setting header {:?} is not allowed",
+                    canonical_header_key(name)
+                ));
             }
         }
         Ok(())
@@ -750,6 +945,10 @@ fn default_true() -> bool {
 }
 
 /// HTTP client configuration (`common/config.HTTPClientConfig`).
+///
+/// Both [`fmt::Debug`] and [`serde::Serialize`] irreversibly redact [`Secret`] fields to
+/// `"<secret>"` and `proxy_url` passwords to `"xxxxx"`, so serializing a config is intentionally
+/// lossy for secret values.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HttpClientConfig {
@@ -831,8 +1030,39 @@ impl HttpClientConfig {
 
     /// Validates the HTTP client configuration and normalizes `bearer_token` / `bearer_token_file`
     /// into `authorization` (`HTTPClientConfig.Validate`).
+    ///
+    /// Returns without mutating `self` if any validation check fails.
     pub fn validate(&mut self) -> Result<(), String> {
-        self.tls_config.validate()?;
+        self.validate_fields()?;
+
+        if let Some(auth) = &mut self.authorization {
+            let trimmed = auth.auth_type.trim();
+            auth.auth_type = if trimmed.is_empty() {
+                "Bearer".to_owned()
+            } else {
+                trimmed.to_owned()
+            };
+        } else if !self.bearer_token.is_empty() {
+            let token = std::mem::take(&mut self.bearer_token);
+            self.authorization = Some(Authorization {
+                auth_type: "Bearer".to_owned(),
+                credentials: token,
+                credentials_file: String::new(),
+                credentials_ref: String::new(),
+            });
+        } else if !self.bearer_token_file.is_empty() {
+            let file = std::mem::take(&mut self.bearer_token_file);
+            self.authorization = Some(Authorization {
+                auth_type: "Bearer".to_owned(),
+                credentials: Secret::default(),
+                credentials_file: file,
+                credentials_ref: String::new(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_auth(&self) -> Result<(), String> {
         if !self.bearer_token.is_empty() && !self.bearer_token_file.is_empty() {
             return Err(
                 "at most one of bearer_token & bearer_token_file must be configured".to_owned(),
@@ -870,7 +1100,7 @@ impl HttpClientConfig {
                 );
             }
         }
-        if let Some(auth) = &mut self.authorization {
+        if let Some(auth) = &self.authorization {
             if !self.bearer_token.is_empty() || !self.bearer_token_file.is_empty() {
                 return Err(
                     "authorization is not compatible with bearer_token & bearer_token_file"
@@ -888,11 +1118,7 @@ impl HttpClientConfig {
                         .to_owned(),
                 );
             }
-            auth.auth_type = auth.auth_type.trim().to_owned();
-            if auth.auth_type.is_empty() {
-                auth.auth_type = "Bearer".to_owned();
-            }
-            if auth.auth_type.eq_ignore_ascii_case("basic") {
+            if auth.auth_type.trim().eq_ignore_ascii_case("basic") {
                 return Err(
                     "authorization type cannot be set to \"basic\", use \"basic_auth\" instead"
                         .to_owned(),
@@ -904,23 +1130,13 @@ impl HttpClientConfig {
                         .to_owned(),
                 );
             }
-        } else if !self.bearer_token.is_empty() {
-            let token = std::mem::take(&mut self.bearer_token);
-            self.authorization = Some(Authorization {
-                auth_type: "Bearer".to_owned(),
-                credentials: token,
-                credentials_file: String::new(),
-                credentials_ref: String::new(),
-            });
-        } else if !self.bearer_token_file.is_empty() {
-            let file = std::mem::take(&mut self.bearer_token_file);
-            self.authorization = Some(Authorization {
-                auth_type: "Bearer".to_owned(),
-                credentials: Secret::default(),
-                credentials_file: file,
-                credentials_ref: String::new(),
-            });
         }
+        Ok(())
+    }
+
+    fn validate_fields(&self) -> Result<(), String> {
+        self.tls_config.validate()?;
+        self.validate_auth()?;
 
         if let Some(oauth2) = &self.oauth2 {
             oauth2.validate()?;
@@ -974,6 +1190,300 @@ impl HttpClientConfig {
         }
         Ok(())
     }
+
+    /// Returns a [`reqwest::ClientBuilder`] configured with the TLS, HTTP/2, redirect, and proxy
+    /// policies from this config.
+    ///
+    /// Automatic response decompression is disabled to match Prometheus (`DisableCompression: true`)
+    /// and [`crate::scrape::ReqwestFetcher::with_client`], `rustls` is explicitly selected, and no
+    /// client-level request timeout is configured so callers can apply per-request timeouts or
+    /// layer additional builder options (such as `pool_idle_timeout` or `connect_timeout`).
+    pub fn client_builder(&self) -> Result<reqwest::ClientBuilder, HttpConfigError> {
+        self.validate_fields()
+            .map_err(HttpConfigError::InvalidConfig)?;
+        self.check_unsupported_runtime_auth()?;
+
+        // Explicitly select rustls (so `Identity::from_pem` remains valid if a downstream crate
+        // enables `reqwest/native-tls`) and disable automatic decompression (matching Prometheus
+        // `DisableCompression: true` and `ReqwestFetcher`'s `max_body_bytes` enforcement).
+        // Request timeouts are left to per-request deadlines or caller builder customization.
+        let mut builder = reqwest::Client::builder()
+            .tls_backend_rustls()
+            .no_gzip()
+            .no_brotli()
+            .no_zstd()
+            .no_deflate();
+        if !self.follow_redirects {
+            builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
+        if !self.enable_http2 {
+            builder = builder.http1_only();
+        }
+        builder = self.tls_config.apply_to_builder(builder)?;
+
+        let proxy_headers = build_proxy_header_map(&self.proxy_config.proxy_connect_header)?;
+        if self.proxy_config.proxy_from_environment {
+            if !proxy_headers.is_empty() {
+                return Err(HttpConfigError::InvalidConfig(
+                    "proxy_connect_header with proxy_from_environment is not yet supported"
+                        .to_owned(),
+                ));
+            }
+        } else if let Some(proxy_url) = &self.proxy_config.proxy_url
+            && !proxy_url.is_empty()
+        {
+            let parsed = reqwest::Url::parse(proxy_url).map_err(|e| {
+                HttpConfigError::InvalidConfig(format!(
+                    "invalid proxy_url {:?}: {e}",
+                    redact_url(proxy_url)
+                ))
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(HttpConfigError::InvalidConfig(format!(
+                    "invalid proxy_url scheme {:?} in {:?}, expected \"http\" or \"https\"",
+                    parsed.scheme(),
+                    redact_url(proxy_url)
+                )));
+            }
+            let no_proxy = if !self.proxy_config.no_proxy.is_empty() {
+                Some(
+                    reqwest::NoProxy::from_string(&self.proxy_config.no_proxy).ok_or_else(
+                        || {
+                            HttpConfigError::InvalidConfig(format!(
+                                "invalid no_proxy {:?}",
+                                self.proxy_config.no_proxy
+                            ))
+                        },
+                    )?,
+                )
+            } else {
+                None
+            };
+            if proxy_headers.is_empty() {
+                let proxy = reqwest::Proxy::all(proxy_url)?.no_proxy(no_proxy);
+                builder = builder.proxy(proxy);
+            } else {
+                // Attach `proxy_connect_header` only to HTTPS `CONNECT` proxies so proxy secrets
+                // are not injected into plain `http://` requests forwarded to origin servers.
+                let https_proxy = reqwest::Proxy::https(proxy_url)?
+                    .no_proxy(no_proxy.clone())
+                    .headers(proxy_headers);
+                let http_proxy = reqwest::Proxy::http(proxy_url)?.no_proxy(no_proxy);
+                builder = builder.proxy(https_proxy).proxy(http_proxy);
+            }
+        } else {
+            builder = builder.no_proxy();
+        }
+        Ok(builder)
+    }
+
+    /// Builds a [`reqwest::Client`] from [`Self::client_builder`].
+    pub fn build_client(&self) -> Result<reqwest::Client, HttpConfigError> {
+        Ok(self.client_builder()?.build()?)
+    }
+
+    /// Applies authentication (`basic_auth`, `authorization`, `bearer_token`, `bearer_token_file`)
+    /// and custom `http_headers` to an outgoing [`reqwest::RequestBuilder`].
+    ///
+    /// Matches Prometheus `http_config.go` by leaving any pre-existing `Authorization` header
+    /// untouched rather than appending a duplicate value.
+    pub fn apply_to_request(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder, HttpConfigError> {
+        // Keep per-request validation allocation-free: only check auth and reserved headers used
+        // here rather than reparsing `proxy_url` or re-checking TLS settings on every request.
+        self.validate_auth()
+            .map_err(HttpConfigError::InvalidConfig)?;
+        self.check_unsupported_runtime_auth()?;
+        if let Some(headers) = &self.http_headers {
+            headers.validate().map_err(HttpConfigError::InvalidConfig)?;
+        }
+
+        let (client, built_res) = req.build_split();
+        let built = built_res?;
+        let has_authorization = built.headers().contains_key(AUTHORIZATION);
+        let mut req = reqwest::RequestBuilder::from_parts(client, built);
+
+        // Match Prometheus `http_config.go`: skip injecting `Authorization` when the request
+        // already carries one (for example from caller headers or URL userinfo).
+        if !has_authorization {
+            if let Some(basic_auth) = &self.basic_auth {
+                let username = basic_auth.resolve_username()?;
+                let password = basic_auth.resolve_password()?;
+                req = req.basic_auth(
+                    username,
+                    if password.is_empty() {
+                        None
+                    } else {
+                        Some(password)
+                    },
+                );
+            } else if let Some(auth) = &self.authorization {
+                let header_val = auth.resolve_header_value()?;
+                req = req.header(AUTHORIZATION, sensitive_header_value(&header_val)?);
+            } else if !self.bearer_token.is_empty() {
+                let val = format!("Bearer {}", self.bearer_token.as_str());
+                req = req.header(AUTHORIZATION, sensitive_header_value(&val)?);
+            } else if !self.bearer_token_file.is_empty() {
+                let token = fs::read_to_string(&self.bearer_token_file)?;
+                let val = format!("Bearer {}", token.trim());
+                req = req.header(AUTHORIZATION, sensitive_header_value(&val)?);
+            }
+        }
+
+        if let Some(headers) = &self.http_headers {
+            for (name, header) in &headers.headers {
+                let hdr_name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+                    HttpConfigError::InvalidConfig(format!(
+                        "invalid HTTP header name {name:?}: {e}"
+                    ))
+                })?;
+                for v in &header.values {
+                    let hdr_val = HeaderValue::from_str(v).map_err(|e| {
+                        HttpConfigError::InvalidConfig(format!(
+                            "invalid HTTP header value for {name:?}: {e}"
+                        ))
+                    })?;
+                    req = req.header(&hdr_name, hdr_val);
+                }
+                for v in &header.secrets {
+                    req = req.header(&hdr_name, sensitive_header_value(v.as_str())?);
+                }
+                for file in &header.files {
+                    let content = fs::read_to_string(file).map_err(|e| {
+                        HttpConfigError::Io(std::io::Error::new(
+                            e.kind(),
+                            format!("unable to read headers file {file}: {e}"),
+                        ))
+                    })?;
+                    req = req.header(&hdr_name, sensitive_header_value(content.trim())?);
+                }
+            }
+        }
+
+        Ok(req)
+    }
+
+    fn check_unsupported_runtime_auth(&self) -> Result<(), HttpConfigError> {
+        if self.oauth2.is_some() {
+            return Err(HttpConfigError::InvalidConfig(
+                "oauth2 authentication is not yet supported at runtime".to_owned(),
+            ));
+        }
+        if let Some(basic_auth) = &self.basic_auth
+            && (!basic_auth.username_ref.is_empty() || !basic_auth.password_ref.is_empty())
+        {
+            return Err(HttpConfigError::InvalidConfig(
+                "cannot use secret ref without manager".to_owned(),
+            ));
+        }
+        if let Some(auth) = &self.authorization
+            && !auth.credentials_ref.is_empty()
+        {
+            return Err(HttpConfigError::InvalidConfig(
+                "cannot use secret ref without manager".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn build_proxy_header_map(
+    headers: &BTreeMap<String, Vec<Secret>>,
+) -> Result<HeaderMap, HttpConfigError> {
+    let mut map = HeaderMap::new();
+    for (name, values) in headers {
+        let hdr_name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+            HttpConfigError::InvalidConfig(format!(
+                "invalid proxy_connect_header name {name:?}: {e}"
+            ))
+        })?;
+        for value in values {
+            let mut hdr_val = HeaderValue::from_str(value.as_str()).map_err(|e| {
+                HttpConfigError::InvalidConfig(format!(
+                    "invalid proxy_connect_header value for {name:?}: {e}"
+                ))
+            })?;
+            hdr_val.set_sensitive(true);
+            map.append(&hdr_name, hdr_val);
+        }
+    }
+    Ok(map)
+}
+
+fn sensitive_header_value(value: &str) -> Result<HeaderValue, HttpConfigError> {
+    let mut hdr_val = HeaderValue::from_str(value)
+        .map_err(|e| HttpConfigError::InvalidConfig(format!("invalid HTTP header value: {e}")))?;
+    hdr_val.set_sensitive(true);
+    Ok(hdr_val)
+}
+
+fn extract_pem_blocks(
+    pem: &[u8],
+    wanted: &[&[u8]],
+    limit: Option<usize>,
+) -> Result<Vec<u8>, HttpConfigError> {
+    let mut out = Vec::new();
+    let mut active_label: Option<&[u8]> = None;
+    let mut keep_active = false;
+    let mut matched = 0usize;
+
+    for raw_line in pem.split(|&b| b == b'\n') {
+        let trimmed = raw_line
+            .strip_suffix(b"\r")
+            .unwrap_or(raw_line)
+            .trim_ascii();
+        if let Some(label) = trimmed
+            .strip_prefix(b"-----BEGIN ")
+            .and_then(|rest| rest.strip_suffix(b"-----"))
+            && !label.is_empty()
+            && !label.starts_with(b"-")
+            && !label.ends_with(b"-")
+        {
+            if active_label.is_some() {
+                return Err(HttpConfigError::InvalidConfig(
+                    "malformed PEM: nested BEGIN marker before END".to_owned(),
+                ));
+            }
+            active_label = Some(label);
+            keep_active = wanted.contains(&label) && limit.is_none_or(|max| matched < max);
+            if keep_active {
+                out.extend_from_slice(trimmed);
+                out.push(b'\n');
+            }
+            continue;
+        }
+
+        if let Some(label) = active_label {
+            if let Some(end_label) = trimmed
+                .strip_prefix(b"-----END ")
+                .and_then(|rest| rest.strip_suffix(b"-----"))
+                && end_label == label
+            {
+                if keep_active {
+                    out.extend_from_slice(trimmed);
+                    out.push(b'\n');
+                    matched += 1;
+                }
+                active_label = None;
+                keep_active = false;
+                continue;
+            }
+            if keep_active {
+                out.extend_from_slice(trimmed);
+                out.push(b'\n');
+            }
+        }
+    }
+
+    if active_label.is_some() {
+        return Err(HttpConfigError::InvalidConfig(
+            "malformed PEM: missing END marker".to_owned(),
+        ));
+    }
+
+    Ok(out)
 }
 
 /// Known field names of [`HttpClientConfig`] (including flattened [`ProxyConfig`]).
@@ -1102,15 +1612,83 @@ pub fn count_true(flags: &[bool]) -> usize {
     flags.iter().filter(|&&b| b).count()
 }
 
+fn is_valid_url_scheme(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    matches!(bytes.next(), Some(b) if b.is_ascii_alphabetic())
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+}
+
+fn redact_authority_password(raw: &str, authority_start: usize) -> Option<String> {
+    let rest = &raw[authority_start..];
+    let authority_end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let at_pos = authority.rfind('@')?;
+    let colon_pos = authority[..at_pos].find(':')?;
+    let prefix = &raw[..authority_start + colon_pos + 1];
+    let suffix = &raw[authority_start + at_pos..];
+    Some(format!("{prefix}xxxxx{suffix}"))
+}
+
+fn redact_url(raw: &str) -> String {
+    let authority_start = raw
+        .find("://")
+        .filter(|&idx| is_valid_url_scheme(&raw[..idx]))
+        .map_or(0, |idx| idx + 3);
+
+    if let Ok(mut parsed) = url::Url::parse(raw)
+        && !parsed.cannot_be_a_base()
+    {
+        if parsed.password().is_some() {
+            // Preserve the original URL spelling (matching Go's `url.URL.Redacted()`, which does
+            // not append a trailing `/` to `http://u:p@host:8080`). Fall back to `Url::set_password`
+            // only if WHATWG parsing accepted a non-standard separator.
+            if authority_start > 0
+                && let Some(redacted) = redact_authority_password(raw, authority_start)
+            {
+                return redacted;
+            }
+            let _ = parsed.set_password(Some("xxxxx"));
+            return parsed.into();
+        }
+        return raw.to_owned();
+    }
+
+    // Fallback for malformed or schemeless URLs (for example `http://u:p@proxy:99999`,
+    // `u:p@proxy:8080`, or `u:p@proxy://x`) so userinfo credentials are never echoed raw.
+    if let Some(redacted) = redact_authority_password(raw, authority_start) {
+        return redacted;
+    }
+    let rest = &raw[authority_start..];
+    if let Some(last_at) = rest.rfind('@')
+        && rest[..last_at].contains(':')
+    {
+        return SECRET_TOKEN.to_owned();
+    }
+    raw.to_owned()
+}
+
+fn serialize_opt_url<S: Serializer>(
+    url: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match url {
+        Some(u) => serializer.serialize_some(&redact_url(u)),
+        None => serializer.serialize_none(),
+    }
+}
+
 /// Validates that `s` can be parsed by Go's `net/url.Parse`.
 pub fn validate_go_url(s: &str) -> Result<(), String> {
     if s.bytes().any(|b| b < 0x20 || b == 0x7f) {
-        return Err(format!("net/url: invalid control character in URL {s:?}"));
+        return Err(format!(
+            "net/url: invalid control character in URL {:?}",
+            redact_url(s)
+        ));
     }
     if s.contains("://") {
         let base_parse = url::Url::parse(s);
         if let Err(err) = base_parse {
-            return Err(format!("parse {s:?}: {err}"));
+            return Err(format!("parse {:?}: {err}", redact_url(s)));
         }
     }
     Ok(())
