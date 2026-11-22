@@ -22,9 +22,10 @@
 
 use crate::parse::{Histogram, HistogramRef, Span};
 
-use super::columns::{HistogramDpTable, f64_to_u64_count};
+use super::columns::{ExpBucketsCol, ExpHistogramDpTable, HistogramDpTable, f64_to_u64_count};
 use super::family::CurrentFamily;
 use super::options::DecodeError;
+use super::staleness::is_stale_nan;
 
 /// Go's `histogram.CustomBucketsSchema`, the schema of a native histogram with custom buckets
 /// (NHCB).
@@ -32,6 +33,17 @@ pub(super) const CUSTOM_BUCKETS_SCHEMA: i32 = -53;
 
 /// Go's `histogram.ExponentialSchemaMin` and `histogram.ExponentialSchemaMax`.
 pub(super) const EXPONENTIAL_SCHEMAS: std::ops::RangeInclusive<i32> = -4..=8;
+
+/// Dense buckets one side of an exponential histogram may always use, the default `MaxSize` of
+/// the OpenTelemetry SDK's exponential histogram.
+const MIN_DENSE_BUCKET_LIMIT: u64 = 160;
+
+/// Dense buckets one side may use per sparse bucket on top of [`MIN_DENSE_BUCKET_LIMIT`], so the
+/// dense lists grow at most linearly with the input.
+const DENSE_BUCKETS_PER_SPARSE_BUCKET: u64 = 8;
+
+const EXPONENTIAL_CUSTOM_BOUNDS: &str =
+    "histogram with exponential schema must not have custom bounds";
 
 /// Bucket counts of one side of a native histogram.
 #[derive(Clone, Copy)]
@@ -301,6 +313,241 @@ fn check_custom_buckets(histogram: &NativeView<'_>) -> Result<(), String> {
     Ok(())
 }
 
+/// Range of bucket indexes at `schema` whose buckets hold float64 values, per Go's
+/// `getBoundExponential`.
+///
+/// The highest index is the bucket that ends at `math.MaxFloat64`; the next one is the
+/// overflow bucket for `±Inf`. The lowest index is the bucket of the smallest subnormal,
+/// `2^-1074`. The bounds of buckets outside the range are outside the float64 range.
+fn exponential_index_range(schema: i32) -> (i64, i64) {
+    debug_assert!(EXPONENTIAL_SCHEMAS.contains(&schema));
+    if schema >= 0 {
+        (-1074 << schema, 1024 << schema)
+    } else {
+        (-(1074 >> -schema), 1024 >> -schema)
+    }
+}
+
+/// Go's `FloatHistogram.Validate` for a float histogram with an exponential schema, which the
+/// caller then drops: no custom bounds, valid spans, and no negative buckets. Like Go, it does
+/// not check the count against the buckets.
+pub(super) fn check_float_exponential(histogram: &NativeView<'_>) -> Result<(), String> {
+    debug_assert!(histogram.is_float);
+    if !histogram.custom_values.is_empty() {
+        return Err(EXPONENTIAL_CUSTOM_BOUNDS.to_owned());
+    }
+    walk_buckets(
+        "positive",
+        histogram.positive_spans,
+        histogram.positive,
+        |_, _| {},
+    )?;
+    walk_buckets(
+        "negative",
+        histogram.negative_spans,
+        histogram.negative,
+        |_, _| {},
+    )?;
+    Ok(())
+}
+
+/// Appends an exponential native histogram (schema -4 to 8) to `dp` as an OTAP exponential
+/// histogram data point, per the OpenTelemetry Prometheus compatibility spec: `scale` is the
+/// schema, the sparse spans become one dense list per side whose offset is the first index
+/// minus one, and buckets outside the float64 range are dropped and not counted. A stale NaN
+/// sum leaves the counts zero and the buckets empty.
+///
+/// A side whose dense list would be wider than [`dense_bucket_limit`] lowers the scale and
+/// merges adjacent buckets until it fits, like Prometheus's `native_histogram_bucket_limit`,
+/// so a few sparse buckets far apart cannot make the decoder allocate a huge list.
+///
+/// The caller drops float histograms, which the spec does not map, and appends the base
+/// columns, with the no-recorded-value flag for a stale point.
+pub(super) fn push_exponential(
+    dp: &mut ExpHistogramDpTable,
+    histogram: &NativeView<'_>,
+    family: &CurrentFamily,
+) -> Result<(), DecodeError> {
+    debug_assert!(!histogram.is_float);
+    if !histogram.custom_values.is_empty() {
+        return Err(invalid_histogram(
+            family,
+            EXPONENTIAL_CUSTOM_BOUNDS.to_owned(),
+        ));
+    }
+    // Prometheus writes the stale NaN into the sum of a stale native histogram.
+    let stale = is_stale_nan(histogram.sum);
+    let range = exponential_index_range(histogram.schema);
+    let shift = downscale_shift(
+        histogram.schema,
+        [
+            (
+                kept_index_bounds(histogram.positive_spans, range),
+                histogram.positive.len(),
+            ),
+            (
+                kept_index_bounds(histogram.negative_spans, range),
+                histogram.negative.len(),
+            ),
+        ],
+    );
+    let (positive_total, positive_kept) = push_dense_side(
+        &mut dp.positive,
+        "positive",
+        histogram.positive_spans,
+        histogram.positive,
+        range,
+        shift,
+        stale,
+    )
+    .map_err(|reason| invalid_histogram(family, reason))?;
+    let (negative_total, negative_kept) = push_dense_side(
+        &mut dp.negative,
+        "negative",
+        histogram.negative_spans,
+        histogram.negative,
+        range,
+        shift,
+        stale,
+    )
+    .map_err(|reason| invalid_histogram(family, reason))?;
+    histogram
+        .check_count(
+            positive_total
+                .wrapping_add(negative_total)
+                .wrapping_add(histogram.zero_count),
+        )
+        .map_err(|reason| invalid_histogram(family, reason))?;
+
+    dp.scales.push(histogram.schema - shift as i32);
+    dp.zero_thresholds.push(histogram.zero_threshold);
+    if stale {
+        dp.counts.push(0);
+        dp.sums.push(0.0);
+        dp.zero_counts.push(0);
+    } else {
+        dp.counts.push(
+            histogram
+                .zero_count
+                .wrapping_add(positive_kept)
+                .wrapping_add(negative_kept),
+        );
+        dp.sums.push(histogram.sum);
+        dp.zero_counts.push(histogram.zero_count);
+    }
+    Ok(())
+}
+
+/// Dense buckets a side with `sparse_buckets` buckets may use before it is downscaled.
+fn dense_bucket_limit(sparse_buckets: usize) -> u64 {
+    MIN_DENSE_BUCKET_LIMIT
+        .max(DENSE_BUCKETS_PER_SPARSE_BUCKET.saturating_mul(sparse_buckets as u64))
+}
+
+/// Lowest and highest index within `range` that `spans` cover, or `None` if they cover none.
+///
+/// It only reads the spans, before [`walk_buckets`] checks them, so it takes the extremes of
+/// every span instead of relying on their order.
+fn kept_index_bounds(spans: &[Span], (min_index, max_index): (i64, i64)) -> Option<(i64, i64)> {
+    let mut bounds: Option<(i64, i64)> = None;
+    let mut index = 0i64;
+    for span in spans {
+        index = index.saturating_add(i64::from(span.offset));
+        if span.length > 0 {
+            let first = index.max(min_index);
+            let last = index
+                .saturating_add(i64::from(span.length) - 1)
+                .min(max_index);
+            if first <= last {
+                bounds =
+                    Some(bounds.map_or((first, last), |(lo, hi)| (lo.min(first), hi.max(last))));
+            }
+        }
+        index = index.saturating_add(i64::from(span.length));
+    }
+    bounds
+}
+
+/// OTel index of the bucket that holds Prometheus bucket `index` after lowering the scale by
+/// `shift`. Prometheus bucket `index` is OTel bucket `index - 1`, and lowering the scale by one
+/// merges OTel buckets `2i` and `2i + 1` into bucket `i`.
+fn otel_index(index: i64, shift: u32) -> i64 {
+    (index - 1) >> shift
+}
+
+/// How far to lower `schema` so that every side fits its [`dense_bucket_limit`]. Each side is
+/// the `kept_index_bounds` of its spans and its sparse bucket count.
+fn downscale_shift(schema: i32, sides: [(Option<(i64, i64)>, usize); 2]) -> u32 {
+    let too_wide = |shift: u32| {
+        sides.iter().any(|&(bounds, sparse_buckets)| {
+            bounds.is_some_and(|(first, last)| {
+                let width = otel_index(last, shift) - otel_index(first, shift) + 1;
+                width as u64 > dense_bucket_limit(sparse_buckets)
+            })
+        })
+    };
+    let mut shift = 0;
+    // At schema -4 the whole float range is 132 buckets, below the limit.
+    while too_wide(shift) && schema - (shift as i32) > *EXPONENTIAL_SCHEMAS.start() {
+        shift += 1;
+    }
+    debug_assert!(!too_wide(shift));
+    shift
+}
+
+/// Appends one side of an exponential histogram to `col` as a dense list at the scale lowered
+/// by `shift`, keeping only the buckets within `range`, and returns the total count of all
+/// buckets, for Go's count check, and of the kept buckets. A stale point gets an empty list.
+fn push_dense_side(
+    col: &mut ExpBucketsCol,
+    side: &str,
+    spans: &[Span],
+    buckets: Buckets<'_>,
+    (min_index, max_index): (i64, i64),
+    shift: u32,
+    stale: bool,
+) -> Result<(u64, u64), String> {
+    if col.list_offsets.is_empty() {
+        col.list_offsets.push(0);
+    }
+    let start = col.counts.len();
+    let counts = &mut col.counts;
+    let mut first_index = None;
+    let mut kept = 0u64;
+    // `walk_buckets` checks the spans before it visits any bucket, so indexes only grow and
+    // stay within the `kept_index_bounds` that `downscale_shift` limited to the dense limit.
+    let total = walk_buckets(side, spans, buckets, |index, count| {
+        if index < min_index || index > max_index {
+            return;
+        }
+        let otel = otel_index(index, shift);
+        let first = *first_index.get_or_insert(otel);
+        let pos = start + (otel - first) as usize;
+        if pos < counts.len() {
+            counts[pos] = counts[pos].wrapping_add(count);
+        } else {
+            counts.resize(pos, 0);
+            counts.push(count);
+        }
+        kept = kept.wrapping_add(count);
+    })?;
+    let mut offset = first_index.unwrap_or(0);
+    if stale {
+        col.counts.truncate(start);
+        offset = 0;
+    }
+    // Both bounds of the index range fit in i32.
+    col.offsets.push(offset as i32);
+    let end = i32::try_from(col.counts.len()).map_err(|_| {
+        format!(
+            "{side} side: {} buckets overflow the OTAP i32 list offsets",
+            col.counts.len()
+        )
+    })?;
+    col.list_offsets.push(end);
+    Ok((total, kept))
+}
+
 /// Go's `checkHistogramCustomBounds`, without the span and bucket count check that
 /// [`walk_buckets`] does.
 fn check_custom_bounds(bounds: &[f64], spans: &[Span]) -> Result<(), String> {
@@ -344,6 +591,7 @@ fn check_custom_bounds(bounds: &[f64], spans: &[Span]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arrow::staleness::STALE_NAN;
 
     fn span(offset: i32, length: u32) -> Span {
         Span { offset, length }
@@ -445,6 +693,172 @@ mod tests {
         h.negative_spans = vec![span(0, 1)];
         h.negative_buckets = vec![1];
         assert!(push(&mut HistogramDpTable::default(), &h).is_err());
+    }
+
+    fn exponential(schema: i32, spans: Vec<Span>, deltas: Vec<i64>) -> Histogram<u64, i64> {
+        let count = deltas
+            .iter()
+            .scan(0i64, |current, delta| {
+                *current += delta;
+                Some(*current as u64)
+            })
+            .sum::<u64>()
+            + 2;
+        Histogram {
+            schema,
+            zero_threshold: 1e-128,
+            zero_count: 2,
+            count,
+            sum: 10.0,
+            positive_spans: spans,
+            positive_buckets: deltas,
+            ..Histogram::default()
+        }
+    }
+
+    fn push_exp(dp: &mut ExpHistogramDpTable, h: &Histogram<u64, i64>) -> Result<(), DecodeError> {
+        let view = NativeView::new(HistogramRef::Int(h)).unwrap();
+        push_exponential(dp, &view, &family())
+    }
+
+    #[test]
+    fn index_range_matches_go_bounds() {
+        assert_eq!(exponential_index_range(0), (-1074, 1024));
+        assert_eq!(exponential_index_range(8), (-1074 << 8, 1024 << 8));
+        // 2^(16 * -67) = 2^-1072 still holds 2^-1074, the bucket below does not.
+        assert_eq!(exponential_index_range(-4), (-67, 64));
+        assert_eq!(exponential_index_range(-1), (-537, 512));
+    }
+
+    #[test]
+    fn push_exponential_densifies_with_otel_offsets() {
+        let mut dp = ExpHistogramDpTable::default();
+        let mut h = exponential(3, vec![span(-2, 2), span(3, 1)], vec![1, 2, -1]);
+        h.negative_spans = vec![span(5, 1)];
+        h.negative_buckets = vec![4];
+        h.count += 4;
+        push_exp(&mut dp, &h).unwrap();
+        assert_eq!(dp.scales, [3]);
+        assert_eq!(dp.counts, [h.count]);
+        assert_eq!(dp.zero_counts, [2]);
+        // Prometheus index -2 is the bucket above OTel index -3.
+        assert_eq!(dp.positive.offsets, [-3]);
+        assert_eq!(dp.positive.counts, [1, 3, 0, 0, 0, 2]);
+        assert_eq!(dp.positive.list_offsets, [0, 6]);
+        assert_eq!(dp.negative.offsets, [4]);
+        assert_eq!(dp.negative.counts, [4]);
+
+        // No spans: offset 0 and an empty list.
+        push_exp(&mut dp, &exponential(0, vec![], vec![])).unwrap();
+        assert_eq!(dp.positive.offsets, [-3, 0]);
+        assert_eq!(dp.positive.list_offsets, [0, 6, 6]);
+        assert_eq!(dp.counts[1], 2);
+    }
+
+    #[test]
+    fn push_exponential_drops_buckets_outside_the_float_range() {
+        let mut dp = ExpHistogramDpTable::default();
+        // At schema 0 index 1024 ends at math.MaxFloat64 and 1025 is the ±Inf bucket;
+        // index -1075 is below the smallest subnormal.
+        let h = exponential(0, vec![span(-1075, 1), span(2098, 2)], vec![7, -6, 2]);
+        push_exp(&mut dp, &h).unwrap();
+        assert_eq!(dp.positive.offsets, [1023]);
+        assert_eq!(dp.positive.counts, [1]);
+        // Zero count plus the one kept bucket.
+        assert_eq!(dp.counts, [3]);
+    }
+
+    #[test]
+    fn push_exponential_empties_stale_points() {
+        let mut dp = ExpHistogramDpTable::default();
+        let mut h = exponential(1, vec![span(0, 1)], vec![3]);
+        h.sum = STALE_NAN;
+        push_exp(&mut dp, &h).unwrap();
+        assert_eq!((dp.counts[0], dp.sums[0], dp.zero_counts[0]), (0, 0.0, 0));
+        assert!(dp.positive.counts.is_empty());
+        assert_eq!(dp.positive.offsets, [0]);
+    }
+
+    #[test]
+    fn push_exponential_applies_go_checks() {
+        let mut h = exponential(0, vec![span(0, 1)], vec![3]);
+        h.count = 4;
+        let err = push_exp(&mut ExpHistogramDpTable::default(), &h).unwrap_err();
+        assert!(err.to_string().contains("should equal"), "{err}");
+
+        let mut h = exponential(0, vec![span(0, 1)], vec![3]);
+        h.custom_values = vec![1.0];
+        let err = push_exp(&mut ExpHistogramDpTable::default(), &h).unwrap_err();
+        assert!(err.to_string().contains("custom bounds"), "{err}");
+
+        let h = exponential(0, vec![span(0, 1), span(-2, 1)], vec![3, 0]);
+        assert!(push_exp(&mut ExpHistogramDpTable::default(), &h).is_err());
+    }
+
+    #[test]
+    fn push_exponential_downscales_wide_sides() {
+        // Indexes 1 and 2 are OTel buckets 0 and 1, which merge at scale 1, and index 301 is
+        // OTel bucket 300. At scale 2 the list would need 301 buckets, more than 160.
+        let mut dp = ExpHistogramDpTable::default();
+        let h = exponential(2, vec![span(1, 2), span(298, 1)], vec![2, 1, -1]);
+        push_exp(&mut dp, &h).unwrap();
+        assert_eq!(dp.scales, [1]);
+        assert_eq!(dp.positive.offsets, [0]);
+        assert_eq!(dp.positive.counts.len(), 151);
+        assert_eq!(dp.positive.counts[0], 5);
+        assert_eq!(dp.positive.counts[150], 2);
+        assert_eq!(dp.counts, [9]);
+
+        // Two buckets at the ends of the schema 8 range would need 537,088 dense buckets.
+        let mut dp = ExpHistogramDpTable::default();
+        let h = exponential(8, vec![span(-274_944, 1), span(537_087, 1)], vec![1, 0]);
+        push_exp(&mut dp, &h).unwrap();
+        assert_eq!(dp.scales, [-4]);
+        assert_eq!(dp.positive.offsets, [-68]);
+        assert_eq!(dp.positive.counts.len(), 132);
+        assert_eq!(dp.positive.counts[0], 1);
+        assert_eq!(dp.positive.counts[131], 1);
+
+        // Many sparse buckets raise the limit, so a dense histogram keeps its scale.
+        let mut dp = ExpHistogramDpTable::default();
+        let h = exponential(8, vec![span(0, 200)], vec![1; 200]);
+        push_exp(&mut dp, &h).unwrap();
+        assert_eq!(dp.scales, [8]);
+        assert_eq!(dp.positive.counts.len(), 200);
+    }
+
+    #[test]
+    fn downscale_shift_uses_both_sides() {
+        assert_eq!(downscale_shift(3, [(Some((0, 159)), 2), (None, 0)]), 0);
+        assert_eq!(
+            downscale_shift(3, [(Some((0, 159)), 2), (Some((0, 160)), 2)]),
+            1
+        );
+        assert_eq!(dense_bucket_limit(0), 160);
+        assert_eq!(dense_bucket_limit(100), 800);
+    }
+
+    #[test]
+    fn check_float_exponential_applies_go_checks() {
+        let float = |spans: Vec<Span>, buckets: Vec<f64>| Histogram::<f64, f64> {
+            schema: 0,
+            count: 1.0,
+            positive_spans: spans,
+            positive_buckets: buckets,
+            ..Histogram::default()
+        };
+        let check = |h: &Histogram<f64, f64>| {
+            check_float_exponential(&NativeView::new(HistogramRef::Float(h)).unwrap())
+        };
+        // Go does not check the count of a float histogram.
+        assert!(check(&float(vec![span(0, 1)], vec![5.0])).is_ok());
+        let err = check(&float(vec![span(0, 1), span(-1, 1)], vec![1.0, 1.0])).unwrap_err();
+        assert!(err.contains("offset is negative"), "{err}");
+        let err = check(&float(vec![span(0, 1)], vec![-1.0])).unwrap_err();
+        assert!(err.contains("count is negative"), "{err}");
+        let mut h = float(vec![], vec![]);
+        h.custom_values = vec![1.0];
+        assert!(check(&h).unwrap_err().contains("custom bounds"));
     }
 
     #[test]

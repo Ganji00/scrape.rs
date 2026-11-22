@@ -453,10 +453,13 @@ impl ArrowDecoder {
     /// metric name are not reassembled or rejected; each run starts with fresh `untyped` metadata
     /// unless preceded by its own metadata lines.
     ///
-    /// Each protobuf `MetricFamily` message becomes its own family. Classic protobuf histograms
-    /// are converted to native histograms with custom buckets, like Go, and decoded as
-    /// explicit-bucket `HistogramDataPoints`; a native histogram that Go's `Validate` would
-    /// reject fails the scrape with [`DecodeError::InvalidHistogram`].
+    /// Each protobuf `MetricFamily` message becomes its own family. Native histograms follow
+    /// the OpenTelemetry Prometheus compatibility spec: exponential schemas become
+    /// `ExpHistogramDataPoints`, and custom-bucket histograms, which classic protobuf histograms
+    /// are converted to like in Go, become explicit-bucket `HistogramDataPoints`. A family that
+    /// mixes both gets one metric row of each type. Float exponential histograms are dropped. A
+    /// native histogram that Go's `Validate` would reject fails the scrape with
+    /// [`DecodeError::InvalidHistogram`].
     ///
     /// Single-batch `decode` returns [`DecodeError::CapacityOverflow`] if a scrape contains more
     /// than 65,536 distinct metric families (OTAP's `u16` `UnivariateMetrics.id` limit). Use
@@ -1074,6 +1077,7 @@ impl ArrowDecoder {
 
     fn reset_batch(&mut self) {
         self.current_family.batch_id = None;
+        self.current_family.exp_batch_id = None;
         self.metrics.clear();
         self.key_interner.clear();
         self.val_interner.clear();

@@ -523,30 +523,261 @@ fn label_errors_match_the_text_decoder() {
     ));
 }
 
+fn span(offset: i32, length: u32) -> dto::BucketSpan {
+    dto::BucketSpan { offset, length }
+}
+
+/// Integer exponential native histogram with positive buckets only.
+fn native(schema: i32, spans: Vec<dto::BucketSpan>, deltas: Vec<i64>) -> dto::Histogram {
+    let mut current = 0i64;
+    let buckets: u64 = deltas
+        .iter()
+        .map(|delta| {
+            current += delta;
+            // Negative counts are for the Validate tests, which never get to the count check.
+            current.max(0) as u64
+        })
+        .sum();
+    dto::Histogram {
+        sample_count: buckets + 1,
+        sample_sum: 12.5,
+        schema,
+        zero_threshold: 1e-128,
+        zero_count: 1,
+        positive_span: spans,
+        positive_delta: deltas,
+        ..dto::Histogram::default()
+    }
+}
+
+fn histogram_metric(pairs: &[(&str, &str)], histogram: dto::Histogram) -> dto::Metric {
+    dto::Metric {
+        label: labels(pairs),
+        histogram: Some(histogram),
+        timestamp_ms: 1_700_000_000_000,
+        ..dto::Metric::default()
+    }
+}
+
+fn metric_types(records: &OtapMetricRecords) -> Vec<u8> {
+    records
+        .univariate_metrics()
+        .unwrap()
+        .column_by_name("metric_type")
+        .unwrap()
+        .as_primitive::<arrow_array::types::UInt8Type>()
+        .values()
+        .to_vec()
+}
+
+#[test]
+fn exponential_histograms_become_exponential_points() {
+    let mut first = native(3, vec![span(-1, 2), span(2, 1)], vec![2, 1, -2]);
+    first.start_timestamp = Some(timestamp(1_600_000_000_000));
+    first.negative_span = vec![span(0, 1)];
+    first.negative_delta = vec![4];
+    first.sample_count += 4;
+    first.exemplars = vec![
+        dto::Exemplar {
+            label: labels(&[("trace_id", "0102030405060708090a0b0c0d0e0f10")]),
+            value: 0.3,
+            timestamp: Some(timestamp(1_700_000_000_001)),
+        },
+        // Go drops native histogram exemplars without a timestamp.
+        dto::Exemplar {
+            label: labels(&[("user", "x")]),
+            value: 0.4,
+            timestamp: None,
+        },
+        dto::Exemplar {
+            label: labels(&[("user", "y")]),
+            value: 0.5,
+            timestamp: Some(timestamp(1_700_000_000_002)),
+        },
+    ];
+    let second = native(0, vec![], vec![]);
+    let input = encode(&[family(
+        "rpc_seconds",
+        "RPC latency.",
+        dto::MetricType::Histogram,
+        vec![
+            histogram_metric(&[("method", "get")], first),
+            histogram_metric(&[("method", "put")], second),
+        ],
+    )]);
+    let records = decode(&input, &DecodeOptions::default()).unwrap();
+
+    assert_eq!(metric_types(&records), [4]);
+    assert!(records.histogram_data_points().is_none());
+    let points = records.exp_histogram_data_points().unwrap();
+    assert_eq!(u64s(points, "count"), [11, 1]);
+    assert_eq!(f64s(points, "sum"), [12.5, 12.5]);
+    assert_eq!(u64s(points, "zero_count"), [1, 1]);
+    assert_eq!(
+        points
+            .column_by_name("scale")
+            .unwrap()
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .values(),
+        &[3, 0]
+    );
+    assert_eq!(
+        timestamps(points, "start_time_unix_nano"),
+        [Some(1_600_000_000_000_000_000), None]
+    );
+    let positive = points.column_by_name("positive").unwrap().as_struct();
+    assert_eq!(
+        positive
+            .column_by_name("offset")
+            .unwrap()
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .values(),
+        &[-2, 0]
+    );
+    let counts = positive
+        .column_by_name("bucket_counts")
+        .unwrap()
+        .as_list::<i32>();
+    assert_eq!(counts.value_offsets(), [0, 5, 5]);
+    assert_eq!(
+        counts.values().as_primitive::<UInt64Type>().values(),
+        &[2, 3, 0, 0, 1]
+    );
+    assert!(points.column_by_name("negative").is_some());
+    assert!(points.column_by_name("flags").is_none());
+
+    let exemplars = records.exp_histogram_dp_exemplars().unwrap();
+    assert_eq!(f64s(exemplars, "double_value"), [0.3, 0.5]);
+    let exemplar_attrs = records.exp_histogram_dp_exemplar_attrs().unwrap();
+    assert_eq!(strings(exemplar_attrs, "str"), ["y"]);
+    let attrs = records.exp_histogram_dp_attrs().unwrap();
+    assert_eq!(strings(attrs, "str"), ["get", "put"]);
+}
+
+#[test]
+fn mixed_native_and_custom_bucket_histograms_use_two_rows() {
+    let input = encode(&[family(
+        "mixed",
+        "Mixed.",
+        dto::MetricType::Histogram,
+        vec![
+            histogram_metric(&[("a", "1")], native(1, vec![span(0, 1)], vec![3])),
+            classic_histogram(&[("a", "2")], &[(1.0, 2)], 2, 1.0),
+            histogram_metric(&[("a", "3")], native(1, vec![span(0, 1)], vec![1])),
+        ],
+    )]);
+    let records = decode(&input, &DecodeOptions::default()).unwrap();
+    assert_eq!(metric_types(&records), [4, 3]);
+    let metrics = records.univariate_metrics().unwrap();
+    assert_eq!(strings(metrics, "name"), ["mixed", "mixed"]);
+    assert_eq!(strings(metrics, "description"), ["Mixed.", "Mixed."]);
+    assert_eq!(records.exp_histogram_data_points().unwrap().num_rows(), 2);
+    assert_eq!(records.histogram_data_points().unwrap().num_rows(), 1);
+}
+
+#[test]
+fn float_exponential_histograms_are_dropped_and_gauge_ones_kept() {
+    let float = dto::Histogram {
+        sample_count_float: 2.0,
+        sample_sum: 1.0,
+        schema: 0,
+        zero_count_float: 2.0,
+        zero_threshold: 1e-128,
+        ..dto::Histogram::default()
+    };
+    let input = encode(&[
+        family(
+            "float",
+            "",
+            dto::MetricType::Histogram,
+            vec![histogram_metric(&[], float)],
+        ),
+        family(
+            "gauge",
+            "",
+            dto::MetricType::GaugeHistogram,
+            vec![histogram_metric(&[], native(0, vec![span(1, 1)], vec![2]))],
+        ),
+    ]);
+    let records = decode(&input, &DecodeOptions::default()).unwrap();
+    assert_eq!(
+        strings(records.univariate_metrics().unwrap(), "name"),
+        ["gauge"]
+    );
+    assert_eq!(metric_types(&records), [4]);
+    assert_eq!(records.exp_histogram_data_points().unwrap().num_rows(), 1);
+}
+
+#[test]
+fn stale_native_histograms_set_the_no_recorded_value_flag() {
+    let mut stale = native(0, vec![span(0, 1)], vec![2]);
+    stale.sample_sum = f64::from_bits(0x7ff0_0000_0000_0002);
+    let input = encode(&[family(
+        "h",
+        "",
+        dto::MetricType::Histogram,
+        vec![
+            histogram_metric(&[("s", "1")], stale),
+            histogram_metric(&[("s", "2")], native(0, vec![span(0, 1)], vec![2])),
+        ],
+    )]);
+    let records = decode(&input, &DecodeOptions::default()).unwrap();
+    let points = records.exp_histogram_data_points().unwrap();
+    assert_eq!(
+        points
+            .column_by_name("flags")
+            .unwrap()
+            .as_primitive::<UInt32Type>()
+            .values(),
+        &[1, 0]
+    );
+    assert_eq!(u64s(points, "count"), [0, 3]);
+}
+
 #[test]
 fn invalid_histograms_fail_the_scrape() {
-    let native = |schema| dto::Metric {
-        histogram: Some(dto::Histogram {
-            sample_count: 1,
-            schema,
-            zero_threshold: 1e-128,
-            zero_count: 1,
-            ..dto::Histogram::default()
-        }),
-        ..dto::Metric::default()
-    };
-    for schema in [9, -5] {
+    let cases = [
+        (native(9, vec![], vec![]), "invalid schema"),
+        (native(-5, vec![], vec![]), "invalid schema"),
+        (
+            native(0, vec![span(0, 1), span(-1, 1)], vec![1, 1]),
+            "offset is negative",
+        ),
+        (
+            native(0, vec![span(0, 2)], vec![1, -2]),
+            "count is negative",
+        ),
+        (
+            dto::Histogram {
+                sample_count: 99,
+                ..native(0, vec![span(0, 1)], vec![1])
+            },
+            "should equal",
+        ),
+        // Float exponential histograms are dropped, but only after Go's checks.
+        (
+            dto::Histogram {
+                sample_count_float: 2.0,
+                schema: 0,
+                positive_span: vec![span(0, 1), span(-1, 1)],
+                positive_count: vec![1.0, 1.0],
+                ..dto::Histogram::default()
+            },
+            "offset is negative",
+        ),
+    ];
+    for (histogram, expected) in cases {
         let input = encode(&[family(
             "h",
             "",
             dto::MetricType::Histogram,
-            vec![native(schema)],
+            vec![histogram_metric(&[], histogram)],
         )]);
         let err = decode(&input, &DecodeOptions::default()).unwrap_err();
         assert!(
             matches!(&err, DecodeError::InvalidHistogram { metric, reason }
-                if metric == "h" && reason.contains("invalid schema")),
-            "{err:?}"
+                if metric == "h" && reason.contains(expected)),
+            "{expected}: {err:?}"
         );
     }
 }
@@ -570,6 +801,14 @@ fn chunked_and_budgeted_decoding_matches_single_batch() {
             (0..5).map(|i| gauge(&[], f64::from(i))).collect(),
         ),
         family("h", "H.", dto::MetricType::Histogram, metrics),
+        family(
+            "e",
+            "E.",
+            dto::MetricType::Histogram,
+            (0..4)
+                .map(|i| histogram_metric(&[], native(i, vec![span(0, 1)], vec![1])))
+                .collect(),
+        ),
     ]);
     let opts = DecodeOptions::default().with_max_data_points_per_batch(2);
     let mut dec = ArrowDecoder::new();
@@ -582,7 +821,7 @@ fn chunked_and_budgeted_decoding_matches_single_batch() {
             .iter()
             .map(OtapMetricRecords::num_data_points)
             .collect::<Vec<_>>(),
-        [2, 2, 2, 2, 2]
+        [2, 2, 2, 2, 2, 2, 2]
     );
     // The family row is repeated in every chunk its points land in.
     assert_eq!(
@@ -621,7 +860,11 @@ fn chunked_and_budgeted_decoding_matches_single_batch() {
     let whole = dec
         .decode(&input, &Format::PROTO_DELIM, &DecodeOptions::default())
         .unwrap();
-    assert_eq!(whole.num_data_points(), 10);
+    assert_eq!(whole.num_data_points(), 14);
+    assert_eq!(
+        strings(chunks[6].univariate_metrics().unwrap(), "name"),
+        ["e"]
+    );
 }
 
 #[test]

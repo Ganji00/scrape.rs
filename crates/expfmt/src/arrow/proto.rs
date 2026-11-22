@@ -25,15 +25,17 @@
 use std::time::Instant;
 
 use crate::dto;
-use crate::parse::{Entry, MetricType, Parser, ProtobufParser, ProtobufParserState};
+use crate::parse::{Entry, HistogramRef, MetricType, Parser, ProtobufParser, ProtobufParserState};
 use crate::parse::{METRIC_NAME_LABEL, timestamp_millis};
 
 use super::columns::{ExemplarTable, ms_to_ns, parse_hex_array};
 use super::family::CurrentFamily;
 use super::intern::StringInterner;
 use super::native::{
-    CUSTOM_BUCKETS_SCHEMA, EXPONENTIAL_SCHEMAS, NativeView, invalid_histogram, push_custom_buckets,
+    CUSTOM_BUCKETS_SCHEMA, EXPONENTIAL_SCHEMAS, NativeView, check_float_exponential,
+    invalid_histogram, push_custom_buckets, push_exponential,
 };
+use super::staleness::{DATA_POINT_FLAG_NO_RECORDED_VALUE, is_stale_nan};
 use super::{
     ArrowDecoder, DECODE_BUDGET_DURATION_CHECK_INTERVAL, DecodeBudget, DecodeError, DecodeOptions,
     DecodeStep, MAX_METRICS_PER_BATCH, UntypedPolicy,
@@ -51,6 +53,16 @@ pub(super) struct ProtoScratch {
 impl ProtoScratch {
     pub(super) fn retained_memory_bytes(&self) -> usize {
         self.state.retained_memory_bytes() + self.quantiles.capacity() * size_of::<(f64, f64)>()
+    }
+}
+
+/// Whether the current histogram becomes an exponential point, so it needs the family's
+/// exponential histogram row. Float exponential histograms are dropped and need no row.
+#[inline]
+fn is_exponential(parser: &ProtobufParser<'_>) -> bool {
+    match parser.histogram().2 {
+        HistogramRef::Int(h) => EXPONENTIAL_SCHEMAS.contains(&h.schema),
+        HistogramRef::Float(_) => false,
     }
 }
 
@@ -131,10 +143,12 @@ impl ArrowDecoder {
                         || self.current_family.metric_type != MetricType::Summary
                         || parser.is_summary_start();
                     if is_point {
-                        if CHUNKED
-                            && self.current_family.batch_id.is_none()
-                            && self.metrics.len() >= MAX_METRICS_PER_BATCH
-                        {
+                        let row = if entry == Entry::Histogram && is_exponential(parser) {
+                            self.current_family.exp_batch_id
+                        } else {
+                            self.current_family.batch_id
+                        };
+                        if CHUNKED && row.is_none() && self.metrics.len() >= MAX_METRICS_PER_BATCH {
                             *pending_series = true;
                             let batch = self.finish_batches(default_ts_ns.is_some())?;
                             self.reset_batch();
@@ -308,6 +322,9 @@ impl ArrowDecoder {
         Ok(())
     }
 
+    /// Appends a native histogram: custom buckets (NHCB, which classic protobuf histograms are
+    /// converted to) as an explicit-bucket point, exponential schemas as an exponential point.
+    /// Float exponential histograms are dropped, per the OpenTelemetry compatibility spec.
     fn append_proto_histogram(
         &mut self,
         parser: &mut ProtobufParser<'_>,
@@ -319,43 +336,79 @@ impl ArrowDecoder {
         let metric = parser.current_metric();
         let view =
             NativeView::new(histogram).map_err(|r| invalid_histogram(&self.current_family, r))?;
-        if view.schema != CUSTOM_BUCKETS_SCHEMA {
-            let reason = if EXPONENTIAL_SCHEMAS.contains(&view.schema) {
-                "exponential native histograms are not supported yet".to_owned()
-            } else {
-                format!(
-                    "histogram has an invalid schema, which must be between {} and {} or {}, \
-                     got {}",
-                    EXPONENTIAL_SCHEMAS.start(),
-                    EXPONENTIAL_SCHEMAS.end(),
-                    CUSTOM_BUCKETS_SCHEMA,
-                    view.schema,
-                )
-            };
-            return Err(invalid_histogram(&self.current_family, reason));
-        }
+        let exponential = match view.schema {
+            CUSTOM_BUCKETS_SCHEMA => false,
+            schema if EXPONENTIAL_SCHEMAS.contains(&schema) => {
+                if view.is_float {
+                    check_float_exponential(&view)
+                        .map_err(|r| invalid_histogram(&self.current_family, r))?;
+                    self.current_family.has_samples = true;
+                    return Ok(());
+                }
+                true
+            }
+            schema => {
+                return Err(invalid_histogram(
+                    &self.current_family,
+                    format!(
+                        "histogram has an invalid schema, which must be between {} and {} or \
+                         {CUSTOM_BUCKETS_SCHEMA}, got {schema}",
+                        EXPONENTIAL_SCHEMAS.start(),
+                        EXPONENTIAL_SCHEMAS.end(),
+                    ),
+                ));
+            }
+        };
 
-        let dp_index = self.hist_dp.base.len();
+        let (table, dp_index) = if exponential {
+            ("ExpHistogramDataPoints", self.exp_hist_dp.base.len())
+        } else {
+            ("HistogramDataPoints", self.hist_dp.base.len())
+        };
         let dp_id = u32::try_from(dp_index).map_err(|_| DecodeError::CapacityOverflow {
-            table: "HistogramDataPoints",
+            table,
             count: dp_index + 1,
         })?;
         self.proto_labels_into_temp(&metric.label)?;
-        push_custom_buckets(&mut self.hist_dp, dp_index, &view, &self.current_family)?;
-        self.hist_dp
-            .attrs
-            .extend_for_parent(dp_id, &self.temp_attrs);
-
-        let parent_id = self
-            .current_family
-            .emit_into_batch(&mut self.metrics, opts)?;
+        let parent_id = if exponential {
+            push_exponential(&mut self.exp_hist_dp, &view, &self.current_family)?;
+            self.current_family
+                .emit_exp_histogram_into_batch(&mut self.metrics, opts)?
+        } else {
+            push_custom_buckets(&mut self.hist_dp, dp_index, &view, &self.current_family)?;
+            self.current_family
+                .emit_into_batch(&mut self.metrics, opts)?
+        };
         let ts_ns = sample_timestamp_ns(metric, default_ts_ns)?;
-        self.hist_dp.base.push(parent_id, start_ts_ns, ts_ns);
 
+        let (base, attrs, exemplars, exemplar_table) = if exponential {
+            let dp = &mut self.exp_hist_dp;
+            (
+                &mut dp.base,
+                &mut dp.attrs,
+                &mut dp.exemplars,
+                "ExpHistogramDpExemplars",
+            )
+        } else {
+            let dp = &mut self.hist_dp;
+            (
+                &mut dp.base,
+                &mut dp.attrs,
+                &mut dp.exemplars,
+                "HistogramDpExemplars",
+            )
+        };
+        attrs.extend_for_parent(dp_id, &self.temp_attrs);
+        let flags = if exponential && is_stale_nan(view.sum) {
+            DATA_POINT_FLAG_NO_RECORDED_VALUE
+        } else {
+            0
+        };
+        base.push_with_flags(parent_id, start_ts_ns, ts_ns, flags);
         while let Some(exemplar) = parser.next_histogram_exemplar() {
             push_proto_exemplar(
-                &mut self.hist_dp.exemplars,
-                "HistogramDpExemplars",
+                exemplars,
+                exemplar_table,
                 &mut self.key_interner,
                 &mut self.val_interner,
                 &self.current_family,
