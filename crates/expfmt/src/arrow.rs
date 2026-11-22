@@ -42,8 +42,8 @@ use crate::parse::{
 };
 
 use self::columns::{
-    AttrEncoding, HistogramDpTable, MetricTable, NumberDpTable, ScratchBuffers, SummaryDpTable,
-    f64_to_u64_count, ms_to_ns, parse_hex_array,
+    AttrEncoding, ExpHistogramDpTable, HistogramDpTable, MetricTable, NumberDpTable,
+    ScratchBuffers, SummaryDpTable, f64_to_u64_count, ms_to_ns, parse_hex_array,
 };
 use self::family::{CurrentFamily, FamilyAssembly, SeriesRole};
 use self::intern::StringInterner;
@@ -317,6 +317,7 @@ pub struct ArrowDecoder {
     num_dp: NumberDpTable,
     sum_dp: SummaryDpTable,
     hist_dp: HistogramDpTable,
+    exp_hist_dp: ExpHistogramDpTable,
     temp_attrs: Vec<(u32, u32)>,
     scratch: ScratchBuffers,
 }
@@ -361,6 +362,7 @@ impl ArrowDecoder {
             num_dp: NumberDpTable::with_capacity(data_points, attrs),
             sum_dp: SummaryDpTable::default(),
             hist_dp: HistogramDpTable::default(),
+            exp_hist_dp: ExpHistogramDpTable::default(),
             temp_attrs: Vec::new(),
             scratch: ScratchBuffers::with_capacity(metrics, data_points, attrs),
         }
@@ -382,6 +384,7 @@ impl ArrowDecoder {
             + self.num_dp.retained_memory_bytes()
             + self.sum_dp.retained_memory_bytes()
             + self.hist_dp.retained_memory_bytes()
+            + self.exp_hist_dp.retained_memory_bytes()
             + self.temp_attrs.capacity() * size_of::<(u32, u32)>()
             + self.scratch.retained_memory_bytes()
     }
@@ -1015,6 +1018,7 @@ impl ArrowDecoder {
         self.num_dp.clear();
         self.sum_dp.clear();
         self.hist_dp.clear();
+        self.exp_hist_dp.clear();
     }
 
     #[inline]
@@ -1030,7 +1034,10 @@ impl ArrowDecoder {
 
     #[inline]
     fn total_data_points(&self) -> usize {
-        self.num_dp.base.len() + self.sum_dp.base.len() + self.hist_dp.base.len()
+        self.num_dp.base.len()
+            + self.sum_dp.base.len()
+            + self.hist_dp.base.len()
+            + self.exp_hist_dp.base.len()
     }
 
     #[inline]
@@ -1962,20 +1969,31 @@ impl ArrowDecoder {
         let histogram_data_points = self
             .hist_dp
             .build_batch(has_default_ts, &mut self.scratch)?;
+        let exp_histogram_data_points = self
+            .exp_hist_dp
+            .build_batch(has_default_ts, &mut self.scratch)?;
 
         let any_dp_attrs = !self.num_dp.attrs.is_empty()
             || !self.sum_dp.attrs.is_empty()
             || !self.hist_dp.attrs.is_empty()
+            || !self.exp_hist_dp.attrs.is_empty()
             || !self.num_dp.exemplars.attrs.is_empty()
-            || !self.hist_dp.exemplars.attrs.is_empty();
+            || !self.hist_dp.exemplars.attrs.is_empty()
+            || !self.exp_hist_dp.exemplars.attrs.is_empty();
 
         let enc = AttrEncoding::new(&self.key_interner, &self.val_interner, any_dp_attrs);
         let number_dp_attrs = self.num_dp.attrs.build_batch(&enc, &mut self.scratch)?;
         let summary_dp_attrs = self.sum_dp.attrs.build_batch(&enc, &mut self.scratch)?;
         let histogram_dp_attrs = self.hist_dp.attrs.build_batch(&enc, &mut self.scratch)?;
+        let exp_histogram_dp_attrs = self
+            .exp_hist_dp
+            .attrs
+            .build_batch(&enc, &mut self.scratch)?;
 
         let number_dp_exemplars = self.num_dp.exemplars.build_batch(&mut self.scratch)?;
         let histogram_dp_exemplars = self.hist_dp.exemplars.build_batch(&mut self.scratch)?;
+        let exp_histogram_dp_exemplars =
+            self.exp_hist_dp.exemplars.build_batch(&mut self.scratch)?;
 
         let number_dp_exemplar_attrs = self
             .num_dp
@@ -1984,6 +2002,11 @@ impl ArrowDecoder {
             .build_batch(&enc, &mut self.scratch)?;
         let histogram_dp_exemplar_attrs = self
             .hist_dp
+            .exemplars
+            .attrs
+            .build_batch(&enc, &mut self.scratch)?;
+        let exp_histogram_dp_exemplar_attrs = self
+            .exp_hist_dp
             .exemplars
             .attrs
             .build_batch(&enc, &mut self.scratch)?;
@@ -1996,13 +2019,17 @@ impl ArrowDecoder {
             number_data_points,
             summary_data_points,
             histogram_data_points,
+            exp_histogram_data_points,
             number_dp_attrs,
             summary_dp_attrs,
             histogram_dp_attrs,
+            exp_histogram_dp_attrs,
             number_dp_exemplars,
             histogram_dp_exemplars,
+            exp_histogram_dp_exemplars,
             number_dp_exemplar_attrs,
             histogram_dp_exemplar_attrs,
+            exp_histogram_dp_exemplar_attrs,
         })
     }
 }

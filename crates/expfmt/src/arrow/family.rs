@@ -22,7 +22,7 @@ use super::options::{
 };
 use super::schema::{
     OTAP_METRIC_TYPE_GAUGE, OTAP_METRIC_TYPE_HISTOGRAM, OTAP_METRIC_TYPE_SUM,
-    OTAP_METRIC_TYPE_SUMMARY,
+    OTAP_METRIC_TYPE_SUMMARY, has_aggregation_temporality,
 };
 use super::staleness::{DATA_POINT_FLAG_NO_RECORDED_VALUE, DpKind, StalenessTracker};
 
@@ -311,8 +311,7 @@ pub(super) fn emit_family_row(
         }
     };
 
-    let has_temporality =
-        otap_type == OTAP_METRIC_TYPE_SUM || otap_type == OTAP_METRIC_TYPE_HISTOGRAM;
+    let has_temporality = has_aggregation_temporality(otap_type);
     let has_sum = otap_type == OTAP_METRIC_TYPE_SUM;
 
     metrics.metric_types.push(otap_type);
