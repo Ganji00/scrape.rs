@@ -68,6 +68,81 @@ pub struct ProtobufParser<'a> {
     is_float_histogram: bool,
     /// `(upper_bound, cumulative_count)` of the classic buckets during NHCB conversion.
     nhcb_buckets: Vec<(f64, f64)>,
+    /// Skips sorting labels and building `entry_bytes` for each series, for callers that only
+    /// read the decoded protobuf through the `pub(crate)` accessors.
+    skip_entry_bytes: bool,
+}
+
+/// Lifetime-free state of a [`ProtobufParser`], so a decode cursor can keep it across calls
+/// without borrowing the input.
+///
+/// It also owns the decoded `MetricFamily` and histogram scratch, which a new parser reuses.
+pub(crate) struct ProtobufParserState {
+    pos: usize,
+    family: dto::MetricFamily,
+    metric_index: usize,
+    next_metric_index: usize,
+    state: Option<Entry>,
+    field_pos: isize,
+    fields_done: bool,
+    exemplar_pos: usize,
+    exemplar_returned: bool,
+    series_name: String,
+    magic_label: Option<(&'static str, FloatBuf)>,
+    entry_bytes: Vec<u8>,
+    label_order: Vec<usize>,
+    int_histogram: Histogram<u64, i64>,
+    float_histogram: Histogram<f64, f64>,
+    is_float_histogram: bool,
+    nhcb_buckets: Vec<(f64, f64)>,
+    skip_entry_bytes: bool,
+}
+
+impl Default for ProtobufParserState {
+    fn default() -> Self {
+        ProtobufParser::new(b"").into_state()
+    }
+}
+
+impl ProtobufParserState {
+    /// Resets the parser to the start of a new input and keeps the scratch capacity.
+    pub(crate) fn reset(&mut self, skip_entry_bytes: bool) {
+        self.pos = 0;
+        self.family.clear();
+        self.metric_index = 0;
+        self.next_metric_index = 0;
+        self.state = None;
+        self.field_pos = -2;
+        self.fields_done = false;
+        self.exemplar_pos = 0;
+        self.exemplar_returned = false;
+        self.series_name.clear();
+        self.magic_label = None;
+        self.entry_bytes.clear();
+        self.label_order.clear();
+        self.is_float_histogram = false;
+        self.nhcb_buckets.clear();
+        self.skip_entry_bytes = skip_entry_bytes;
+    }
+
+    /// Heap capacity of the scratch buffers, without the nested buffers of decoded metrics.
+    pub(crate) fn retained_memory_bytes(&self) -> usize {
+        fn histogram_bytes<C, B>(h: &Histogram<C, B>) -> usize {
+            (h.positive_spans.capacity() + h.negative_spans.capacity()) * size_of::<Span>()
+                + (h.positive_buckets.capacity() + h.negative_buckets.capacity()) * size_of::<B>()
+                + h.custom_values.capacity() * size_of::<f64>()
+        }
+        self.family.metric.capacity() * size_of::<dto::Metric>()
+            + self.family.name.capacity()
+            + self.family.help.capacity()
+            + self.family.unit.capacity()
+            + self.series_name.capacity()
+            + self.entry_bytes.capacity()
+            + self.label_order.capacity() * size_of::<usize>()
+            + histogram_bytes(&self.int_histogram)
+            + histogram_bytes(&self.float_histogram)
+            + self.nhcb_buckets.capacity() * size_of::<(f64, f64)>()
+    }
 }
 
 impl<'a> ProtobufParser<'a> {
@@ -92,7 +167,86 @@ impl<'a> ProtobufParser<'a> {
             float_histogram: Histogram::default(),
             is_float_histogram: false,
             nhcb_buckets: Vec::new(),
+            skip_entry_bytes: false,
         }
+    }
+
+    /// Resumes a parser over `input` from `state`.
+    pub(crate) fn from_state(input: &'a [u8], state: ProtobufParserState) -> Self {
+        Self {
+            input,
+            pos: state.pos,
+            family: state.family,
+            metric_index: state.metric_index,
+            next_metric_index: state.next_metric_index,
+            state: state.state,
+            field_pos: state.field_pos,
+            fields_done: state.fields_done,
+            exemplar_pos: state.exemplar_pos,
+            exemplar_returned: state.exemplar_returned,
+            series_name: state.series_name,
+            magic_label: state.magic_label,
+            entry_bytes: state.entry_bytes,
+            label_order: state.label_order,
+            int_histogram: state.int_histogram,
+            float_histogram: state.float_histogram,
+            is_float_histogram: state.is_float_histogram,
+            nhcb_buckets: state.nhcb_buckets,
+            skip_entry_bytes: state.skip_entry_bytes,
+        }
+    }
+
+    /// Returns the lifetime-free state, see [`ProtobufParser::from_state`].
+    pub(crate) fn into_state(self) -> ProtobufParserState {
+        ProtobufParserState {
+            pos: self.pos,
+            family: self.family,
+            metric_index: self.metric_index,
+            next_metric_index: self.next_metric_index,
+            state: self.state,
+            field_pos: self.field_pos,
+            fields_done: self.fields_done,
+            exemplar_pos: self.exemplar_pos,
+            exemplar_returned: self.exemplar_returned,
+            series_name: self.series_name,
+            magic_label: self.magic_label,
+            entry_bytes: self.entry_bytes,
+            label_order: self.label_order,
+            int_histogram: self.int_histogram,
+            float_histogram: self.float_histogram,
+            is_float_histogram: self.is_float_histogram,
+            nhcb_buckets: self.nhcb_buckets,
+            skip_entry_bytes: self.skip_entry_bytes,
+        }
+    }
+
+    /// The decoded metric family of the current entry.
+    pub(crate) fn family(&self) -> &dto::MetricFamily {
+        &self.family
+    }
+
+    /// The metric of the current series or histogram entry.
+    pub(crate) fn current_metric(&self) -> &dto::Metric {
+        self.metric()
+    }
+
+    /// The entry the last `next_entry` call returned.
+    pub(crate) fn current_entry(&self) -> Option<Entry> {
+        self.state
+    }
+
+    /// Whether the current series is the `_count` series, the first series of a summary metric.
+    pub(crate) fn is_summary_start(&self) -> bool {
+        self.kind() == dto::MetricType::Summary && self.field_pos == -2
+    }
+
+    /// The next exemplar of the current histogram, without copying its labels. Same exemplars
+    /// as [`Parser::exemplar`].
+    pub(crate) fn next_histogram_exemplar(&mut self) -> Option<&dto::Exemplar> {
+        if self.state != Some(Entry::Histogram) {
+            return None;
+        }
+        self.histogram_exemplar()
     }
 
     fn next_metric_family(&mut self) -> Result<bool, ParseError> {
@@ -227,6 +381,18 @@ impl<'a> ProtobufParser<'a> {
         }
         self.update_magic_label();
 
+        if !self.skip_entry_bytes {
+            self.update_entry_bytes();
+        }
+
+        if self.state == Some(Entry::Histogram) {
+            self.load_histogram()?;
+        }
+        Ok(())
+    }
+
+    /// Sorts the labels of the current series and builds `entry_bytes` from them.
+    fn update_entry_bytes(&mut self) {
         let mut entry_bytes = std::mem::take(&mut self.entry_bytes);
         entry_bytes.clear();
         let mut order = std::mem::take(&mut self.label_order);
@@ -245,11 +411,6 @@ impl<'a> ProtobufParser<'a> {
         }
         self.entry_bytes = entry_bytes;
         self.label_order = order;
-
-        if self.state == Some(Entry::Histogram) {
-            self.load_histogram()?;
-        }
-        Ok(())
     }
 
     fn label_count(&self) -> usize {
@@ -577,7 +738,7 @@ fn is_native_histogram(histogram: &dto::Histogram) -> bool {
 }
 
 /// Same as Go: seconds and nanoseconds to ms, without validation.
-fn timestamp_millis(timestamp: &prost_types::Timestamp) -> i64 {
+pub(crate) fn timestamp_millis(timestamp: &prost_types::Timestamp) -> i64 {
     timestamp
         .seconds
         .wrapping_mul(1000)

@@ -22,12 +22,19 @@
 mod columns;
 mod family;
 mod intern;
+// Only protobuf input carries native histograms until OpenMetrics 2.0 is dispatched.
+#[cfg(feature = "dto")]
+mod native;
 mod options;
+#[cfg(feature = "dto")]
+mod proto;
 mod records;
 mod schema;
 mod staleness;
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, feature = "dto"))]
+mod tests_proto;
 
 use std::future::Future;
 use std::iter::FusedIterator;
@@ -40,6 +47,8 @@ use crate::parse::{
     OpenMetricsParserState, ParseError, Parser, PromParser, PromParserState, parse_go_float,
     unescape_bytes_into,
 };
+#[cfg(feature = "dto")]
+use crate::parse::{ProtobufParser, ProtobufParserState};
 
 use self::columns::{
     AttrEncoding, ExpHistogramDpTable, HistogramDpTable, MetricTable, NumberDpTable,
@@ -91,9 +100,14 @@ pub enum DecodeStep {
     Done,
 }
 
+// `ProtobufParserState` owns the decoded `MetricFamily` and histogram scratch. Boxing it would
+// allocate on every decode step, so the enum stays unboxed.
+#[allow(clippy::large_enum_variant)]
 enum ActiveParserState {
     Prom(PromParserState),
     OpenMetrics(OpenMetricsParserState),
+    #[cfg(feature = "dto")]
+    Protobuf(ProtobufParserState),
     Invalid,
 }
 
@@ -104,6 +118,10 @@ impl ActiveParserState {
             Self::Prom(state) => ActiveParser::Prom(PromParser::from_state(input, state)),
             Self::OpenMetrics(state) => {
                 ActiveParser::OpenMetrics(OpenMetricsParser::from_state(input, state))
+            }
+            #[cfg(feature = "dto")]
+            Self::Protobuf(state) => {
+                ActiveParser::Protobuf(ProtobufParser::from_state(input, state))
             }
             Self::Invalid => ActiveParser::Invalid,
         }
@@ -123,6 +141,8 @@ impl ActiveParserState {
                     decoder.om_scratch = scratch;
                 }
             }
+            #[cfg(feature = "dto")]
+            Self::Protobuf(state) => decoder.proto.state = state,
             Self::Invalid => {}
         }
     }
@@ -177,9 +197,14 @@ impl DecodeCursor {
     }
 }
 
+// See `ActiveParserState` for why the protobuf parser is not boxed.
+#[allow(clippy::large_enum_variant)]
 enum ActiveParser<'input> {
     Prom(PromParser<'input>),
     OpenMetrics(OpenMetricsParser<'input>),
+    /// Driven by `ArrowDecoder::ingest_proto_entries`, never by the text accessors below.
+    #[cfg(feature = "dto")]
+    Protobuf(ProtobufParser<'input>),
     Invalid,
 }
 
@@ -194,6 +219,8 @@ impl<'input> ActiveParser<'input> {
         match self {
             Self::Prom(p) => p.pos(),
             Self::OpenMetrics(p) => p.pos(),
+            #[cfg(feature = "dto")]
+            Self::Protobuf(p) => p.pos(),
             Self::Invalid => 0,
         }
     }
@@ -203,6 +230,8 @@ impl<'input> ActiveParser<'input> {
         match self {
             Self::Prom(p) => ActiveParserState::Prom(p.into_state()),
             Self::OpenMetrics(p) => ActiveParserState::OpenMetrics(p.into_state()),
+            #[cfg(feature = "dto")]
+            Self::Protobuf(p) => ActiveParserState::Protobuf(p.into_state()),
             Self::Invalid => ActiveParserState::Invalid,
         }
     }
@@ -212,7 +241,7 @@ impl<'input> ActiveParser<'input> {
         match self {
             Self::Prom(p) => p.next_entry(),
             Self::OpenMetrics(p) => p.next_entry(),
-            Self::Invalid => Ok(None),
+            _ => Ok(None),
         }
     }
 
@@ -221,7 +250,7 @@ impl<'input> ActiveParser<'input> {
         match self {
             Self::Prom(p) => p.name_offset(),
             Self::OpenMetrics(p) => p.name_offset(),
-            Self::Invalid => 0,
+            _ => 0,
         }
     }
 
@@ -230,7 +259,7 @@ impl<'input> ActiveParser<'input> {
         match self {
             Self::Prom(p) => p.raw_help(),
             Self::OpenMetrics(p) => p.raw_help(),
-            Self::Invalid => (b"", b""),
+            _ => (b"", b""),
         }
     }
 
@@ -239,7 +268,7 @@ impl<'input> ActiveParser<'input> {
         match self {
             Self::Prom(p) => p.metric_type(),
             Self::OpenMetrics(p) => p.metric_type(),
-            Self::Invalid => (b"", MetricType::Unknown),
+            _ => (b"", MetricType::Unknown),
         }
     }
 
@@ -248,7 +277,7 @@ impl<'input> ActiveParser<'input> {
         match self {
             Self::Prom(p) => p.unit(),
             Self::OpenMetrics(p) => p.unit(),
-            Self::Invalid => (b"", b""),
+            _ => (b"", b""),
         }
     }
 
@@ -257,23 +286,23 @@ impl<'input> ActiveParser<'input> {
         match self {
             Self::Prom(p) => p.raw_series_parts(),
             Self::OpenMetrics(p) => p.raw_series_parts(),
-            Self::Invalid => (b"", &[], b"", None, 0.0),
+            _ => (b"", &[], b"", None, 0.0),
         }
     }
 
     #[inline]
     fn raw_exemplar_parts(&self) -> Option<(f64, Option<i64>, &[LabelSpan])> {
         match self {
-            Self::Prom(_) | Self::Invalid => None,
             Self::OpenMetrics(p) => p.raw_exemplar_parts(),
+            _ => None,
         }
     }
 
     #[inline]
     fn start_timestamp(&mut self) -> Option<i64> {
         match self {
-            Self::Prom(_) | Self::Invalid => None,
             Self::OpenMetrics(p) => p.start_timestamp(),
+            _ => None,
         }
     }
 
@@ -291,6 +320,11 @@ impl<'input> ActiveParser<'input> {
                     decoder.om_scratch = scratch;
                 }
             }
+            #[cfg(feature = "dto")]
+            Self::Protobuf(p) => {
+                let parser = std::mem::replace(p, ProtobufParser::new(b""));
+                decoder.proto.state = parser.into_state();
+            }
             Self::Invalid => {}
         }
     }
@@ -306,6 +340,8 @@ pub struct ArrowDecoder {
     scrape_id: u64,
     prom_spans: Vec<LabelSpan>,
     om_scratch: OmScratch,
+    #[cfg(feature = "dto")]
+    proto: proto::ProtoScratch,
     unescape_buf: Vec<u8>,
     series_name_buf: Vec<u8>,
     current_family: CurrentFamily,
@@ -351,6 +387,8 @@ impl ArrowDecoder {
             scrape_id: 0,
             prom_spans: Vec::with_capacity(16),
             om_scratch: OmScratch::default(),
+            #[cfg(feature = "dto")]
+            proto: proto::ProtoScratch::default(),
             unescape_buf: Vec::new(),
             series_name_buf: Vec::with_capacity(64),
             current_family: CurrentFamily::with_capacity(64, 128),
@@ -387,6 +425,18 @@ impl ArrowDecoder {
             + self.exp_hist_dp.retained_memory_bytes()
             + self.temp_attrs.capacity() * size_of::<(u32, u32)>()
             + self.scratch.retained_memory_bytes()
+            + self.proto_retained_memory_bytes()
+    }
+
+    #[cfg(feature = "dto")]
+    fn proto_retained_memory_bytes(&self) -> usize {
+        self.proto.retained_memory_bytes()
+    }
+
+    #[cfg(not(feature = "dto"))]
+    #[allow(clippy::unused_self)]
+    fn proto_retained_memory_bytes(&self) -> usize {
+        0
     }
 
     /// Decodes a single exposition scrape buffer of `format` into OTAP metric
@@ -394,13 +444,19 @@ impl ArrowDecoder {
     ///
     /// # Contiguous families and batching
     ///
-    /// Input parsing streams `Entry` items one by one from `PromParser` or
-    /// `OpenMetricsParser` directly into reusable columnar staging vectors and label string
-    /// interners without materializing intermediate per-sample structs or per-string allocations.
+    /// Input parsing streams `Entry` items one by one from `PromParser`, `OpenMetricsParser`, or,
+    /// with the `dto` feature, `ProtobufParser` for [`Format::PROTO_DELIM`], directly into
+    /// reusable columnar staging vectors and label string interners without materializing
+    /// intermediate per-sample structs or per-string allocations.
     /// Metric families are decoded as contiguous runs, with `# HELP`, `# TYPE`, and `# UNIT`
     /// lines appearing before that family's samples. Non-contiguous repetitions of an earlier
     /// metric name are not reassembled or rejected; each run starts with fresh `untyped` metadata
     /// unless preceded by its own metadata lines.
+    ///
+    /// Each protobuf `MetricFamily` message becomes its own family. Classic protobuf histograms
+    /// are converted to native histograms with custom buckets, like Go, and decoded as
+    /// explicit-bucket `HistogramDataPoints`; a native histogram that Go's `Validate` would
+    /// reject fails the scrape with [`DecodeError::InvalidHistogram`].
     ///
     /// Single-batch `decode` returns [`DecodeError::CapacityOverflow`] if a scrape contains more
     /// than 65,536 distinct metric families (OTAP's `u16` `UnivariateMetrics.id` limit). Use
@@ -424,7 +480,7 @@ impl ArrowDecoder {
         let mut pending_series = false;
         let mut done = false;
         let mut tracker = None;
-        let res = self.ingest_entries::<false, false, false>(
+        let res = self.ingest::<false, false, false>(
             &mut parser,
             opts,
             default_ts_ns,
@@ -642,7 +698,7 @@ impl ArrowDecoder {
         let state = std::mem::replace(&mut cursor.parser_state, ActiveParserState::Invalid);
         let mut parser = state.into_parser(input);
         let res = if cursor.chunked {
-            self.ingest_entries::<true, BUDGETED, TRACKED>(
+            self.ingest::<true, BUDGETED, TRACKED>(
                 &mut parser,
                 &cursor.opts,
                 cursor.default_ts_ns,
@@ -653,7 +709,7 @@ impl ArrowDecoder {
                 tracker,
             )
         } else {
-            self.ingest_entries::<false, BUDGETED, TRACKED>(
+            self.ingest::<false, BUDGETED, TRACKED>(
                 &mut parser,
                 &cursor.opts,
                 cursor.default_ts_ns,
@@ -746,7 +802,7 @@ impl ArrowDecoder {
         let mut pending_series = false;
         let mut done = false;
         let mut tracker_opt = Some(tracker);
-        let res = self.ingest_entries::<false, false, true>(
+        let res = self.ingest::<false, false, true>(
             &mut parser,
             opts,
             default_ts_ns,
@@ -995,8 +1051,14 @@ impl ArrowDecoder {
                 let scratch = std::mem::take(&mut self.om_scratch);
                 ActiveParser::OpenMetrics(OpenMetricsParser::with_scratch(input, scratch))
             }
+            #[cfg(feature = "dto")]
+            FormatType::ProtoDelim => {
+                let mut state = std::mem::take(&mut self.proto.state);
+                state.reset(true);
+                ActiveParser::Protobuf(ProtobufParser::from_state(input, state))
+            }
             _ => {
-                // TODO(bwplotka): Dispatch Proto* in Phase 3.
+                // TODO(bwplotka): Dispatch ProtoText and ProtoCompact, and OpenMetrics 2.0.
                 return Err(DecodeError::UnsupportedFormat(format.as_str().to_owned()));
             }
         };
@@ -1101,6 +1163,50 @@ impl ArrowDecoder {
         self.current_family
             .start_new(raw_name, &self.series_name_buf);
         Ok(())
+    }
+
+    /// Runs the entry loop of the active parser: protobuf has its own loop, so the text loop
+    /// below stays specialized for byte spans into the input.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn ingest<const CHUNKED: bool, const BUDGETED: bool, const TRACKED: bool>(
+        &mut self,
+        parser: &mut ActiveParser<'_>,
+        opts: &DecodeOptions,
+        default_ts_ns: Option<i64>,
+        max_data_points: usize,
+        budget: Option<DecodeBudget>,
+        pending_series: &mut bool,
+        done: &mut bool,
+        tracker: &mut Option<&mut StalenessTracker>,
+    ) -> Result<DecodeStep, DecodeError> {
+        #[cfg(feature = "dto")]
+        if let ActiveParser::Protobuf(parser) = parser {
+            if TRACKED {
+                return Err(DecodeError::UnsupportedFormat(
+                    "staleness tracking is not supported for protobuf input yet".to_owned(),
+                ));
+            }
+            return self.ingest_proto_entries::<CHUNKED, BUDGETED>(
+                parser,
+                opts,
+                default_ts_ns,
+                max_data_points,
+                budget,
+                pending_series,
+                done,
+            );
+        }
+        self.ingest_entries::<CHUNKED, BUDGETED, TRACKED>(
+            parser,
+            opts,
+            default_ts_ns,
+            max_data_points,
+            budget,
+            pending_series,
+            done,
+            tracker,
+        )
     }
 
     // Monomorphizing on `CHUNKED`, `BUDGETED`, and `TRACKED` shares one entry dispatch loop across
@@ -1870,42 +1976,72 @@ impl ArrowDecoder {
         val_table: &'static str,
     ) -> Result<(u32, u32), DecodeError> {
         let key = unescape_bytes_into(raw_key, true, &mut self.unescape_buf);
+        let key_id = Self::intern_key(
+            &mut self.key_interner,
+            &self.current_family,
+            key,
+            reject_metric_name,
+            prev_key_id,
+            sorted_by_key_id,
+            key_table,
+        )?;
+        let val = unescape_bytes_into(raw_val, true, &mut self.unescape_buf);
+        let val_id = Self::intern_val(&mut self.val_interner, val, val_table)?;
+        Ok((key_id, val_id))
+    }
+
+    /// Interns an unescaped label name, rejects `__name__` when `reject_metric_name` is set,
+    /// and tracks whether the names arrive sorted by key ID, with adjacent duplicates rejected.
+    #[inline]
+    fn intern_key(
+        key_interner: &mut StringInterner,
+        current_family: &CurrentFamily,
+        key: &[u8],
+        reject_metric_name: bool,
+        prev_key_id: &mut Option<u32>,
+        sorted_by_key_id: &mut bool,
+        key_table: &'static str,
+    ) -> Result<u32, DecodeError> {
         if reject_metric_name && key == METRIC_NAME_LABEL.as_bytes() {
             return Err(DecodeError::DuplicateLabel {
-                metric: self.current_family.name_string(),
+                metric: current_family.name_string(),
                 label: METRIC_NAME_LABEL.to_owned(),
             });
         }
-        let key_id =
-            self.key_interner
-                .intern(key)
-                .ok_or_else(|| DecodeError::CapacityOverflow {
-                    table: key_table,
-                    count: self.key_interner.len(),
-                })?;
+        let key_id = key_interner
+            .intern(key)
+            .ok_or_else(|| DecodeError::CapacityOverflow {
+                table: key_table,
+                count: key_interner.len(),
+            })?;
 
         if let Some(prev) = *prev_key_id
             && key_id <= prev
         {
             if key_id == prev {
                 return Err(DecodeError::DuplicateLabel {
-                    metric: self.current_family.name_string(),
-                    label: self.key_interner.get(key_id).to_owned(),
+                    metric: current_family.name_string(),
+                    label: key_interner.get(key_id).to_owned(),
                 });
             }
             *sorted_by_key_id = false;
         }
         *prev_key_id = Some(key_id);
+        Ok(key_id)
+    }
 
-        let val = unescape_bytes_into(raw_val, true, &mut self.unescape_buf);
-        let val_id =
-            self.val_interner
-                .intern(val)
-                .ok_or_else(|| DecodeError::CapacityOverflow {
-                    table: val_table,
-                    count: self.val_interner.len(),
-                })?;
-        Ok((key_id, val_id))
+    #[inline]
+    fn intern_val(
+        val_interner: &mut StringInterner,
+        val: &[u8],
+        val_table: &'static str,
+    ) -> Result<u32, DecodeError> {
+        val_interner
+            .intern(val)
+            .ok_or_else(|| DecodeError::CapacityOverflow {
+                table: val_table,
+                count: val_interner.len(),
+            })
     }
 
     #[cold]
