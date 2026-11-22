@@ -50,6 +50,7 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
         .unwrap()
         .into();
     let om_bench: Rc<[u8]> = fs::read(root.join("alltypes.bench.om.txt")).unwrap().into();
+    let proto: Rc<[u8]> = fs::read(root.join("../expfmt/protobuf")).unwrap().into();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -410,5 +411,60 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
         churn_handle
             .await
             .expect("alternating staleness churn task succeeds");
+
+        // Verify delimited protobuf scrapes, whose parser state owns the decoded `MetricFamily`
+        // and histogram scratch, keep retained scratch memory and live heap constant after
+        // warmup, both in one batch and in budgeted chunks across `.await` points.
+        let proto_decoder = Rc::new(RefCell::new(ArrowDecoder::new()));
+        let proto_opts = opts.with_max_data_points_per_batch(16);
+        let proto_handle = tokio::task::spawn_local(async move {
+            let mut warmup_proto_dec_mem = 0usize;
+            let mut warmup_proto_live_heap = 0usize;
+
+            for i in 0..32 {
+                let records = proto_decoder
+                    .borrow_mut()
+                    .decode(&proto, &Format::PROTO_DELIM, &opts)
+                    .expect("protobuf scrape succeeds");
+                let otap = to_otap_arrow_records(&records);
+                drop(otap);
+                drop(records);
+
+                let mut cursor = proto_decoder
+                    .borrow_mut()
+                    .start_decode_stream(&Format::PROTO_DELIM, &proto_opts)
+                    .expect("protobuf cursor starts");
+                loop {
+                    let step = proto_decoder
+                        .borrow_mut()
+                        .step_decode(&mut cursor, &proto, coop_budget)
+                        .expect("protobuf step succeeds");
+                    match step {
+                        DecodeStep::Pending => tokio::task::yield_now().await,
+                        DecodeStep::Batch(chunk) => drop(to_otap_arrow_records(&chunk)),
+                        DecodeStep::Done => break,
+                    }
+                }
+
+                let dec_mem = proto_decoder.borrow().retained_memory_bytes();
+                let live_heap = dhat::HeapStats::get().curr_bytes;
+                if i == 1 {
+                    warmup_proto_dec_mem = dec_mem;
+                    warmup_proto_live_heap = live_heap;
+                } else if i > 1 {
+                    assert_eq!(
+                        dec_mem, warmup_proto_dec_mem,
+                        "protobuf decoder scratch memory grew at iteration {i}"
+                    );
+                    assert_eq!(
+                        live_heap, warmup_proto_live_heap,
+                        "live heap bytes leaked after protobuf scrape at iteration {i}"
+                    );
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        proto_handle.await.expect("protobuf local task succeeds");
     });
 }
