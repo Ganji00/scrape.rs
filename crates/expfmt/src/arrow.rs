@@ -39,7 +39,7 @@ mod tests_proto;
 use std::future::Future;
 use std::iter::FusedIterator;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::format::{Format, FormatType};
 use crate::parse::{
@@ -908,6 +908,7 @@ impl ArrowDecoder {
             &mut self.num_dp,
             &mut self.sum_dp,
             &mut self.hist_dp,
+            &mut self.exp_hist_dp,
             &mut self.key_interner,
             &mut self.val_interner,
             opts,
@@ -1111,6 +1112,62 @@ impl ArrowDecoder {
         self.total_data_points() + self.assembly.groups.len()
     }
 
+    /// Ends the input of the text or protobuf entry loop: drains the series that disappeared
+    /// from `tracker` as stale points, bounded by `step_budget`
+    /// (`(remaining_entries, started, max_duration)`) and, when chunked, by `max_data_points`,
+    /// then returns the last batch and commits the scrape.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_input<const CHUNKED: bool, const TRACKED: bool>(
+        &mut self,
+        tracker: &mut Option<&mut StalenessTracker>,
+        opts: &DecodeOptions,
+        default_ts_ns: Option<i64>,
+        max_data_points: usize,
+        step_budget: Option<(usize, Instant, Duration)>,
+        done: &mut bool,
+    ) -> Result<DecodeStep, DecodeError> {
+        let drain_step = if TRACKED && let Some(tr) = tracker.as_deref_mut() {
+            tr.finish_scrape_step(
+                &mut self.metrics,
+                &mut self.num_dp,
+                &mut self.sum_dp,
+                &mut self.hist_dp,
+                &mut self.exp_hist_dp,
+                &mut self.key_interner,
+                &mut self.val_interner,
+                opts,
+                default_ts_ns,
+                CHUNKED.then_some(max_data_points),
+                MAX_METRICS_PER_BATCH,
+                step_budget,
+            )?
+        } else {
+            StaleDrainStep::Complete
+        };
+        if TRACKED && drain_step == StaleDrainStep::YieldPending {
+            return Ok(DecodeStep::Pending);
+        }
+        let has_more_stale = TRACKED && drain_step == StaleDrainStep::ChunkFull;
+        if self.metrics.is_empty() {
+            *done = true;
+            if TRACKED && let Some(tr) = tracker.as_deref_mut() {
+                tr.commit_scrape();
+            }
+            return Ok(DecodeStep::Done);
+        }
+        let batch = self.finish_batches(default_ts_ns.is_some())?;
+        if !has_more_stale {
+            *done = true;
+            if TRACKED && let Some(tr) = tracker.as_deref_mut() {
+                tr.commit_scrape();
+            }
+        }
+        if CHUNKED {
+            self.reset_batch_for_mode::<TRACKED>(tracker);
+        }
+        Ok(DecodeStep::Batch(batch))
+    }
+
     #[inline]
     fn flush_pending_family<const TRACKED: bool>(
         &mut self,
@@ -1186,12 +1243,7 @@ impl ArrowDecoder {
     ) -> Result<DecodeStep, DecodeError> {
         #[cfg(feature = "dto")]
         if let ActiveParser::Protobuf(parser) = parser {
-            if TRACKED {
-                return Err(DecodeError::UnsupportedFormat(
-                    "staleness tracking is not supported for protobuf input yet".to_owned(),
-                ));
-            }
-            return self.ingest_proto_entries::<CHUNKED, BUDGETED>(
+            return self.ingest_proto_entries::<CHUNKED, BUDGETED, TRACKED>(
                 parser,
                 opts,
                 default_ts_ns,
@@ -1199,6 +1251,7 @@ impl ArrowDecoder {
                 budget,
                 pending_series,
                 done,
+                tracker,
             );
         }
         self.ingest_entries::<CHUNKED, BUDGETED, TRACKED>(
@@ -1252,54 +1305,18 @@ impl ArrowDecoder {
                     Some(entry) => entry,
                     None => {
                         self.flush_pending_family::<TRACKED>(tracker, opts, default_ts_ns)?;
-                        let drain_step = if TRACKED {
-                            let step_budget = budget.filter(|_| BUDGETED).and_then(|b| {
-                                started.map(|st| {
-                                    (max_entries.saturating_sub(entries), st, b.max_duration)
-                                })
-                            });
-                            if let Some(tr) = tracker.as_deref_mut() {
-                                tr.finish_scrape_step(
-                                    &mut self.metrics,
-                                    &mut self.num_dp,
-                                    &mut self.sum_dp,
-                                    &mut self.hist_dp,
-                                    &mut self.key_interner,
-                                    &mut self.val_interner,
-                                    opts,
-                                    default_ts_ns,
-                                    CHUNKED.then_some(max_data_points),
-                                    MAX_METRICS_PER_BATCH,
-                                    step_budget,
-                                )?
-                            } else {
-                                StaleDrainStep::Complete
-                            }
-                        } else {
-                            StaleDrainStep::Complete
-                        };
-                        if TRACKED && drain_step == StaleDrainStep::YieldPending {
-                            return Ok(DecodeStep::Pending);
-                        }
-                        let has_more_stale = TRACKED && drain_step == StaleDrainStep::ChunkFull;
-                        if self.metrics.is_empty() {
-                            *done = true;
-                            if TRACKED && let Some(tr) = tracker.as_deref_mut() {
-                                tr.commit_scrape();
-                            }
-                            return Ok(DecodeStep::Done);
-                        }
-                        let batch = self.finish_batches(default_ts_ns.is_some())?;
-                        if !has_more_stale {
-                            *done = true;
-                            if TRACKED && let Some(tr) = tracker.as_deref_mut() {
-                                tr.commit_scrape();
-                            }
-                        }
-                        if CHUNKED {
-                            self.reset_batch_for_mode::<TRACKED>(tracker);
-                        }
-                        return Ok(DecodeStep::Batch(batch));
+                        let step_budget = budget.filter(|_| BUDGETED).and_then(|b| {
+                            started
+                                .map(|st| (max_entries.saturating_sub(entries), st, b.max_duration))
+                        });
+                        return self.finish_input::<CHUNKED, TRACKED>(
+                            tracker,
+                            opts,
+                            default_ts_ns,
+                            max_data_points,
+                            step_budget,
+                            done,
+                        );
                     }
                 }
             };

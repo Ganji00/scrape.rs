@@ -35,7 +35,7 @@ use super::native::{
     CUSTOM_BUCKETS_SCHEMA, EXPONENTIAL_SCHEMAS, NativeView, check_float_exponential,
     invalid_histogram, push_custom_buckets, push_exponential,
 };
-use super::staleness::{DATA_POINT_FLAG_NO_RECORDED_VALUE, is_stale_nan};
+use super::staleness::{DATA_POINT_FLAG_NO_RECORDED_VALUE, DpKind, StalenessTracker, is_stale_nan};
 use super::{
     ArrowDecoder, DECODE_BUDGET_DURATION_CHECK_INTERVAL, DecodeBudget, DecodeError, DecodeOptions,
     DecodeStep, MAX_METRICS_PER_BATCH, UntypedPolicy,
@@ -87,13 +87,22 @@ fn sample_timestamp_ns(
     }
 }
 
+/// The kind of the data point an append added and whether it is a stale marker, for the
+/// staleness tracker. `None` when the point was dropped.
+type AppendedPoint = Option<(DpKind, bool)>;
+
 impl ArrowDecoder {
-    /// The protobuf counterpart of `ingest_entries`, with the same chunking and budget rules.
+    /// The protobuf counterpart of `ingest_entries`, with the same chunking, budget, and
+    /// staleness rules.
     ///
     /// Kept out of line so it does not change how the text loop in `ingest` is inlined.
     #[allow(clippy::too_many_arguments)]
     #[inline(never)]
-    pub(super) fn ingest_proto_entries<const CHUNKED: bool, const BUDGETED: bool>(
+    pub(super) fn ingest_proto_entries<
+        const CHUNKED: bool,
+        const BUDGETED: bool,
+        const TRACKED: bool,
+    >(
         &mut self,
         parser: &mut ProtobufParser<'_>,
         opts: &DecodeOptions,
@@ -102,6 +111,7 @@ impl ArrowDecoder {
         budget: Option<DecodeBudget>,
         pending_series: &mut bool,
         done: &mut bool,
+        tracker: &mut Option<&mut StalenessTracker>,
     ) -> Result<DecodeStep, DecodeError> {
         let start_pos = if BUDGETED { parser.pos() } else { 0 };
         let budget = budget.filter(|_| BUDGETED);
@@ -119,15 +129,18 @@ impl ArrowDecoder {
                 match parser.next_entry().map_err(DecodeError::from_parse)? {
                     Some(entry) => entry,
                     None => {
-                        *done = true;
-                        if self.metrics.is_empty() {
-                            return Ok(DecodeStep::Done);
-                        }
-                        let batch = self.finish_batches(default_ts_ns.is_some())?;
-                        if CHUNKED {
-                            self.reset_batch();
-                        }
-                        return Ok(DecodeStep::Batch(batch));
+                        let step_budget = budget.and_then(|b| {
+                            started
+                                .map(|st| (max_entries.saturating_sub(entries), st, b.max_duration))
+                        });
+                        return self.finish_input::<CHUNKED, TRACKED>(
+                            tracker,
+                            opts,
+                            default_ts_ns,
+                            max_data_points,
+                            step_budget,
+                            done,
+                        );
                     }
                 }
             };
@@ -151,19 +164,40 @@ impl ArrowDecoder {
                         if CHUNKED && row.is_none() && self.metrics.len() >= MAX_METRICS_PER_BATCH {
                             *pending_series = true;
                             let batch = self.finish_batches(default_ts_ns.is_some())?;
-                            self.reset_batch();
+                            self.reset_batch_for_mode::<TRACKED>(tracker);
                             return Ok(DecodeStep::Batch(batch));
                         }
-                        if entry == Entry::Histogram {
-                            self.append_proto_histogram(parser, opts, default_ts_ns)?;
+                        let point = if entry == Entry::Histogram {
+                            self.append_proto_histogram(parser, opts, default_ts_ns)?
                         } else if self.current_family.metric_type == MetricType::Summary {
-                            self.append_proto_summary(parser, opts, default_ts_ns)?;
+                            self.append_proto_summary(parser, opts, default_ts_ns)?
                         } else {
-                            self.append_proto_scalar(parser, opts, default_ts_ns)?;
+                            self.append_proto_scalar(parser, opts, default_ts_ns)?
+                        };
+                        if TRACKED
+                            && let Some(tr) = tracker.as_deref_mut()
+                            && let Some((kind, is_stale)) = point
+                        {
+                            // Same rule as the text loop: a point with its own timestamp is
+                            // tracked only with `track_timestamps_staleness`.
+                            if parser.current_metric().timestamp_ms == 0
+                                || opts.track_timestamps_staleness
+                            {
+                                tr.record_series(
+                                    &mut self.current_family,
+                                    kind,
+                                    &self.temp_attrs,
+                                    &self.key_interner,
+                                    &self.val_interner,
+                                    is_stale,
+                                )?;
+                            } else {
+                                tr.sync_existing_family(&mut self.current_family)?;
+                            }
                         }
                         if CHUNKED && self.total_data_points() >= max_data_points {
                             let batch = self.finish_batches(default_ts_ns.is_some())?;
-                            self.reset_batch();
+                            self.reset_batch_for_mode::<TRACKED>(tracker);
                             return Ok(DecodeStep::Batch(batch));
                         }
                     }
@@ -206,7 +240,7 @@ impl ArrowDecoder {
         parser: &mut ProtobufParser<'_>,
         opts: &DecodeOptions,
         default_ts_ns: Option<i64>,
-    ) -> Result<(), DecodeError> {
+    ) -> Result<AppendedPoint, DecodeError> {
         let metric_type = self.current_family.metric_type;
         let start_ts_ns = if metric_type == MetricType::Counter {
             start_timestamp_ns(parser)
@@ -222,7 +256,7 @@ impl ArrowDecoder {
                 check_label_name(index, &metric.label, true, &self.current_family)?;
             }
             self.current_family.has_samples = true;
-            return Ok(());
+            return Ok(None);
         }
 
         let dp_index = self.num_dp.base.len();
@@ -233,11 +267,12 @@ impl ArrowDecoder {
         self.proto_labels_into_temp(&metric.label)?;
         self.num_dp.attrs.extend_for_parent(dp_id, &self.temp_attrs);
 
+        let is_stale = is_stale_nan(value);
         if let Some(exemplar) = metric
             .counter
             .as_ref()
             .and_then(|counter| counter.exemplar.as_ref())
-            .filter(|_| metric_type == MetricType::Counter)
+            .filter(|_| metric_type == MetricType::Counter && !is_stale)
         {
             push_proto_exemplar(
                 &mut self.num_dp.exemplars,
@@ -255,9 +290,19 @@ impl ArrowDecoder {
             .current_family
             .emit_into_batch(&mut self.metrics, opts)?;
         let ts_ns = sample_timestamp_ns(metric, default_ts_ns)?;
-        self.num_dp.base.push(parent_id, start_ts_ns, ts_ns);
-        self.num_dp.values.push_value(value);
-        Ok(())
+        if is_stale {
+            self.num_dp.base.push_with_flags(
+                parent_id,
+                start_ts_ns,
+                ts_ns,
+                DATA_POINT_FLAG_NO_RECORDED_VALUE,
+            );
+            self.num_dp.values.push_null(dp_index);
+        } else {
+            self.num_dp.base.push(parent_id, start_ts_ns, ts_ns);
+            self.num_dp.values.push_value(value);
+        }
+        Ok(Some((DpKind::Number, is_stale)))
     }
 
     fn append_proto_summary(
@@ -265,7 +310,7 @@ impl ArrowDecoder {
         parser: &mut ProtobufParser<'_>,
         opts: &DecodeOptions,
         default_ts_ns: Option<i64>,
-    ) -> Result<(), DecodeError> {
+    ) -> Result<AppendedPoint, DecodeError> {
         let start_ts_ns = start_timestamp_ns(parser);
         let metric = parser.current_metric();
 
@@ -286,20 +331,37 @@ impl ArrowDecoder {
         if sum_dp.quantile_offsets.is_empty() {
             sum_dp.quantile_offsets.push(0);
         }
-        sum_dp.base.push(parent_id, start_ts_ns, ts_ns);
+        // Like the text loop, a stale marker in the sum or any quantile makes the point stale,
+        // with zero count and sum and no quantiles.
+        let is_stale = summary.is_some_and(|s| {
+            is_stale_nan(s.sample_sum) || s.quantile.iter().any(|q| is_stale_nan(q.value))
+        });
+        if is_stale {
+            sum_dp.base.push_with_flags(
+                parent_id,
+                start_ts_ns,
+                ts_ns,
+                DATA_POINT_FLAG_NO_RECORDED_VALUE,
+            );
+        } else {
+            sum_dp.base.push(parent_id, start_ts_ns, ts_ns);
+        }
         // Go reads a missing summary as zero count and sum.
-        sum_dp
-            .counts
-            .push(dp_index, Some(summary.map_or(0, |s| s.sample_count)));
-        sum_dp
-            .sums
-            .push(dp_index, Some(summary.map_or(0.0, |s| s.sample_sum)));
+        sum_dp.counts.push(
+            dp_index,
+            Some(summary.filter(|_| !is_stale).map_or(0, |s| s.sample_count)),
+        );
+        sum_dp.sums.push(
+            dp_index,
+            Some(summary.filter(|_| !is_stale).map_or(0.0, |s| s.sample_sum)),
+        );
 
         // Same as the text loop: finite quantiles only, sorted by quantile.
         let quantiles = &mut self.proto.quantiles;
         quantiles.clear();
         quantiles.extend(
             summary
+                .filter(|_| !is_stale)
                 .map_or(&[][..], |s| &s.quantile)
                 .iter()
                 .filter(|q| q.quantile.is_finite())
@@ -319,7 +381,7 @@ impl ArrowDecoder {
             }
         })?;
         sum_dp.quantile_offsets.push(q_off);
-        Ok(())
+        Ok(Some((DpKind::Summary, is_stale)))
     }
 
     /// Appends a native histogram: custom buckets (NHCB, which classic protobuf histograms are
@@ -330,7 +392,7 @@ impl ArrowDecoder {
         parser: &mut ProtobufParser<'_>,
         opts: &DecodeOptions,
         default_ts_ns: Option<i64>,
-    ) -> Result<(), DecodeError> {
+    ) -> Result<AppendedPoint, DecodeError> {
         let start_ts_ns = start_timestamp_ns(parser);
         let (_, _, histogram) = parser.histogram();
         let metric = parser.current_metric();
@@ -343,7 +405,7 @@ impl ArrowDecoder {
                     check_float_exponential(&view)
                         .map_err(|r| invalid_histogram(&self.current_family, r))?;
                     self.current_family.has_samples = true;
-                    return Ok(());
+                    return Ok(None);
                 }
                 true
             }
@@ -399,13 +461,19 @@ impl ArrowDecoder {
             )
         };
         attrs.extend_for_parent(dp_id, &self.temp_attrs);
-        let flags = if exponential && is_stale_nan(view.sum) {
-            DATA_POINT_FLAG_NO_RECORDED_VALUE
+        // Prometheus writes the stale NaN into the sum of a stale native histogram.
+        let is_stale = is_stale_nan(view.sum);
+        if is_stale {
+            base.push_with_flags(
+                parent_id,
+                start_ts_ns,
+                ts_ns,
+                DATA_POINT_FLAG_NO_RECORDED_VALUE,
+            );
         } else {
-            0
-        };
-        base.push_with_flags(parent_id, start_ts_ns, ts_ns, flags);
-        while let Some(exemplar) = parser.next_histogram_exemplar() {
+            base.push(parent_id, start_ts_ns, ts_ns);
+        }
+        while let Some(exemplar) = parser.next_histogram_exemplar().filter(|_| !is_stale) {
             push_proto_exemplar(
                 exemplars,
                 exemplar_table,
@@ -417,7 +485,12 @@ impl ArrowDecoder {
                 default_ts_ns,
             )?;
         }
-        Ok(())
+        let kind = if exponential {
+            DpKind::ExpHistogram
+        } else {
+            DpKind::Histogram
+        };
+        Ok(Some((kind, is_stale)))
     }
 
     /// Interns the labels of a protobuf metric into `temp_attrs`, sorted by key ID, with the

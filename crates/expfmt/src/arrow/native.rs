@@ -247,7 +247,8 @@ pub(super) fn invalid_histogram(family: &CurrentFamily, reason: String) -> Decod
 
 /// Appends a native histogram with custom buckets (NHCB) to `dp` as an explicit-bucket
 /// histogram data point: the custom values become the explicit bounds, followed by one dense
-/// count per bucket including `+Inf`.
+/// count per bucket including `+Inf`. A stale NaN sum leaves the count zero, the sum null, and
+/// the buckets and bounds empty, like a stale classic histogram from the text loop.
 ///
 /// `dp_index` is the row of the data point, whose base columns the caller appends.
 pub(super) fn push_custom_buckets(
@@ -276,7 +277,12 @@ pub(super) fn push_custom_buckets(
     .and_then(|total| histogram.check_count(total))
     .map_err(|reason| invalid_histogram(family, reason))?;
 
-    dp.bounds_vals.extend_from_slice(bounds);
+    let stale = is_stale_nan(histogram.sum);
+    if stale {
+        dp.bucket_counts.truncate(start);
+    } else {
+        dp.bounds_vals.extend_from_slice(bounds);
+    }
     let bucket_off =
         i32::try_from(dp.bucket_counts.len()).map_err(|_| DecodeError::CapacityOverflow {
             table: "HistogramDataPoints.histogram_bucket_counts",
@@ -289,8 +295,13 @@ pub(super) fn push_custom_buckets(
         })?;
     dp.bucket_offsets.push(bucket_off);
     dp.bounds_offsets.push(bounds_off);
-    dp.counts.push(dp_index, Some(histogram.count));
-    dp.sums.push(dp_index, Some(histogram.sum));
+    if stale {
+        dp.counts.push(dp_index, Some(0));
+        dp.sums.push(dp_index, None);
+    } else {
+        dp.counts.push(dp_index, Some(histogram.count));
+        dp.sums.push(dp_index, Some(histogram.sum));
+    }
     Ok(())
 }
 
@@ -669,6 +680,19 @@ mod tests {
         assert_eq!(dp.bounds_vals, [1.0, 2.0, 5.0]);
         assert_eq!(dp.bucket_offsets, [0, 4]);
         assert_eq!(dp.bounds_offsets, [0, 3]);
+    }
+
+    #[test]
+    fn push_custom_buckets_empties_stale_points() {
+        let mut dp = HistogramDpTable::default();
+        push(&mut dp, &nhcb(2, 1.0, vec![span(0, 1)], vec![2])).unwrap();
+        push(&mut dp, &nhcb(2, STALE_NAN, vec![span(0, 1)], vec![2])).unwrap();
+        assert_eq!(dp.bucket_counts, [2, 0, 0, 0]);
+        assert_eq!(dp.bounds_vals, [1.0, 2.0, 5.0]);
+        assert_eq!(dp.bucket_offsets, [0, 4, 4]);
+        assert_eq!(dp.bounds_offsets, [0, 3, 3]);
+        assert!(!dp.counts.is_nullable());
+        assert!(dp.sums.is_nullable());
     }
 
     #[test]

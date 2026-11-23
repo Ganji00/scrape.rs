@@ -1316,6 +1316,16 @@ impl ExpBucketsCol {
         !self.counts.is_empty()
     }
 
+    /// Appends an empty bucket list with offset 0.
+    fn push_empty(&mut self) {
+        if self.list_offsets.is_empty() {
+            self.list_offsets.push(0);
+        }
+        let end = self.list_offsets[self.list_offsets.len() - 1];
+        self.offsets.push(0);
+        self.list_offsets.push(end);
+    }
+
     fn to_struct_array(&self) -> Result<ArrayRef, DecodeError> {
         let counts = ListArray::new(
             histogram_bucket_counts_item_field(),
@@ -1349,6 +1359,19 @@ pub(super) struct ExpHistogramDpTable {
 }
 
 impl ExpHistogramDpTable {
+    /// Appends the value columns of a stale data point: zero counts, sum, scale, and zero
+    /// threshold, and empty buckets. The caller appends the base columns with the
+    /// no-recorded-value flag.
+    pub(super) fn push_stale_values(&mut self) {
+        self.counts.push(0);
+        self.sums.push(0.0);
+        self.scales.push(0);
+        self.zero_counts.push(0);
+        self.zero_thresholds.push(0.0);
+        self.positive.push_empty();
+        self.negative.push_empty();
+    }
+
     pub(super) fn clear(&mut self) {
         self.base.clear();
         self.counts.clear();

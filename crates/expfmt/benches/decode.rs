@@ -386,7 +386,34 @@ fn main() {
                         black_box(chunk.unwrap());
                     }
                 }
-            });
+            })
+            .bench(
+                format!("Decode/case={case}/mode=decode_staleness"),
+                move |b| {
+                    let mut decoder = ArrowDecoder::new();
+                    let mut tracker = StalenessTracker::new();
+                    black_box(
+                        decoder
+                            .decode_with_staleness(payload, format, &opts, &mut tracker)
+                            .unwrap(),
+                    );
+
+                    b.set_bytes(bytes);
+                    b.report_allocs();
+                    while b.keep_running() {
+                        black_box(
+                            decoder
+                                .decode_with_staleness(
+                                    black_box(payload),
+                                    format,
+                                    &opts,
+                                    &mut tracker,
+                                )
+                                .unwrap(),
+                        );
+                    }
+                },
+            );
     }
 
     suite.run();

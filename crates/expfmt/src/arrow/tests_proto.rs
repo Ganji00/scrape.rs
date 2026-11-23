@@ -708,30 +708,299 @@ fn float_exponential_histograms_are_dropped_and_gauge_ones_kept() {
     assert_eq!(records.exp_histogram_data_points().unwrap().num_rows(), 1);
 }
 
+/// The `flags` column of a data point batch, zero for every point when it is left out.
+fn flags(batch: &RecordBatch) -> Vec<u32> {
+    batch.column_by_name("flags").map_or_else(
+        || vec![0; batch.num_rows()],
+        |array| array.as_primitive::<UInt32Type>().values().to_vec(),
+    )
+}
+
+fn summary_metric(pairs: &[(&str, &str)], sum: f64, quantile_value: f64) -> dto::Metric {
+    dto::Metric {
+        label: labels(pairs),
+        summary: Some(dto::Summary {
+            sample_count: 3,
+            sample_sum: sum,
+            quantile: vec![dto::Quantile {
+                quantile: 0.5,
+                value: quantile_value,
+            }],
+            start_timestamp: None,
+        }),
+        ..dto::Metric::default()
+    }
+}
+
 #[test]
-fn stale_native_histograms_set_the_no_recorded_value_flag() {
-    let mut stale = native(0, vec![span(0, 1)], vec![2]);
-    stale.sample_sum = f64::from_bits(0x7ff0_0000_0000_0002);
-    let input = encode(&[family(
+fn stale_markers_set_the_no_recorded_value_flag() {
+    let mut stale_native = native(0, vec![span(0, 1)], vec![2]);
+    stale_native.sample_sum = STALE_NAN;
+    let input = encode(&[
+        family(
+            "g",
+            "",
+            dto::MetricType::Gauge,
+            vec![gauge(&[("s", "1")], STALE_NAN), gauge(&[("s", "2")], 1.0)],
+        ),
+        family(
+            "s",
+            "",
+            dto::MetricType::Summary,
+            vec![
+                summary_metric(&[("s", "1")], STALE_NAN, 1.0),
+                summary_metric(&[("s", "2")], 1.0, STALE_NAN),
+                summary_metric(&[("s", "3")], 1.0, 1.0),
+            ],
+        ),
+        family(
+            "h",
+            "",
+            dto::MetricType::Histogram,
+            vec![
+                histogram_metric(&[("s", "1")], stale_native),
+                histogram_metric(&[("s", "2")], native(0, vec![span(0, 1)], vec![2])),
+                classic_histogram(&[("s", "3")], &[(1.0, 2)], 2, STALE_NAN),
+                classic_histogram(&[("s", "4")], &[(1.0, 2)], 2, 1.0),
+            ],
+        ),
+    ]);
+    let records = decode(&input, &DecodeOptions::default()).unwrap();
+
+    let numbers = records.number_data_points().unwrap();
+    assert_eq!(flags(numbers), [1, 0]);
+    let values = numbers.column_by_name("double_value").unwrap();
+    assert!(values.is_null(0) && values.is_valid(1));
+
+    // Like the text loop: zero count and sum and no quantiles.
+    let summaries = records.summary_data_points().unwrap();
+    assert_eq!(flags(summaries), [1, 1, 0]);
+    assert_eq!(u64s(summaries, "count"), [0, 0, 3]);
+    assert_eq!(f64s(summaries, "sum"), [0.0, 0.0, 1.0]);
+
+    let exponential = records.exp_histogram_data_points().unwrap();
+    assert_eq!(flags(exponential), [1, 0]);
+    assert_eq!(u64s(exponential, "count"), [0, 3]);
+
+    // Like a stale classic histogram from the text loop: zero count, no sum, no buckets.
+    let custom = records.histogram_data_points().unwrap();
+    assert_eq!(flags(custom), [1, 0]);
+    assert_eq!(u64s(custom, "count"), [0, 2]);
+    let sums = custom.column_by_name("sum").unwrap();
+    assert!(sums.is_null(0) && sums.is_valid(1));
+    let buckets = custom
+        .column_by_name("bucket_counts")
+        .unwrap()
+        .as_list::<i32>();
+    assert_eq!(buckets.value_length(0), 0);
+    assert_eq!(buckets.value_length(1), 2);
+}
+
+/// One family of every kind the tracker records, with all points at the scrape timestamp.
+fn tracked_families(series: &[&str]) -> Vec<u8> {
+    let stamped = |mut metric: dto::Metric| {
+        metric.timestamp_ms = 0;
+        metric
+    };
+    let mut gauges = Vec::new();
+    let mut summaries = Vec::new();
+    let mut histograms = Vec::new();
+    for &value in series {
+        let pairs = [("s", value)];
+        gauges.push(stamped(gauge(&pairs, 1.0)));
+        summaries.push(stamped(summary_metric(&pairs, 1.0, 1.0)));
+        histograms.push(stamped(histogram_metric(
+            &pairs,
+            native(0, vec![span(0, 1)], vec![2]),
+        )));
+        histograms.push(stamped(classic_histogram(&pairs, &[(1.0, 2)], 2, 1.0)));
+    }
+    encode(&[
+        family("g", "", dto::MetricType::Gauge, gauges),
+        family("s", "", dto::MetricType::Summary, summaries),
+        family("h", "", dto::MetricType::Histogram, histograms),
+    ])
+}
+
+#[test]
+fn disappeared_series_get_stale_points() {
+    let opts = DecodeOptions::default().with_timestamp_ms(1_700_000_000_000);
+    let mut decoder = ArrowDecoder::new();
+    let mut tracker = StalenessTracker::new();
+    let mut scrape = |input: &[u8], tracker: &mut StalenessTracker| {
+        decoder
+            .decode_with_staleness(input, &Format::PROTO_DELIM, &opts, tracker)
+            .unwrap()
+    };
+
+    let first = scrape(&tracked_families(&["1", "2"]), &mut tracker);
+    assert_eq!(metric_types(&first), [1, 5, 4, 3]);
+
+    // Series 2 disappears: each kind gets one stale point in the row of its kind, after the
+    // live point of series 1.
+    let second = scrape(&tracked_families(&["1"]), &mut tracker);
+    assert_eq!(metric_types(&second), [1, 5, 4, 3]);
+    for points in [
+        second.number_data_points(),
+        second.summary_data_points(),
+        second.exp_histogram_data_points(),
+        second.histogram_data_points(),
+    ] {
+        assert_eq!(flags(points.unwrap()), [0, 1]);
+    }
+    let exponential = second.exp_histogram_data_points().unwrap();
+    assert_eq!(u64s(exponential, "count"), [3, 0]);
+
+    // A family that disappears entirely gets its rows back for its stale points, an
+    // `ExpHistogram` row for the exponential ones.
+    let third = scrape(&encode(&[]), &mut tracker);
+    assert_eq!(metric_types(&third), [1, 5, 4, 3]);
+    assert_eq!(flags(third.exp_histogram_data_points().unwrap()), [1]);
+    assert_eq!(flags(third.histogram_data_points().unwrap()), [1]);
+
+    // Stale points are only written once.
+    let fourth = scrape(&encode(&[]), &mut tracker);
+    assert!(fourth.univariate_metrics().is_none());
+}
+
+#[test]
+fn input_stale_markers_end_tracked_series() {
+    let opts = DecodeOptions::default().with_timestamp_ms(1_700_000_000_000);
+    let mut decoder = ArrowDecoder::new();
+    let mut tracker = StalenessTracker::new();
+    let mut stale_native = native(0, vec![span(0, 1)], vec![2]);
+    stale_native.sample_sum = STALE_NAN;
+    let mut stale = histogram_metric(&[("s", "1")], stale_native);
+    stale.timestamp_ms = 0;
+
+    let mut scrape = |input: &[u8]| {
+        decoder
+            .decode_with_staleness(input, &Format::PROTO_DELIM, &opts, &mut tracker)
+            .unwrap()
+    };
+    scrape(&tracked_families(&["1"]));
+
+    // The exponential series is stale in the input, the other kinds disappeared.
+    let second = scrape(&encode(&[family(
         "h",
         "",
         dto::MetricType::Histogram,
-        vec![
-            histogram_metric(&[("s", "1")], stale),
-            histogram_metric(&[("s", "2")], native(0, vec![span(0, 1)], vec![2])),
-        ],
+        vec![stale],
+    )]));
+    assert_eq!(metric_types(&second), [4, 1, 5, 3]);
+    for points in [
+        second.exp_histogram_data_points(),
+        second.number_data_points(),
+        second.summary_data_points(),
+        second.histogram_data_points(),
+    ] {
+        assert_eq!(flags(points.unwrap()), [1]);
+    }
+
+    // None of them is marked stale again.
+    assert!(scrape(&encode(&[])).univariate_metrics().is_none());
+}
+
+#[test]
+fn explicit_timestamps_are_tracked_only_when_enabled() {
+    let input = encode(&[family(
+        "c_total",
+        "",
+        dto::MetricType::Counter,
+        vec![counter(&[], 1.0, 1_700_000_000_000)],
     )]);
-    let records = decode(&input, &DecodeOptions::default()).unwrap();
-    let points = records.exp_histogram_data_points().unwrap();
-    assert_eq!(
-        points
-            .column_by_name("flags")
+    for (track, stale_points) in [(false, 0), (true, 1)] {
+        let opts = DecodeOptions::default()
+            .with_timestamp_ms(1_700_000_000_000)
+            .with_track_timestamps_staleness(track);
+        let mut decoder = ArrowDecoder::new();
+        let mut tracker = StalenessTracker::new();
+        decoder
+            .decode_with_staleness(&input, &Format::PROTO_DELIM, &opts, &mut tracker)
+            .unwrap();
+        let records = decoder
+            .decode_with_staleness(&encode(&[]), &Format::PROTO_DELIM, &opts, &mut tracker)
+            .unwrap();
+        let points = records.number_data_points().map_or(0, |b| b.num_rows());
+        assert_eq!(points, stale_points, "track_timestamps_staleness = {track}");
+    }
+}
+
+/// Stale points per table: number, summary, explicit-bucket, and exponential histogram.
+fn stale_counts(records: &OtapMetricRecords) -> [usize; 4] {
+    [
+        records.number_data_points(),
+        records.summary_data_points(),
+        records.histogram_data_points(),
+        records.exp_histogram_data_points(),
+    ]
+    .map(|points| points.map_or(0, |b| flags(b).iter().filter(|&&f| f == 1).count()))
+}
+
+#[test]
+fn chunked_and_budgeted_stale_points_match_single_batch() {
+    let opts = DecodeOptions::default().with_timestamp_ms(1_700_000_000_000);
+    let full = tracked_families(&["1", "2", "3"]);
+    let partial = tracked_families(&["2"]);
+
+    let mut decoder = ArrowDecoder::new();
+    let mut tracker = StalenessTracker::new();
+    let mut single = |input: &[u8]| {
+        decoder
+            .decode_with_staleness(input, &Format::PROTO_DELIM, &opts, &mut tracker)
             .unwrap()
-            .as_primitive::<UInt32Type>()
-            .values(),
-        &[1, 0]
-    );
-    assert_eq!(u64s(points, "count"), [0, 3]);
+    };
+    single(&full);
+    assert_eq!(stale_counts(&single(&partial)), [2; 4]);
+
+    let chunked_opts = opts.with_max_data_points_per_batch(1);
+    let mut decoder = ArrowDecoder::new();
+    let mut tracker = StalenessTracker::new();
+    for input in [&full, &partial] {
+        let mut stale = [0; 4];
+        let mut chunks = 0;
+        for chunk in decoder.decode_stream_with_staleness(
+            input,
+            &Format::PROTO_DELIM,
+            &chunked_opts,
+            &mut tracker,
+        ) {
+            chunks += 1;
+            let counts = stale_counts(&chunk.unwrap());
+            stale.iter_mut().zip(counts).for_each(|(s, c)| *s += c);
+        }
+        if input == &partial {
+            // One live and two stale points of each kind, one per chunk.
+            assert_eq!(chunks, 12);
+            assert_eq!(stale, [2; 4]);
+        }
+    }
+
+    let budget = DecodeBudget::default().with_max_entries(1);
+    let mut decoder = ArrowDecoder::new();
+    let mut tracker = StalenessTracker::new();
+    for input in [&full, &partial] {
+        let mut stale = [0; 4];
+        let mut cursor = decoder
+            .start_decode_stream(&Format::PROTO_DELIM, &chunked_opts)
+            .unwrap();
+        loop {
+            match decoder
+                .step_decode_with_staleness(&mut cursor, input, budget, &mut tracker)
+                .unwrap()
+            {
+                DecodeStep::Pending => {}
+                DecodeStep::Batch(chunk) => {
+                    let counts = stale_counts(&chunk);
+                    stale.iter_mut().zip(counts).for_each(|(s, c)| *s += c);
+                }
+                DecodeStep::Done => break,
+            }
+        }
+        if input == &partial {
+            assert_eq!(stale, [2; 4]);
+        }
+    }
 }
 
 #[test]

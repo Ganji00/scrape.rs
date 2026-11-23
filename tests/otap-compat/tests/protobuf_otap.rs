@@ -32,8 +32,8 @@ use otel_arrow_dfe_pdata::schema::payloads;
 use otel_arrow_dfe_pdata::testing::equiv::assert_equivalent;
 use otel_arrow_dfe_pdata::testing::round_trip::{otap_to_otlp, to_metrics_data};
 use prometheus_expfmt::arrow::{
-    ArrowDecoder, DecodeError, DecodeOptions, MetricPayloadType, OtapMetricRecords,
-    PROMETHEUS_TYPE_METADATA_KEY,
+    ArrowDecoder, DATA_POINT_FLAG_NO_RECORDED_VALUE, DecodeError, DecodeOptions, MetricPayloadType,
+    OtapMetricRecords, PROMETHEUS_TYPE_METADATA_KEY, StalenessTracker,
 };
 use prometheus_expfmt::dto;
 use prometheus_expfmt::format::Format;
@@ -461,6 +461,61 @@ fn protobuf_decode_stream_chunks_validate_in_otap() {
     }
     assert_eq!(streamed.len(), 6);
     assert_equivalent(&[expected()], &streamed);
+}
+
+#[test]
+fn protobuf_stale_points_validate_in_otap_and_otlp() {
+    // The payload's points have explicit timestamps.
+    let opts = DecodeOptions::new()
+        .with_timestamp_ms(TS_MS + 15_000)
+        .with_track_timestamps_staleness(true);
+    let mut decoder = ArrowDecoder::new();
+    let mut tracker = StalenessTracker::new();
+    decoder
+        .decode_with_staleness(&payload(), &Format::PROTO_DELIM, &opts, &mut tracker)
+        .expect("protobuf payload decodes");
+    let stale = decoder
+        .decode_with_staleness(&[], &Format::PROTO_DELIM, &opts, &mut tracker)
+        .expect("empty scrape decodes");
+    assert!(
+        stale
+            .get(MetricPayloadType::ExpHistogramDataPoints)
+            .is_some()
+    );
+
+    let (plain, round_tripped) = to_otlp(&stale);
+    for message in [plain, round_tripped] {
+        let OtlpProtoMessage::Metrics(data) = message else {
+            panic!("expected OTLP MetricsData");
+        };
+        let metrics = &data.resource_metrics[0].scope_metrics[0].metrics;
+        let mut exponential = 0;
+        for m in metrics {
+            let flags: Vec<u32> = match &m.data {
+                Some(metric::Data::Sum(s)) => s.data_points.iter().map(|p| p.flags).collect(),
+                Some(metric::Data::Summary(s)) => s.data_points.iter().map(|p| p.flags).collect(),
+                Some(metric::Data::Histogram(h)) => h.data_points.iter().map(|p| p.flags).collect(),
+                Some(metric::Data::ExponentialHistogram(h)) => {
+                    exponential += h.data_points.len();
+                    for p in &h.data_points {
+                        assert_eq!((p.count, p.zero_count), (0, 0));
+                        assert!(
+                            p.positive
+                                .as_ref()
+                                .is_none_or(|b| b.bucket_counts.is_empty())
+                        );
+                    }
+                    h.data_points.iter().map(|p| p.flags).collect()
+                }
+                other => panic!("unexpected metric data: {other:?}"),
+            };
+            assert!(!flags.is_empty(), "{}", m.name);
+            for flag in flags {
+                assert_eq!(flag, DATA_POINT_FLAG_NO_RECORDED_VALUE, "{}", m.name);
+            }
+        }
+        assert!(exponential > 0);
+    }
 }
 
 #[test]
