@@ -182,7 +182,7 @@ fn protobuf_cases(root: &Path) -> Vec<(&'static str, Vec<u8>)> {
                             },
                         ],
                         histogram: Some(histogram),
-                        timestamp_ms: 1_700_000_000_000,
+                        // No explicit timestamp, so `decode_staleness` tracks every series.
                         ..dto::Metric::default()
                     }
                 })
