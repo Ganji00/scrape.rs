@@ -350,11 +350,13 @@ fn expected() -> OtlpProtoMessage {
                         attributes: vec![kv_str("route", "/stale")],
                         start_time_unix_nano: 0,
                         time_unix_nano: TS_NS,
+                        // Like the stale points the tracker writes: no sum, and zero scale
+                        // and zero threshold.
                         count: 0,
-                        sum: Some(0.0),
-                        scale: 2,
+                        sum: None,
+                        scale: 0,
                         zero_count: 0,
-                        zero_threshold: 1e-128,
+                        zero_threshold: 0.0,
                         positive: Some(Buckets {
                             offset: 0,
                             bucket_counts: Vec::new(),

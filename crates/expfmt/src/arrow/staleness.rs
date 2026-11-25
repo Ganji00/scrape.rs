@@ -260,6 +260,22 @@ struct TrackedFamily {
     current_exp_batch_id: Option<u16>,
 }
 
+impl TrackedFamily {
+    /// Takes the rows `current_family` emitted in this batch. A row the family has not emitted
+    /// yet keeps the row an earlier part of the same family emitted, so a family split in the
+    /// input, or one whose classic and exponential points come in separate parts, does not
+    /// make its stale points emit a second row. `reset_batch_ids` clears both between batches.
+    #[inline]
+    fn sync_batch_ids(&mut self, current_family: &CurrentFamily) {
+        if current_family.batch_id.is_some() {
+            self.current_batch_id = current_family.batch_id;
+        }
+        if current_family.exp_batch_id.is_some() {
+            self.current_exp_batch_id = current_family.exp_batch_id;
+        }
+    }
+}
+
 const MAX_FAMILY_IDX: u32 = (1 << 27) - 1;
 const KIND_SHIFT: u32 = 27;
 const KIND_MASK: u32 = 0b11;
@@ -1105,8 +1121,7 @@ impl StalenessTracker {
             && fam.metric_type == metric_type
             && fam.saw_total_suffix == saw_total_suffix
         {
-            fam.current_batch_id = current_family.batch_id;
-            fam.current_exp_batch_id = current_family.exp_batch_id;
+            fam.sync_batch_ids(current_family);
             return Ok(());
         }
 
@@ -1149,8 +1164,7 @@ impl StalenessTracker {
             && fam.metric_type == metric_type
             && fam.saw_total_suffix == saw_total_suffix
         {
-            fam.current_batch_id = current_family.batch_id;
-            fam.current_exp_batch_id = current_family.exp_batch_id;
+            fam.sync_batch_ids(current_family);
             return Ok(idx);
         }
 
@@ -1274,8 +1288,7 @@ impl StalenessTracker {
         entry.pending_has_help = current_family.has_help;
         entry.pending_has_unit = current_family.has_unit;
         entry.has_pending_meta = true;
-        entry.current_batch_id = current_family.batch_id;
-        entry.current_exp_batch_id = current_family.exp_batch_id;
+        entry.sync_batch_ids(current_family);
         Ok(())
     }
 

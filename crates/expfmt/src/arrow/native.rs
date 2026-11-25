@@ -70,6 +70,9 @@ pub(super) struct NativeView<'h> {
     pub(super) sum: f64,
     pub(super) count: u64,
     pub(super) zero_count: u64,
+    /// `true` if the zero count as sent is not 0. A float zero count below 1 or NaN converts
+    /// to a `zero_count` of 0, but Go still rejects it on custom buckets.
+    pub(super) has_zero_count: bool,
     /// `true` for a float histogram, which Go does not check against its bucket counts.
     pub(super) is_float: bool,
     pub(super) positive_spans: &'h [Span],
@@ -88,6 +91,7 @@ impl<'h> NativeView<'h> {
                 h,
                 h.count,
                 h.zero_count,
+                h.zero_count != 0,
                 false,
                 Buckets::Delta(&h.positive_buckets),
                 Buckets::Delta(&h.negative_buckets),
@@ -106,6 +110,7 @@ impl<'h> NativeView<'h> {
                     h,
                     f64_to_u64_count(h.count),
                     f64_to_u64_count(h.zero_count),
+                    h.zero_count != 0.0,
                     true,
                     Buckets::Absolute(&h.positive_buckets),
                     Buckets::Absolute(&h.negative_buckets),
@@ -118,6 +123,7 @@ impl<'h> NativeView<'h> {
         h: &'h Histogram<C, B>,
         count: u64,
         zero_count: u64,
+        has_zero_count: bool,
         is_float: bool,
         positive: Buckets<'h>,
         negative: Buckets<'h>,
@@ -128,6 +134,7 @@ impl<'h> NativeView<'h> {
             sum: h.sum,
             count,
             zero_count,
+            has_zero_count,
             is_float,
             positive_spans: &h.positive_spans,
             positive,
@@ -309,7 +316,7 @@ pub(super) fn push_custom_buckets(
 /// [`walk_buckets`] does.
 fn check_custom_buckets(histogram: &NativeView<'_>) -> Result<(), String> {
     check_custom_bounds(histogram.custom_values, histogram.positive_spans)?;
-    if histogram.zero_count != 0 {
+    if histogram.has_zero_count {
         return Err("custom buckets: must have zero count of 0".to_owned());
     }
     if histogram.zero_threshold != 0.0 {
@@ -366,7 +373,7 @@ pub(super) fn check_float_exponential(histogram: &NativeView<'_>) -> Result<(), 
 /// histogram data point, per the OpenTelemetry Prometheus compatibility spec: `scale` is the
 /// schema, the sparse spans become one dense list per side whose offset is the first index
 /// minus one, and buckets outside the float64 range are dropped and not counted. A stale NaN
-/// sum leaves the counts zero and the buckets empty.
+/// sum leaves the counts, scale and zero threshold zero, the sum null, and the buckets empty.
 ///
 /// A side whose dense list would be wider than [`dense_bucket_limit`] lowers the scale and
 /// merges adjacent buckets until it fits, like Prometheus's `native_histogram_bucket_limit`,
@@ -410,8 +417,8 @@ pub(super) fn push_exponential(
         range,
         shift,
         stale,
-    )
-    .map_err(|reason| invalid_histogram(family, reason))?;
+        family,
+    )?;
     let (negative_total, negative_kept) = push_dense_side(
         &mut dp.negative,
         "negative",
@@ -420,8 +427,8 @@ pub(super) fn push_exponential(
         range,
         shift,
         stale,
-    )
-    .map_err(|reason| invalid_histogram(family, reason))?;
+        family,
+    )?;
     histogram
         .check_count(
             positive_total
@@ -430,21 +437,24 @@ pub(super) fn push_exponential(
         )
         .map_err(|reason| invalid_histogram(family, reason))?;
 
-    dp.scales.push(histogram.schema - shift as i32);
-    dp.zero_thresholds.push(histogram.zero_threshold);
     if stale {
+        // Same values as the stale points the tracker appends; the buckets are already empty.
+        dp.sums.push_null(dp.counts.len());
         dp.counts.push(0);
-        dp.sums.push(0.0);
+        dp.scales.push(0);
         dp.zero_counts.push(0);
+        dp.zero_thresholds.push(0.0);
     } else {
+        dp.sums.push_value(histogram.sum);
         dp.counts.push(
             histogram
                 .zero_count
                 .wrapping_add(positive_kept)
                 .wrapping_add(negative_kept),
         );
-        dp.sums.push(histogram.sum);
+        dp.scales.push(histogram.schema - shift as i32);
         dp.zero_counts.push(histogram.zero_count);
+        dp.zero_thresholds.push(histogram.zero_threshold);
     }
     Ok(())
 }
@@ -509,15 +519,20 @@ fn downscale_shift(schema: i32, sides: [(Option<(i64, i64)>, usize); 2]) -> u32 
 /// Appends one side of an exponential histogram to `col` as a dense list at the scale lowered
 /// by `shift`, keeping only the buckets within `range`, and returns the total count of all
 /// buckets, for Go's count check, and of the kept buckets. A stale point gets an empty list.
+///
+/// Invalid spans and buckets are [`DecodeError::InvalidHistogram`]; a column that outgrows
+/// the OTAP i32 list offsets is [`DecodeError::CapacityOverflow`].
+#[allow(clippy::too_many_arguments)]
 fn push_dense_side(
     col: &mut ExpBucketsCol,
-    side: &str,
+    side: &'static str,
     spans: &[Span],
     buckets: Buckets<'_>,
     (min_index, max_index): (i64, i64),
     shift: u32,
     stale: bool,
-) -> Result<(u64, u64), String> {
+    family: &CurrentFamily,
+) -> Result<(u64, u64), DecodeError> {
     if col.list_offsets.is_empty() {
         col.list_offsets.push(0);
     }
@@ -541,7 +556,8 @@ fn push_dense_side(
             counts.push(count);
         }
         kept = kept.wrapping_add(count);
-    })?;
+    })
+    .map_err(|reason| invalid_histogram(family, reason))?;
     let mut offset = first_index.unwrap_or(0);
     if stale {
         col.counts.truncate(start);
@@ -549,11 +565,13 @@ fn push_dense_side(
     }
     // Both bounds of the index range fit in i32.
     col.offsets.push(offset as i32);
-    let end = i32::try_from(col.counts.len()).map_err(|_| {
-        format!(
-            "{side} side: {} buckets overflow the OTAP i32 list offsets",
-            col.counts.len()
-        )
+    let end = i32::try_from(col.counts.len()).map_err(|_| DecodeError::CapacityOverflow {
+        table: if side == "positive" {
+            "ExpHistogramDataPoints.positive"
+        } else {
+            "ExpHistogramDataPoints.negative"
+        },
+        count: col.counts.len(),
     })?;
     col.list_offsets.push(end);
     Ok((total, kept))
@@ -563,11 +581,12 @@ fn push_dense_side(
 /// [`walk_buckets`] does.
 fn check_custom_bounds(bounds: &[f64], spans: &[Span]) -> Result<(), String> {
     let mut previous = f64::NEG_INFINITY;
-    for &bound in bounds {
+    for (i, &bound) in bounds.iter().enumerate() {
         if bound.is_nan() {
             return Err("custom buckets: must not have NaN bounds".to_owned());
         }
-        if bound <= previous {
+        // The first bound may be -Inf.
+        if i > 0 && bound <= previous {
             return Err(format!(
                 "previous bound is {previous} and current is {bound}: custom buckets: must be \
                  in strictly increasing order"
@@ -641,7 +660,10 @@ mod tests {
         assert!(check_custom_bounds(&[1.0, 2.0], &[span(0, 3)]).is_ok());
         assert!(check_custom_bounds(&[1.0, 1.0], &[]).is_err());
         assert!(check_custom_bounds(&[f64::NAN], &[]).is_err());
-        assert!(check_custom_bounds(&[f64::NEG_INFINITY], &[]).is_err());
+        // Go only compares a bound with the one before it, so the first may be -Inf.
+        assert!(check_custom_bounds(&[f64::NEG_INFINITY], &[]).is_ok());
+        assert!(check_custom_bounds(&[f64::NEG_INFINITY, 1.0], &[span(0, 3)]).is_ok());
+        assert!(check_custom_bounds(&[f64::NEG_INFINITY, f64::NEG_INFINITY], &[]).is_err());
         assert!(check_custom_bounds(&[1.0, f64::INFINITY], &[]).is_err());
         assert!(check_custom_bounds(&[1.0], &[span(-1, 1)]).is_err());
         assert!(check_custom_bounds(&[1.0], &[span(1, 2)]).is_err());
@@ -717,6 +739,27 @@ mod tests {
         h.negative_spans = vec![span(0, 1)];
         h.negative_buckets = vec![1];
         assert!(push(&mut HistogramDpTable::default(), &h).is_err());
+    }
+
+    #[test]
+    fn push_custom_buckets_rejects_fractional_and_nan_float_zero_count() {
+        // Go checks the float zero count as sent, before any conversion to an integer count.
+        for zero_count in [0.5, f64::NAN] {
+            let h = Histogram::<f64, f64> {
+                schema: CUSTOM_BUCKETS_SCHEMA,
+                count: 1.0,
+                sum: 1.0,
+                zero_count,
+                positive_spans: vec![span(0, 1)],
+                positive_buckets: vec![1.0],
+                custom_values: vec![1.0],
+                ..Histogram::default()
+            };
+            let view = NativeView::new(HistogramRef::Float(&h)).unwrap();
+            let mut dp = HistogramDpTable::default();
+            let err = push_custom_buckets(&mut dp, 0, &view, &family()).unwrap_err();
+            assert!(err.to_string().contains("zero count of 0"), "{err}");
+        }
     }
 
     fn exponential(schema: i32, spans: Vec<Span>, deltas: Vec<i64>) -> Histogram<u64, i64> {
@@ -797,8 +840,11 @@ mod tests {
         let mut dp = ExpHistogramDpTable::default();
         let mut h = exponential(1, vec![span(0, 1)], vec![3]);
         h.sum = STALE_NAN;
+        h.zero_threshold = 0.5;
         push_exp(&mut dp, &h).unwrap();
-        assert_eq!((dp.counts[0], dp.sums[0], dp.zero_counts[0]), (0, 0.0, 0));
+        assert_eq!((dp.counts[0], dp.zero_counts[0]), (0, 0));
+        assert_eq!((dp.scales[0], dp.zero_thresholds[0]), (0, 0.0));
+        assert!(dp.sums.is_nullable());
         assert!(dp.positive.counts.is_empty());
         assert_eq!(dp.positive.offsets, [0]);
     }
@@ -849,6 +895,78 @@ mod tests {
         push_exp(&mut dp, &h).unwrap();
         assert_eq!(dp.scales, [8]);
         assert_eq!(dp.positive.counts.len(), 200);
+    }
+
+    /// `exponential` with its buckets on the negative side instead.
+    fn negative(schema: i32, spans: Vec<Span>, deltas: Vec<i64>) -> Histogram<u64, i64> {
+        let mut h = exponential(schema, spans, deltas);
+        h.negative_spans = std::mem::take(&mut h.positive_spans);
+        h.negative_buckets = std::mem::take(&mut h.positive_buckets);
+        h
+    }
+
+    #[test]
+    fn push_exponential_negative_side_only() {
+        let mut dp = ExpHistogramDpTable::default();
+        push_exp(
+            &mut dp,
+            &negative(3, vec![span(-2, 2), span(3, 1)], vec![1, 2, -1]),
+        )
+        .unwrap();
+        assert_eq!(dp.counts, [8]);
+        assert_eq!(dp.negative.offsets, [-3]);
+        assert_eq!(dp.negative.counts, [1, 3, 0, 0, 0, 2]);
+        assert!(dp.positive.counts.is_empty());
+        assert_eq!(dp.positive.offsets, [0]);
+        assert_eq!(dp.positive.list_offsets, [0, 0]);
+
+        // Buckets outside the float range are dropped on the negative side too.
+        let mut dp = ExpHistogramDpTable::default();
+        let h = negative(0, vec![span(-1075, 1), span(2098, 2)], vec![7, -6, 2]);
+        push_exp(&mut dp, &h).unwrap();
+        assert_eq!(dp.negative.offsets, [1023]);
+        assert_eq!(dp.negative.counts, [1]);
+        assert_eq!(dp.counts, [3]);
+
+        // A negative side alone can overflow the count check.
+        let mut h = negative(0, vec![span(0, 1)], vec![3]);
+        h.count = 4;
+        let err = push_exp(&mut ExpHistogramDpTable::default(), &h).unwrap_err();
+        assert!(err.to_string().contains("should equal"), "{err}");
+    }
+
+    #[test]
+    fn push_exponential_truncates_stale_negative_buckets_after_the_first_row() {
+        let mut dp = ExpHistogramDpTable::default();
+        push_exp(&mut dp, &negative(0, vec![span(0, 2)], vec![1, 1])).unwrap();
+        let mut stale = negative(0, vec![span(4, 3)], vec![1, 1, 1]);
+        stale.sum = STALE_NAN;
+        push_exp(&mut dp, &stale).unwrap();
+        // The stale row keeps none of the buckets the walk wrote after row 0's.
+        assert_eq!(dp.negative.counts, [1, 2]);
+        assert_eq!(dp.negative.offsets, [-1, 0]);
+        assert_eq!(dp.negative.list_offsets, [0, 2, 2]);
+        assert_eq!(dp.counts, [5, 0]);
+    }
+
+    #[test]
+    fn push_exponential_downscales_both_sides_for_a_wide_negative_side() {
+        // Same wide side as `push_exponential_downscales_wide_sides`, on the negative side,
+        // with a narrow positive side that is downscaled with it.
+        let mut dp = ExpHistogramDpTable::default();
+        let mut h = negative(2, vec![span(1, 2), span(298, 1)], vec![2, 1, -1]);
+        h.positive_spans = vec![span(1, 2)];
+        h.positive_buckets = vec![4, 0];
+        h.count += 8;
+        push_exp(&mut dp, &h).unwrap();
+        assert_eq!(dp.scales, [1]);
+        assert_eq!(dp.negative.offsets, [0]);
+        assert_eq!(dp.negative.counts.len(), 151);
+        assert_eq!(dp.negative.counts[0], 5);
+        assert_eq!(dp.negative.counts[150], 2);
+        assert_eq!(dp.positive.offsets, [0]);
+        assert_eq!(dp.positive.counts, [8]);
+        assert_eq!(dp.counts, [17]);
     }
 
     #[test]

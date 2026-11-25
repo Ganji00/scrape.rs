@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use crate::dto;
 use crate::parse::{Entry, HistogramRef, MetricType, Parser, ProtobufParser, ProtobufParserState};
-use crate::parse::{METRIC_NAME_LABEL, timestamp_millis};
+use crate::parse::{METRIC_NAME_LABEL, checked_timestamp_millis, timestamp_millis};
 
 use super::columns::{ExemplarTable, ms_to_ns, parse_hex_array};
 use super::family::CurrentFamily;
@@ -51,6 +51,16 @@ pub(super) struct ProtoScratch {
 }
 
 impl ProtoScratch {
+    /// Keeps the scratch of a finished or abandoned parser if it holds more than the scratch
+    /// already kept, like the text parsers' scratch. The last decoded message is dropped first,
+    /// so `retained_memory_bytes` counts everything the decoder keeps.
+    pub(super) fn keep_state(&mut self, mut state: ProtobufParserState) {
+        state.release_decoded();
+        if state.retained_memory_bytes() > self.state.retained_memory_bytes() {
+            self.state = state;
+        }
+    }
+
     pub(super) fn retained_memory_bytes(&self) -> usize {
         self.state.retained_memory_bytes() + self.quantiles.capacity() * size_of::<(f64, f64)>()
     }
@@ -66,11 +76,13 @@ fn is_exponential(parser: &ProtobufParser<'_>) -> bool {
     }
 }
 
-/// Go reads a zero start timestamp as unset.
+/// Go reads a zero start timestamp as unset. A start timestamp out of the nanosecond range is
+/// also unset, like an out-of-range created timestamp in the text loop.
 #[inline]
-fn start_timestamp_ns(parser: &mut ProtobufParser<'_>) -> Option<i64> {
+fn start_timestamp_ns(parser: &ProtobufParser<'_>) -> Option<i64> {
     parser
-        .start_timestamp()
+        .start_timestamp_proto()
+        .and_then(checked_timestamp_millis)
         .filter(|&ms| ms != 0)
         .and_then(|ms| ms.checked_mul(1_000_000))
 }
@@ -150,56 +162,51 @@ impl ArrowDecoder {
                 // `start_proto_family` already read the unit and type of the message.
                 Entry::Unit | Entry::Type | Entry::Comment => {}
                 Entry::Series | Entry::Histogram => {
-                    // The `_sum` and quantile series of a summary are part of the data point
-                    // its `_count` series appended.
-                    let is_point = entry == Entry::Histogram
-                        || self.current_family.metric_type != MetricType::Summary
-                        || parser.is_summary_start();
-                    if is_point {
-                        let row = if entry == Entry::Histogram && is_exponential(parser) {
-                            self.current_family.exp_batch_id
-                        } else {
-                            self.current_family.batch_id
-                        };
-                        if CHUNKED && row.is_none() && self.metrics.len() >= MAX_METRICS_PER_BATCH {
-                            *pending_series = true;
-                            let batch = self.finish_batches(default_ts_ns.is_some())?;
-                            self.reset_batch_for_mode::<TRACKED>(tracker);
-                            return Ok(DecodeStep::Batch(batch));
-                        }
-                        let point = if entry == Entry::Histogram {
-                            self.append_proto_histogram(parser, opts, default_ts_ns)?
-                        } else if self.current_family.metric_type == MetricType::Summary {
-                            self.append_proto_summary(parser, opts, default_ts_ns)?
-                        } else {
-                            self.append_proto_scalar(parser, opts, default_ts_ns)?
-                        };
-                        if TRACKED
-                            && let Some(tr) = tracker.as_deref_mut()
-                            && let Some((kind, is_stale)) = point
+                    // The parser returns one series per summary, its `_count` series, as the
+                    // decoder resets it with `skip_entry_bytes`.
+                    let row = if entry == Entry::Histogram && is_exponential(parser) {
+                        self.current_family.exp_batch_id
+                    } else {
+                        self.current_family.batch_id
+                    };
+                    if CHUNKED && row.is_none() && self.metrics.len() >= MAX_METRICS_PER_BATCH {
+                        *pending_series = true;
+                        let batch = self.finish_batches(default_ts_ns.is_some())?;
+                        self.reset_batch_for_mode::<TRACKED>(tracker);
+                        return Ok(DecodeStep::Batch(batch));
+                    }
+                    let point = if entry == Entry::Histogram {
+                        self.append_proto_histogram(parser, opts, default_ts_ns)?
+                    } else if self.current_family.metric_type == MetricType::Summary {
+                        self.append_proto_summary(parser, opts, default_ts_ns)?
+                    } else {
+                        self.append_proto_scalar(parser, opts, default_ts_ns)?
+                    };
+                    if TRACKED
+                        && let Some(tr) = tracker.as_deref_mut()
+                        && let Some((kind, is_stale)) = point
+                    {
+                        // Same rule as the text loop: a point with its own timestamp is
+                        // tracked only with `track_timestamps_staleness`.
+                        if parser.current_metric().timestamp_ms == 0
+                            || opts.track_timestamps_staleness
                         {
-                            // Same rule as the text loop: a point with its own timestamp is
-                            // tracked only with `track_timestamps_staleness`.
-                            if parser.current_metric().timestamp_ms == 0
-                                || opts.track_timestamps_staleness
-                            {
-                                tr.record_series(
-                                    &mut self.current_family,
-                                    kind,
-                                    &self.temp_attrs,
-                                    &self.key_interner,
-                                    &self.val_interner,
-                                    is_stale,
-                                )?;
-                            } else {
-                                tr.sync_existing_family(&mut self.current_family)?;
-                            }
+                            tr.record_series(
+                                &mut self.current_family,
+                                kind,
+                                &self.temp_attrs,
+                                &self.key_interner,
+                                &self.val_interner,
+                                is_stale,
+                            )?;
+                        } else {
+                            tr.sync_existing_family(&mut self.current_family)?;
                         }
-                        if CHUNKED && self.total_data_points() >= max_data_points {
-                            let batch = self.finish_batches(default_ts_ns.is_some())?;
-                            self.reset_batch_for_mode::<TRACKED>(tracker);
-                            return Ok(DecodeStep::Batch(batch));
-                        }
+                    }
+                    if CHUNKED && self.total_data_points() >= max_data_points {
+                        let batch = self.finish_batches(default_ts_ns.is_some())?;
+                        self.reset_batch_for_mode::<TRACKED>(tracker);
+                        return Ok(DecodeStep::Batch(batch));
                     }
                 }
             }
@@ -252,9 +259,7 @@ impl ArrowDecoder {
 
         if metric_type == MetricType::Unknown && opts.untyped_policy == UntypedPolicy::Drop {
             // Labels are still checked, like the text loop does for dropped families.
-            for index in 0..metric.label.len() {
-                check_label_name(index, &metric.label, true, &self.current_family)?;
-            }
+            check_dropped_labels(&metric.label, &self.current_family)?;
             self.current_family.has_samples = true;
             return Ok(None);
         }
@@ -404,6 +409,8 @@ impl ArrowDecoder {
                 if view.is_float {
                     check_float_exponential(&view)
                         .map_err(|r| invalid_histogram(&self.current_family, r))?;
+                    // Labels are still checked, like for points of dropped untyped families.
+                    check_dropped_labels(&metric.label, &self.current_family)?;
                     self.current_family.has_samples = true;
                     return Ok(None);
                 }
@@ -532,6 +539,25 @@ impl ArrowDecoder {
     }
 }
 
+#[cold]
+fn exemplar_timestamp_overflow(timestamp: &prost_types::Timestamp) -> DecodeError {
+    DecodeError::TimestampOverflow {
+        timestamp_ms: timestamp_millis(timestamp),
+    }
+}
+
+/// Checks the labels of a point that is dropped and so not interned.
+#[cold]
+fn check_dropped_labels(
+    labels: &[dto::LabelPair],
+    family: &CurrentFamily,
+) -> Result<(), DecodeError> {
+    for index in 0..labels.len() {
+        check_label_name(index, labels, true, family)?;
+    }
+    Ok(())
+}
+
 /// Rejects label `index` if it is `__name__` (when `reject_metric_name` is set) or if another
 /// label has the same name. Used for labels that are not interned.
 #[cold]
@@ -570,7 +596,11 @@ fn push_proto_exemplar(
 ) -> Result<(), DecodeError> {
     let ex_id = exemplars.next_id(table)?;
     let ts_ns = match exemplar.timestamp.as_ref() {
-        Some(timestamp) => ms_to_ns(timestamp_millis(timestamp))?,
+        // Go's `UnixMilli` wraps on overflow; the decoder rejects it like a sample timestamp.
+        Some(timestamp) => match checked_timestamp_millis(timestamp) {
+            Some(ms) => ms_to_ns(ms)?,
+            None => return Err(exemplar_timestamp_overflow(timestamp)),
+        },
         None => default_ts_ns.unwrap_or(0),
     };
     let mut span_id = None;
@@ -580,7 +610,8 @@ fn push_proto_exemplar(
     let mut sorted_by_key_id = true;
     for (index, label) in exemplar.label.iter().enumerate() {
         if label.value.is_empty() {
-            check_label_name(index, &exemplar.label, true, family)?;
+            // Exemplar labels may be named `__name__`, as the interned ones below.
+            check_label_name(index, &exemplar.label, false, family)?;
             continue;
         }
         let parsed = match label.name.as_str() {

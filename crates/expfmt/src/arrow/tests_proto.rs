@@ -1155,3 +1155,384 @@ fn protobuf_scratch_is_reused_across_scrapes() {
     }
     assert_eq!(dec.retained_memory_bytes(), retained);
 }
+
+/// Exponential histograms with labels `s` = `{prefix}{i}` for `i` in `0..series`, at the scrape
+/// timestamp.
+fn exponential_series(prefix: &str, series: usize) -> Vec<u8> {
+    let metric = (0..series)
+        .map(|i| {
+            let value = format!("{prefix}{i}");
+            let mut metric =
+                histogram_metric(&[("s", &value)], native(0, vec![span(0, 1)], vec![2]));
+            metric.timestamp_ms = 0;
+            metric
+        })
+        .collect();
+    encode(&[family("h", "", dto::MetricType::Histogram, metric)])
+}
+
+#[test]
+fn target_flushes_write_exponential_stale_points() {
+    let opts = DecodeOptions::default().with_timestamp_ms(1_700_000_000_000);
+    let mut decoder = ArrowDecoder::new();
+    let mut tracker = StalenessTracker::new();
+    decoder
+        .decode_with_staleness(
+            &tracked_families(&["1", "2"]),
+            &Format::PROTO_DELIM,
+            &opts,
+            &mut tracker,
+        )
+        .unwrap();
+    assert_eq!(tracker.active_series_len(), 8);
+
+    // A dropped stream rolls back, so the flush below still sees every series.
+    let chunk_opts = opts.with_max_data_points_per_batch(1);
+    {
+        let mut partial = decoder.flush_target_stale_stream(&mut tracker, &chunk_opts);
+        assert_eq!(partial.next().unwrap().unwrap().num_data_points(), 1);
+    }
+    assert_eq!(tracker.active_series_len(), 8);
+
+    let mut stale = [0; 4];
+    for chunk in decoder.flush_target_stale_stream(&mut tracker, &chunk_opts) {
+        let counts = stale_counts(&chunk.unwrap());
+        stale.iter_mut().zip(counts).for_each(|(s, c)| *s += c);
+    }
+    assert_eq!(stale, [2; 4]);
+    assert!(tracker.is_empty());
+
+    decoder
+        .decode_with_staleness(
+            &tracked_families(&["1", "2"]),
+            &Format::PROTO_DELIM,
+            &opts,
+            &mut tracker,
+        )
+        .unwrap();
+    let flushed = decoder.flush_target_stale(&mut tracker, &opts).unwrap();
+    assert_eq!(stale_counts(&flushed), [2; 4]);
+    assert_eq!(metric_types(&flushed), [1, 5, 4, 3]);
+    let exponential = flushed.exp_histogram_data_points().unwrap();
+    assert_eq!(u64s(exponential, "count"), [0, 0]);
+    let sums = exponential.column_by_name("sum").unwrap();
+    assert_eq!(sums.null_count(), 2);
+    assert!(tracker.is_empty());
+}
+
+#[test]
+fn failed_and_dropped_scrapes_roll_back_the_tracker() {
+    let opts = DecodeOptions::default().with_timestamp_ms(1_700_000_000_000);
+    let mut decoder = ArrowDecoder::new();
+    let mut tracker = StalenessTracker::new();
+    decoder
+        .decode_with_staleness(
+            &tracked_families(&["1"]),
+            &Format::PROTO_DELIM,
+            &opts,
+            &mut tracker,
+        )
+        .unwrap();
+
+    // Series 2 of every kind is recorded before the invalid histogram fails the scrape.
+    let mut failing = tracked_families(&["2"]);
+    failing.extend(encode(&[family(
+        "bad",
+        "",
+        dto::MetricType::Histogram,
+        vec![histogram_metric(&[], native(9, vec![], vec![]))],
+    )]));
+    let err = decoder
+        .decode_with_staleness(&failing, &Format::PROTO_DELIM, &opts, &mut tracker)
+        .unwrap_err();
+    assert!(
+        matches!(err, DecodeError::InvalidHistogram { .. }),
+        "{err:?}"
+    );
+    assert_eq!(tracker.active_series_len(), 4);
+
+    // A stream dropped after its first chunk rolls back too.
+    let chunk_opts = opts.with_max_data_points_per_batch(1);
+    let third = tracked_families(&["3"]);
+    {
+        let mut partial = decoder.decode_stream_with_staleness(
+            &third,
+            &Format::PROTO_DELIM,
+            &chunk_opts,
+            &mut tracker,
+        );
+        partial.next().unwrap().unwrap();
+    }
+    assert_eq!(tracker.active_series_len(), 4);
+
+    // Neither series 2 nor series 3 was committed, so only series 1 is live and none is stale.
+    let records = decoder
+        .decode_with_staleness(
+            &tracked_families(&["1"]),
+            &Format::PROTO_DELIM,
+            &opts,
+            &mut tracker,
+        )
+        .unwrap();
+    assert_eq!(stale_counts(&records), [0; 4]);
+    assert_eq!(records.num_data_points(), 4);
+}
+
+#[test]
+fn churned_exponential_series_are_compacted() {
+    let opts = DecodeOptions::default().with_timestamp_ms(1_700_000_000_000);
+    let mut decoder = ArrowDecoder::new();
+    let mut tracker = StalenessTracker::new();
+    let mut scrape = |input: &[u8], tracker: &mut StalenessTracker| {
+        decoder
+            .decode_with_staleness(input, &Format::PROTO_DELIM, &opts, tracker)
+            .unwrap()
+    };
+
+    scrape(&exponential_series("a", 40), &mut tracker);
+    let retained = tracker.retained_memory_bytes();
+    // 40 deactivated series pass the compaction threshold of 32.
+    let rotated = scrape(&exponential_series("b", 40), &mut tracker);
+    assert_eq!(stale_counts(&rotated), [0, 0, 0, 40]);
+    assert_eq!(tracker.active_series_len(), 40);
+    // Without compaction the tracker would hold 80 series.
+    assert!(tracker.retained_memory_bytes() <= retained);
+
+    // The compacted series keep their kind: they come back as exponential stale points.
+    assert_eq!(
+        stale_counts(&scrape(&exponential_series("b", 40), &mut tracker)),
+        [0; 4]
+    );
+    let flushed = decoder.flush_target_stale(&mut tracker, &opts).unwrap();
+    assert_eq!(stale_counts(&flushed), [0, 0, 0, 40]);
+    assert_eq!(metric_types(&flushed), [4]);
+}
+
+#[test]
+fn split_families_keep_one_row_per_kind_for_stale_points() {
+    let opts = DecodeOptions::default().with_timestamp_ms(1_700_000_000_000);
+    let mut decoder = ArrowDecoder::new();
+    let mut tracker = StalenessTracker::new();
+    let stamped = |mut metric: dto::Metric| {
+        metric.timestamp_ms = 0;
+        metric
+    };
+    let exponential = |value: &str| {
+        stamped(histogram_metric(
+            &[("s", value)],
+            native(0, vec![span(0, 1)], vec![2]),
+        ))
+    };
+    let classic = |value: &str| stamped(classic_histogram(&[("s", value)], &[(1.0, 2)], 2, 1.0));
+
+    decoder
+        .decode_with_staleness(
+            &encode(&[family(
+                "h",
+                "",
+                dto::MetricType::Histogram,
+                vec![exponential("1"), classic("2")],
+            )]),
+            &Format::PROTO_DELIM,
+            &opts,
+            &mut tracker,
+        )
+        .unwrap();
+
+    // `h` comes in two messages. The second one has no exponential row, which must not make
+    // the stale point of series 1 open a second exponential row.
+    let records = decoder
+        .decode_with_staleness(
+            &encode(&[
+                family("h", "", dto::MetricType::Histogram, vec![exponential("3")]),
+                family("h", "", dto::MetricType::Histogram, vec![classic("2")]),
+            ]),
+            &Format::PROTO_DELIM,
+            &opts,
+            &mut tracker,
+        )
+        .unwrap();
+    assert_eq!(metric_types(&records), [4, 3]);
+    assert_eq!(flags(records.exp_histogram_data_points().unwrap()), [0, 1]);
+}
+
+#[test]
+fn chunked_stream_splits_rows_past_the_u16_metric_limit() {
+    // Each family has an exponential and an explicit-bucket row, so 32,769 families need
+    // 65,538 rows, two more than one batch holds.
+    let families = MAX_METRICS_PER_BATCH / 2 + 1;
+    let messages: Vec<_> = (0..families)
+        .map(|i| {
+            let mut metrics = Vec::with_capacity(2);
+            for metric in [
+                histogram_metric(&[], native(0, vec![span(0, 1)], vec![2])),
+                classic_histogram(&[], &[(1.0, 2)], 2, 1.0),
+            ] {
+                let mut metric = metric;
+                metric.timestamp_ms = 0;
+                metrics.push(metric);
+            }
+            family(&format!("h_{i}"), "", dto::MetricType::Histogram, metrics)
+        })
+        .collect();
+    let input = encode(&messages);
+    let opts = DecodeOptions::default()
+        .with_timestamp_ms(1_700_000_000_000)
+        .with_max_data_points_per_batch(1_000_000);
+    let mut decoder = ArrowDecoder::new();
+    let mut tracker = StalenessTracker::new();
+
+    let chunks: Vec<_> = decoder
+        .decode_stream_with_staleness(&input, &Format::PROTO_DELIM, &opts, &mut tracker)
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].num_metrics(), MAX_METRICS_PER_BATCH);
+    // The point that did not fit is replayed into the next batch, not lost.
+    assert_eq!(chunks[1].num_metrics(), 2);
+    assert_eq!(
+        chunks.iter().map(|c| c.num_data_points()).sum::<usize>(),
+        2 * families
+    );
+    assert_eq!(tracker.active_series_len(), 2 * families);
+
+    let stale: Vec<_> = decoder
+        .decode_stream_with_staleness(&encode(&[]), &Format::PROTO_DELIM, &opts, &mut tracker)
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(stale.len(), 2);
+    let mut counts = [0; 4];
+    for chunk in &stale {
+        counts
+            .iter_mut()
+            .zip(stale_counts(chunk))
+            .for_each(|(s, c)| *s += c);
+    }
+    assert_eq!(counts, [0, 0, families, families]);
+    assert!(tracker.is_empty());
+}
+
+#[test]
+fn exemplar_and_start_timestamps_out_of_range() {
+    let mut metric = counter(&[], 1.0, 0);
+    metric.counter.as_mut().unwrap().exemplar = Some(dto::Exemplar {
+        label: vec![],
+        value: 1.0,
+        timestamp: Some(prost_types::Timestamp {
+            seconds: i64::MAX / 100,
+            nanos: 0,
+        }),
+    });
+    let input = encode(&[family(
+        "c_total",
+        "",
+        dto::MetricType::Counter,
+        vec![metric],
+    )]);
+    let err = decode(&input, &DecodeOptions::default()).unwrap_err();
+    assert!(
+        matches!(err, DecodeError::TimestampOverflow { .. }),
+        "{err:?}"
+    );
+
+    // A start timestamp out of range is unset, like an out-of-range created timestamp.
+    let mut metric = counter(&[], 1.0, 0);
+    metric.counter.as_mut().unwrap().start_timestamp = Some(prost_types::Timestamp {
+        seconds: i64::MAX / 100,
+        nanos: 0,
+    });
+    let input = encode(&[family(
+        "c_total",
+        "",
+        dto::MetricType::Counter,
+        vec![metric],
+    )]);
+    let records = decode(&input, &DecodeOptions::default().with_timestamp_ms(1_000)).unwrap();
+    let numbers = records.number_data_points().unwrap();
+    assert!(
+        numbers
+            .column_by_name("start_time_unix_nano")
+            .is_none_or(|column| column.is_null(0))
+    );
+}
+
+#[test]
+fn exemplar_label_named_metric_name_with_empty_value_is_dropped() {
+    let mut metric = counter(&[], 1.0, 0);
+    metric.counter.as_mut().unwrap().exemplar = Some(dto::Exemplar {
+        label: labels(&[("__name__", ""), ("user", "a")]),
+        value: 1.0,
+        timestamp: Some(timestamp(1_000)),
+    });
+    let input = encode(&[family(
+        "c_total",
+        "",
+        dto::MetricType::Counter,
+        vec![metric],
+    )]);
+    let records = decode(&input, &DecodeOptions::default()).unwrap();
+    assert_eq!(
+        strings(records.number_dp_exemplar_attrs().unwrap(), "key"),
+        ["user"]
+    );
+}
+
+#[test]
+fn dropped_float_exponential_histograms_check_labels() {
+    let mut metric = histogram_metric(
+        &[("a", "1"), ("a", "2")],
+        dto::Histogram {
+            sample_count_float: 1.0,
+            schema: 0,
+            positive_span: vec![span(0, 1)],
+            positive_count: vec![1.0],
+            ..dto::Histogram::default()
+        },
+    );
+    metric.timestamp_ms = 0;
+    let input = encode(&[family("h", "", dto::MetricType::Histogram, vec![metric])]);
+    let err = decode(&input, &DecodeOptions::default()).unwrap_err();
+    assert!(matches!(err, DecodeError::DuplicateLabel { .. }), "{err:?}");
+}
+
+#[test]
+fn a_smaller_scrape_keeps_the_larger_scratch() {
+    let large = tracked_families(&["1", "2", "3", "4", "5", "6", "7", "8"]);
+    let small = tracked_families(&["1"]);
+    let opts = DecodeOptions::default();
+    let mut decoder = ArrowDecoder::new();
+    decoder.decode(&large, &Format::PROTO_DELIM, &opts).unwrap();
+    let retained = decoder.proto.retained_memory_bytes();
+    decoder.decode(&small, &Format::PROTO_DELIM, &opts).unwrap();
+    assert_eq!(decoder.proto.retained_memory_bytes(), retained);
+    // The decoded metrics of the last message are not kept between scrapes.
+    assert!(decoder.proto.state.family_is_empty());
+}
+
+#[test]
+fn classic_histograms_may_have_a_negative_infinity_bucket() {
+    // Go's NHCB conversion keeps a `-Inf` bucket as the first custom bound, and its
+    // `checkHistogramCustomBounds` accepts it.
+    let input = encode(&[family(
+        "h",
+        "",
+        dto::MetricType::Histogram,
+        vec![classic_histogram(
+            &[],
+            &[(f64::NEG_INFINITY, 0), (1.0, 2)],
+            2,
+            1.0,
+        )],
+    )]);
+    let records = decode(&input, &DecodeOptions::default()).unwrap();
+    let points = records.histogram_data_points().unwrap();
+    let bounds = points
+        .column_by_name("explicit_bounds")
+        .unwrap()
+        .as_list::<i32>()
+        .value(0);
+    assert_eq!(
+        bounds.as_primitive::<Float64Type>().values().to_vec(),
+        [f64::NEG_INFINITY, 1.0]
+    );
+}

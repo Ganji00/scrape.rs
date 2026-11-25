@@ -1348,7 +1348,8 @@ impl ExpBucketsCol {
 pub(super) struct ExpHistogramDpTable {
     pub(super) base: DpBaseCols,
     pub(super) counts: Vec<u64>,
-    pub(super) sums: Vec<f64>,
+    /// Null for stale data points, like the classic histogram `sum`.
+    pub(super) sums: OptionalValueCol<f64>,
     pub(super) scales: Vec<i32>,
     pub(super) zero_counts: Vec<u64>,
     pub(super) zero_thresholds: Vec<f64>,
@@ -1359,12 +1360,12 @@ pub(super) struct ExpHistogramDpTable {
 }
 
 impl ExpHistogramDpTable {
-    /// Appends the value columns of a stale data point: zero counts, sum, scale, and zero
-    /// threshold, and empty buckets. The caller appends the base columns with the
+    /// Appends the value columns of a stale data point: zero counts, scale, and zero threshold,
+    /// a null sum, and empty buckets. The caller appends the base columns with the
     /// no-recorded-value flag.
     pub(super) fn push_stale_values(&mut self) {
+        self.sums.push_null(self.counts.len());
         self.counts.push(0);
-        self.sums.push(0.0);
         self.scales.push(0);
         self.zero_counts.push(0);
         self.zero_thresholds.push(0.0);
@@ -1388,7 +1389,7 @@ impl ExpHistogramDpTable {
     pub(super) fn retained_memory_bytes(&self) -> usize {
         self.base.retained_memory_bytes()
             + self.counts.capacity() * size_of::<u64>()
-            + self.sums.capacity() * size_of::<f64>()
+            + self.sums.retained_memory_bytes()
             + self.scales.capacity() * size_of::<i32>()
             + self.zero_counts.capacity() * size_of::<u64>()
             + self.zero_thresholds.capacity() * size_of::<f64>()
@@ -1417,6 +1418,7 @@ impl ExpHistogramDpTable {
             start_time_nullable,
             has_time,
             time_nullable,
+            self.sums.is_nullable(),
             has_negative,
             self.base.has_flags(),
         );
@@ -1427,10 +1429,7 @@ impl ExpHistogramDpTable {
             scalar_from_slice(&self.counts),
             None,
         )));
-        cols.push(Arc::new(Float64Array::new(
-            scalar_from_slice(&self.sums),
-            None,
-        )));
+        cols.push(self.sums.to_f64_array());
         cols.push(Arc::new(Int32Array::new(
             scalar_from_slice(&self.scales),
             None,

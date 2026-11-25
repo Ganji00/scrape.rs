@@ -142,7 +142,7 @@ impl ActiveParserState {
                 }
             }
             #[cfg(feature = "dto")]
-            Self::Protobuf(state) => decoder.proto.state = state,
+            Self::Protobuf(state) => decoder.proto.keep_state(state),
             Self::Invalid => {}
         }
     }
@@ -323,7 +323,7 @@ impl<'input> ActiveParser<'input> {
             #[cfg(feature = "dto")]
             Self::Protobuf(p) => {
                 let parser = std::mem::replace(p, ProtobufParser::new(b""));
-                decoder.proto.state = parser.into_state();
+                decoder.proto.keep_state(parser.into_state());
             }
             Self::Invalid => {}
         }

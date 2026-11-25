@@ -498,12 +498,14 @@ pub(super) fn exp_histogram_buckets_fields() -> Fields {
     EXP_HISTOGRAM_BUCKETS_FIELDS.clone()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_exp_histogram_dp_schema(
     has_id: bool,
     has_start_time: bool,
     start_time_nullable: bool,
     has_time: bool,
     time_nullable: bool,
+    sum_nullable: bool,
     has_negative: bool,
     has_flags: bool,
 ) -> SchemaRef {
@@ -528,7 +530,7 @@ fn build_exp_histogram_dp_schema(
         ));
     }
     fields.push(Field::new("count", DataType::UInt64, false));
-    fields.push(Field::new("sum", DataType::Float64, false));
+    fields.push(Field::new("sum", DataType::Float64, sum_nullable));
     fields.push(Field::new("scale", DataType::Int32, false));
     fields.push(Field::new("zero_count", DataType::UInt64, false));
     fields.push(Field::new("zero_threshold", DataType::Float64, false));
@@ -550,7 +552,7 @@ fn build_exp_histogram_dp_schema(
     Arc::new(Schema::new(fields))
 }
 
-static EXP_HISTOGRAM_DP_SCHEMAS: LazyLock<[SchemaRef; 128]> = LazyLock::new(|| {
+static EXP_HISTOGRAM_DP_SCHEMAS: LazyLock<[SchemaRef; 256]> = LazyLock::new(|| {
     std::array::from_fn(|mask| {
         build_exp_histogram_dp_schema(
             (mask & 1) != 0,
@@ -560,20 +562,24 @@ static EXP_HISTOGRAM_DP_SCHEMAS: LazyLock<[SchemaRef; 128]> = LazyLock::new(|| {
             (mask & 16) != 0,
             (mask & 32) != 0,
             (mask & 64) != 0,
+            (mask & 128) != 0,
         )
     })
 });
 
-/// Returns the adaptive `ExpHistogramDataPoints` schema. `negative` is left out when no data
-/// point in the batch has negative buckets, `flags` when none is flagged. `min` and `max` are
-/// never emitted, because Prometheus native histograms do not track them.
+/// Returns the adaptive `ExpHistogramDataPoints` schema. `sum` is nullable when a stale data
+/// point in the batch has no sum, `negative` is left out when no data point in the batch has
+/// negative buckets, `flags` when none is flagged. `min` and `max` are never emitted, because
+/// Prometheus native histograms do not track them.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn exp_histogram_dp_schema(
     has_id: bool,
     has_start_time: bool,
     start_time_nullable: bool,
     has_time: bool,
     time_nullable: bool,
+    sum_nullable: bool,
     has_negative: bool,
     has_flags: bool,
 ) -> SchemaRef {
@@ -582,8 +588,9 @@ pub(super) fn exp_histogram_dp_schema(
         | (usize::from(start_time_nullable) << 2)
         | (usize::from(has_time) << 3)
         | (usize::from(time_nullable) << 4)
-        | (usize::from(has_negative) << 5)
-        | (usize::from(has_flags) << 6);
+        | (usize::from(sum_nullable) << 5)
+        | (usize::from(has_negative) << 6)
+        | (usize::from(has_flags) << 7);
     Arc::clone(&EXP_HISTOGRAM_DP_SCHEMAS[mask])
 }
 

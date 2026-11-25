@@ -218,6 +218,7 @@ impl CurrentFamily {
     }
 
     /// Same as [`CurrentFamily::emit_into_batch`] for the row of exponential histogram points.
+    #[cfg(feature = "dto")]
     #[inline]
     pub(super) fn emit_exp_histogram_into_batch(
         &mut self,

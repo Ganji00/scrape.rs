@@ -34,7 +34,7 @@ pub(crate) use promparse::{ByteSpan, LabelSpan, PromParserState, unescape_bytes_
 #[cfg(feature = "dto")]
 pub use protobufparse::ProtobufParser;
 #[cfg(feature = "dto")]
-pub(crate) use protobufparse::{ProtobufParserState, timestamp_millis};
+pub(crate) use protobufparse::{ProtobufParserState, checked_timestamp_millis, timestamp_millis};
 
 /// Label name under which [`Parser::labels`] stores the metric name.
 pub const METRIC_NAME_LABEL: &str = "__name__";

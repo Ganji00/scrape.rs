@@ -69,7 +69,8 @@ pub struct ProtobufParser<'a> {
     /// `(upper_bound, cumulative_count)` of the classic buckets during NHCB conversion.
     nhcb_buckets: Vec<(f64, f64)>,
     /// Skips sorting labels and building `entry_bytes` for each series, for callers that only
-    /// read the decoded protobuf through the `pub(crate)` accessors.
+    /// read the decoded protobuf through the `pub(crate)` accessors. Such callers read a whole
+    /// summary from its first series, so the `_sum` and quantile series are skipped too.
     skip_entry_bytes: bool,
 }
 
@@ -125,7 +126,19 @@ impl ProtobufParserState {
         self.skip_entry_bytes = skip_entry_bytes;
     }
 
-    /// Heap capacity of the scratch buffers, without the nested buffers of decoded metrics.
+    /// Drops the decoded metrics and keeps the capacity of the metric list, so the nested
+    /// buffers of the last message are not held between scrapes.
+    pub(crate) fn release_decoded(&mut self) {
+        self.family.clear();
+    }
+
+    #[cfg(all(test, feature = "arrow"))]
+    pub(crate) fn family_is_empty(&self) -> bool {
+        self.family.metric.is_empty()
+    }
+
+    /// Heap capacity of the scratch buffers, without the nested buffers of decoded metrics,
+    /// which [`Self::release_decoded`] frees.
     pub(crate) fn retained_memory_bytes(&self) -> usize {
         fn histogram_bytes<C, B>(h: &Histogram<C, B>) -> usize {
             (h.positive_spans.capacity() + h.negative_spans.capacity()) * size_of::<Span>()
@@ -233,11 +246,6 @@ impl<'a> ProtobufParser<'a> {
     /// The entry the last `next_entry` call returned.
     pub(crate) fn current_entry(&self) -> Option<Entry> {
         self.state
-    }
-
-    /// Whether the current series is the `_count` series, the first series of a summary metric.
-    pub(crate) fn is_summary_start(&self) -> bool {
-        self.kind() == dto::MetricType::Summary && self.field_pos == -2
     }
 
     /// The next exemplar of the current histogram, without copying its labels. Same exemplars
@@ -381,7 +389,11 @@ impl<'a> ProtobufParser<'a> {
         }
         self.update_magic_label();
 
-        if !self.skip_entry_bytes {
+        if self.skip_entry_bytes {
+            if self.kind() == dto::MetricType::Summary {
+                self.fields_done = true;
+            }
+        } else {
             self.update_entry_bytes();
         }
 
@@ -684,20 +696,24 @@ impl<'a> Parser<'a> for ProtobufParser<'a> {
     }
 
     fn start_timestamp(&mut self) -> Option<i64> {
+        self.start_timestamp_proto().map(timestamp_millis)
+    }
+}
+
+impl ProtobufParser<'_> {
+    /// The start timestamp of the current counter, summary or histogram as sent.
+    pub(crate) fn start_timestamp_proto(&self) -> Option<&prost_types::Timestamp> {
         let metric = self.metric();
-        let start = match self.kind() {
+        match self.kind() {
             dto::MetricType::Counter => metric.counter.as_ref()?.start_timestamp.as_ref(),
             dto::MetricType::Summary => metric.summary.as_ref()?.start_timestamp.as_ref(),
             dto::MetricType::Histogram | dto::MetricType::GaugeHistogram => {
                 self.dto_histogram().start_timestamp.as_ref()
             }
             _ => None,
-        };
-        start.map(timestamp_millis)
+        }
     }
-}
 
-impl ProtobufParser<'_> {
     /// The native histogram branch of Go's `Exemplar`, which advances `exemplar_pos` or
     /// `field_pos`.
     fn histogram_exemplar(&mut self) -> Option<&dto::Exemplar> {
@@ -743,6 +759,15 @@ pub(crate) fn timestamp_millis(timestamp: &prost_types::Timestamp) -> i64 {
         .seconds
         .wrapping_mul(1000)
         .wrapping_add(i64::from(timestamp.nanos / 1_000_000))
+}
+
+/// [`timestamp_millis`] without the wrap-around of Go's `UnixMilli`: `None` if the timestamp
+/// does not fit in an `i64` of milliseconds.
+pub(crate) fn checked_timestamp_millis(timestamp: &prost_types::Timestamp) -> Option<i64> {
+    timestamp
+        .seconds
+        .checked_mul(1000)?
+        .checked_add(i64::from(timestamp.nanos / 1_000_000))
 }
 
 /// Go's `checkProtoSpanBucketConsistency`, which keeps malformed spans out of compaction.
