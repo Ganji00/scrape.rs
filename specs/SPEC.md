@@ -137,7 +137,7 @@ scrape bytes
 With the `dto` feature (on by default), `ArrowDecoder` decodes delimited protobuf (`FormatType::ProtoDelim`). It produces the same OTAP tables as text input and supports the same `decode`, `decode_stream`, `DecodeBudget`, `DecodeCursor`, and `StalenessTracker` APIs.
 
 - The protobuf parser decodes one `MetricFamily` message at a time, so the protobuf entry loop reads the decoded message instead of byte spans. It shares the interners, batching, `max_data_points_per_batch`, and budget rules with the text loop. Its parser state, including histogram scratch and the capacity of the decoded message, is reused across scrapes. The decoder keeps the larger of the old and the finished parser state, like the text loop's scratch, and drops the metrics of the last message when a scrape ends.
-- The parser returns one series entry per summary, so a summary counts as one entry against `DecodeBudget::max_entries`.
+- The parser returns one series entry per summary, so a summary counts as one entry against `DecodeBudget::max_entries`. An empty message, which Go skips, also counts as one entry.
 - Every message starts a new metric row, even when it repeats the name of the message before it. Go accepts split families, so the protobuf loop never returns the text loop's duplicate or late metadata errors.
 - Counters, gauges, and untyped metrics map like text. A counter exemplar goes to `NumberDpExemplars`.
 - Labels are checked like text, also for points that are dropped. Exemplar labels may be named `__name__`.
@@ -147,9 +147,9 @@ With the `dto` feature (on by default), `ArrowDecoder` decodes delimited protobu
   - A stale NaN value, summary sum or quantile, or histogram sum sets `FLAG_NO_RECORDED_VALUE` and clears the values: a null `double_value`, zero summary count and sum with no quantiles, and zero histogram count with a null sum and no buckets for NHCB.
   - With a `StalenessTracker`, every point is recorded by its OTAP table. Exponential points use their own `DpKind`, so an NHCB point and an exponential point with the same labels are two series.
   - A disappeared series gets a stale point in its own table. A stale exponential point has zero counts, scale, and zero threshold, a null `sum`, and empty bucket lists. Its metric row is the family's `metric_type = 4` row in the current batch, also when the family is split across messages.
-  - A point with its own timestamp is tracked only with `track_timestamps_staleness`, and a dropped point (an untyped series with `UntypedPolicy::Drop`, or a float exponential histogram) is not tracked.
+  - A point with its own timestamp is tracked only with `track_timestamps_staleness`, and a dropped point (an untyped series with `UntypedPolicy::Drop`, or a float histogram) is not tracked.
 - Histograms follow the [OpenTelemetry Prometheus compatibility spec](https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/compatibility/prometheus_and_openmetrics.md). Classic protobuf histograms are converted to NHCB (#37) by the Layer 0 parser. The Layer 1 decoder then maps each native histogram by schema:
-  - **Custom buckets (schema `-53`, NHCB)** become `HistogramDataPoints` rows. `explicit_bounds` are the custom values, and `bucket_counts` has one dense count per bucket, including `+Inf`, with `0` for buckets the spans skip.
+  - **Integer custom buckets (schema `-53`, NHCB)** become `HistogramDataPoints` rows. `explicit_bounds` are the custom values, and `bucket_counts` has one dense count per bucket, including `+Inf`, with `0` for buckets the spans skip.
   - **Exponential integer histograms (schema `-4` to `8`)** become `ExpHistogramDataPoints` rows (`metric_type = 4`, cumulative `aggregation_temporality`):
     - `scale` is the schema. `zero_count`, `zero_threshold`, `sum`, and the start time are copied.
     - The sparse spans of each side become one dense `positive` or `negative` list. Its `offset` is the first bucket index minus one.
@@ -157,7 +157,7 @@ With the `dto` feature (on by default), `ArrowDecoder` decodes delimited protobu
     - Buckets whose bounds fall outside the float64 range are dropped and not counted. These are the `±Inf` overflow bucket above index `1024 << schema` and the buckets below the smallest subnormal. `count` is `zero_count` plus the kept buckets.
     - If a side's dense list would be wider than 160 buckets (the OpenTelemetry SDK's default `MaxSize`) and wider than 8 times its sparse bucket count, `scale` is lowered and adjacent buckets are merged until both sides fit, like Prometheus's `native_histogram_bucket_limit`. This keeps a few sparse buckets far apart from allocating a list of up to about 2^19 buckets.
     - A stale NaN sum sets `flags` to `FLAG_NO_RECORDED_VALUE`, with the same values as a disappeared series: zero counts, scale, and zero threshold, a null `sum` (`sum` is nullable only in batches with such a point), and empty bucket lists.
-  - **Exponential float histograms** are dropped, because OTLP exponential histogram counts are integers. They and their labels are still validated first, so an invalid one fails the scrape like in Go.
+  - **Float histograms**, exponential or NHCB, are dropped, as the spec requires for the float flavor. A classic histogram with float counts converts to a float NHCB, so it is dropped too. They and their labels are still validated first, so an invalid one fails the scrape like in Go.
   - **Any other schema** is an error.
 - Every native histogram is checked like Go's [`Histogram.Validate`](https://github.com/prometheus/prometheus/blob/v0.315.1/model/histogram/histogram.go#L426) and `FloatHistogram.Validate`. Prometheus runs `Validate` when it appends a scraped histogram, and an invalid histogram fails the scrape. A failed check returns `DecodeError::InvalidHistogram`. The checks cover:
   - Span offsets and lengths.
@@ -167,7 +167,7 @@ With the `dto` feature (on by default), `ArrowDecoder` decodes delimited protobu
 - A bucket list that outgrows the OTAP `i32` list offsets returns `DecodeError::CapacityOverflow`, not `InvalidHistogram`.
 - A family whose messages mix NHCB and exponential points gets two metric rows with the same name and metadata, one `metric_type = 3` and one `metric_type = 4`.
 - `gaugehistogram` families keep the Prometheus type in metric metadata like text input, and exponential gauge histograms use cumulative temporality.
-- Native histogram exemplars go to `HistogramDpExemplars` or `ExpHistogramDpExemplars`. As in Go's `ProtobufParser`, exemplars without timestamps are skipped when a histogram has native buckets. `span_id` and `trace_id` exemplar labels move into their OTAP columns.
+- Histogram exemplars go to `HistogramDpExemplars` or `ExpHistogramDpExemplars`. Exemplars without timestamps are skipped for every protobuf histogram: Go's `ProtobufParser` skips them for native histograms, and classic histograms are converted to NHCB. `span_id` and `trace_id` exemplar labels move into their OTAP columns.
 
 Known gaps:
 - Layer 0 always prefers native buckets when a histogram has both native and classic buckets. Go's `IgnoreNativeHistograms` scrape option is not wired in yet.

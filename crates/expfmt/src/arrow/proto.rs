@@ -26,13 +26,13 @@ use std::time::Instant;
 
 use crate::dto;
 use crate::parse::{Entry, HistogramRef, MetricType, Parser, ProtobufParser, ProtobufParserState};
-use crate::parse::{METRIC_NAME_LABEL, checked_timestamp_millis, timestamp_millis};
+use crate::parse::{METRIC_NAME_LABEL, checked_timestamp_millis};
 
 use super::columns::{ExemplarTable, ms_to_ns, parse_hex_array};
 use super::family::CurrentFamily;
 use super::intern::StringInterner;
 use super::native::{
-    CUSTOM_BUCKETS_SCHEMA, EXPONENTIAL_SCHEMAS, NativeView, check_float_exponential,
+    CUSTOM_BUCKETS_SCHEMA, EXPONENTIAL_SCHEMAS, NativeView, check_float_histogram,
     invalid_histogram, push_custom_buckets, push_exponential,
 };
 use super::staleness::{DATA_POINT_FLAG_NO_RECORDED_VALUE, DpKind, StalenessTracker, is_stale_nan};
@@ -67,7 +67,7 @@ impl ProtoScratch {
 }
 
 /// Whether the current histogram becomes an exponential point, so it needs the family's
-/// exponential histogram row. Float exponential histograms are dropped and need no row.
+/// exponential histogram row. Float histograms are dropped and need no row.
 #[inline]
 fn is_exponential(parser: &ProtobufParser<'_>) -> bool {
     match parser.histogram().2 {
@@ -391,7 +391,7 @@ impl ArrowDecoder {
 
     /// Appends a native histogram: custom buckets (NHCB, which classic protobuf histograms are
     /// converted to) as an explicit-bucket point, exponential schemas as an exponential point.
-    /// Float exponential histograms are dropped, per the OpenTelemetry compatibility spec.
+    /// Float histograms are dropped, per the OpenTelemetry compatibility spec.
     fn append_proto_histogram(
         &mut self,
         parser: &mut ProtobufParser<'_>,
@@ -405,17 +405,7 @@ impl ArrowDecoder {
             NativeView::new(histogram).map_err(|r| invalid_histogram(&self.current_family, r))?;
         let exponential = match view.schema {
             CUSTOM_BUCKETS_SCHEMA => false,
-            schema if EXPONENTIAL_SCHEMAS.contains(&schema) => {
-                if view.is_float {
-                    check_float_exponential(&view)
-                        .map_err(|r| invalid_histogram(&self.current_family, r))?;
-                    // Labels are still checked, like for points of dropped untyped families.
-                    check_dropped_labels(&metric.label, &self.current_family)?;
-                    self.current_family.has_samples = true;
-                    return Ok(None);
-                }
-                true
-            }
+            schema if EXPONENTIAL_SCHEMAS.contains(&schema) => true,
             schema => {
                 return Err(invalid_histogram(
                     &self.current_family,
@@ -428,6 +418,13 @@ impl ArrowDecoder {
                 ));
             }
         };
+        if view.is_float {
+            check_float_histogram(&view).map_err(|r| invalid_histogram(&self.current_family, r))?;
+            // Labels are still checked, like for points of dropped untyped families.
+            check_dropped_labels(&metric.label, &self.current_family)?;
+            self.current_family.has_samples = true;
+            return Ok(None);
+        }
 
         let (table, dp_index) = if exponential {
             ("ExpHistogramDataPoints", self.exp_hist_dp.base.len())
@@ -539,10 +536,14 @@ impl ArrowDecoder {
     }
 }
 
+/// Saturates instead of wrapping like Go's `UnixMilli`, so the error keeps the overflow's sign.
 #[cold]
 fn exemplar_timestamp_overflow(timestamp: &prost_types::Timestamp) -> DecodeError {
     DecodeError::TimestampOverflow {
-        timestamp_ms: timestamp_millis(timestamp),
+        timestamp_ms: timestamp
+            .seconds
+            .saturating_mul(1_000)
+            .saturating_add(i64::from(timestamp.nanos / 1_000_000)),
     }
 }
 

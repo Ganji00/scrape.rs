@@ -157,6 +157,7 @@ fn payload() -> Vec<u8> {
     });
 
     let mut summary = family("rpc_seconds", "RPC quantiles.", dto::MetricType::Summary);
+    summary.unit = "seconds".to_owned();
     summary.metric.push(dto::Metric {
         label: labels(&[("service", "auth")]),
         summary: Some(dto::Summary {
@@ -228,6 +229,7 @@ fn payload() -> Vec<u8> {
                 dto::Bucket {
                     upper_bound: 0.1,
                     cumulative_count: 1,
+                    exemplar: Some(trace_exemplar(0.05, TS_MS - 200)),
                     ..dto::Bucket::default()
                 },
                 dto::Bucket {
@@ -238,6 +240,11 @@ fn payload() -> Vec<u8> {
                 dto::Bucket {
                     upper_bound: 10.0,
                     cumulative_count: 2,
+                    // Skipped, like every protobuf histogram exemplar without a timestamp.
+                    exemplar: Some(dto::Exemplar {
+                        timestamp: None,
+                        ..trace_exemplar(5.0, 0)
+                    }),
                     ..dto::Bucket::default()
                 },
             ],
@@ -292,7 +299,7 @@ fn expected() -> OtlpProtoMessage {
         Metric {
             name: "rpc_seconds".to_owned(),
             description: "RPC quantiles.".to_owned(),
-            unit: String::new(),
+            unit: "seconds".to_owned(),
             metadata: vec![kv_str(PROMETHEUS_TYPE_METADATA_KEY, "summary")],
             data: Some(metric::Data::Summary(Summary {
                 data_points: vec![SummaryDataPoint {
@@ -388,7 +395,7 @@ fn expected() -> OtlpProtoMessage {
                     sum: Some(1.5),
                     bucket_counts: vec![1, 0, 1, 1],
                     explicit_bounds: vec![0.1, 1.0, 10.0],
-                    exemplars: Vec::new(),
+                    exemplars: vec![expected_exemplar(0.05, TS_MS as u64 - 200)],
                     flags: 0,
                     min: None,
                     max: None,
@@ -500,12 +507,16 @@ fn protobuf_stale_points_validate_in_otap_and_otlp() {
                 Some(metric::Data::ExponentialHistogram(h)) => {
                     exponential += h.data_points.len();
                     for p in &h.data_points {
-                        assert_eq!((p.count, p.zero_count), (0, 0));
-                        assert!(
-                            p.positive
-                                .as_ref()
-                                .is_none_or(|b| b.bucket_counts.is_empty())
+                        assert_eq!(
+                            (p.count, p.zero_count, p.scale, p.zero_threshold, p.sum),
+                            (0, 0, 0, 0.0, None)
                         );
+                        for side in [&p.positive, &p.negative] {
+                            assert!(
+                                side.as_ref()
+                                    .is_none_or(|b| b.offset == 0 && b.bucket_counts.is_empty())
+                            );
+                        }
                     }
                     h.data_points.iter().map(|p| p.flags).collect()
                 }
@@ -516,7 +527,8 @@ fn protobuf_stale_points_validate_in_otap_and_otlp() {
                 assert_eq!(flag, DATA_POINT_FLAG_NO_RECORDED_VALUE, "{}", m.name);
             }
         }
-        assert!(exponential > 0);
+        // `/a` and `kind="native"`. `/stale` already ended with its input stale marker.
+        assert_eq!(exponential, 2);
     }
 }
 
@@ -538,6 +550,7 @@ fn decodes_go_protobuf_fixtures_into_valid_otap() {
 
     for fixture in [
         "textparse/TestProtobufParseWithNHCB.pb",
+        "nhcb/conversion.pb",
         "expfmt/protobuf",
         "expfmt/protobuf-multimessage",
     ] {
@@ -557,4 +570,23 @@ fn decodes_go_protobuf_fixtures_into_valid_otap() {
             .collect();
         assert_equivalent(&[single], &streamed);
     }
+}
+
+#[test]
+fn go_nhcb_fixture_drops_float_histograms() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata");
+    let input = fs::read(root.join("nhcb/conversion.pb")).unwrap();
+    let decoded = ArrowDecoder::new()
+        .decode(&input, &Format::PROTO_DELIM, &DecodeOptions::new())
+        .unwrap();
+    let OtlpProtoMessage::Metrics(data) = to_otlp(&decoded).0 else {
+        panic!("expected OTLP MetricsData");
+    };
+    let names: Vec<_> = data.resource_metrics[0].scope_metrics[0]
+        .metrics
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect();
+    assert!(names.contains(&"int_empty_runs"), "{names:?}");
+    assert!(names.iter().all(|n| !n.starts_with("float_")), "{names:?}");
 }

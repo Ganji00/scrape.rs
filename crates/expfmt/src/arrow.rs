@@ -457,7 +457,7 @@ impl ArrowDecoder {
     /// the OpenTelemetry Prometheus compatibility spec: exponential schemas become
     /// `ExpHistogramDataPoints`, and custom-bucket histograms, which classic protobuf histograms
     /// are converted to like in Go, become explicit-bucket `HistogramDataPoints`. A family that
-    /// mixes both gets one metric row of each type. Float exponential histograms are dropped. A
+    /// mixes both gets one metric row of each type. Float histograms are dropped. A
     /// native histogram that Go's `Validate` would reject fails the scrape with
     /// [`DecodeError::InvalidHistogram`].
     ///

@@ -70,7 +70,8 @@ pub struct ProtobufParser<'a> {
     nhcb_buckets: Vec<(f64, f64)>,
     /// Skips sorting labels and building `entry_bytes` for each series, for callers that only
     /// read the decoded protobuf through the `pub(crate)` accessors. Such callers read a whole
-    /// summary from its first series, so the `_sum` and quantile series are skipped too.
+    /// summary from its first series, so the `_sum` and quantile series are skipped too. An
+    /// empty `MetricFamily` returns `Entry::Comment`, so such callers can count it.
     skip_entry_bytes: bool,
 }
 
@@ -540,6 +541,11 @@ impl<'a> Parser<'a> for ProtobufParser<'a> {
                         return Ok(None);
                     }
                     if self.state.is_none() {
+                        // Go skips empty metric families. The Arrow decoder gets a comment for
+                        // each instead, so its decode budget counts them.
+                        if self.skip_entry_bytes {
+                            return Ok(Some(Entry::Comment));
+                        }
                         continue;
                     }
                 }
@@ -754,7 +760,7 @@ fn is_native_histogram(histogram: &dto::Histogram) -> bool {
 }
 
 /// Same as Go: seconds and nanoseconds to ms, without validation.
-pub(crate) fn timestamp_millis(timestamp: &prost_types::Timestamp) -> i64 {
+fn timestamp_millis(timestamp: &prost_types::Timestamp) -> i64 {
     timestamp
         .seconds
         .wrapping_mul(1000)

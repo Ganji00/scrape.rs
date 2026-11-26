@@ -73,7 +73,7 @@ pub(super) struct NativeView<'h> {
     /// `true` if the zero count as sent is not 0. A float zero count below 1 or NaN converts
     /// to a `zero_count` of 0, but Go still rejects it on custom buckets.
     pub(super) has_zero_count: bool,
-    /// `true` for a float histogram, which Go does not check against its bucket counts.
+    /// `true` for a float histogram, which is only validated and then dropped.
     pub(super) is_float: bool,
     pub(super) positive_spans: &'h [Span],
     pub(super) positive: Buckets<'h>,
@@ -144,12 +144,9 @@ impl<'h> NativeView<'h> {
         }
     }
 
-    /// Go's count check: the buckets must add up to `count`, or to at most `count` when the
-    /// sum is NaN. Float histograms skip it, like Go, because of float precision.
-    pub(super) fn check_count(&self, bucket_total: u64) -> Result<(), String> {
-        if self.is_float {
-            return Ok(());
-        }
+    /// Go's count check for integer histograms: the buckets must add up to `count`, or to at
+    /// most `count` when the sum is NaN.
+    fn check_count(&self, bucket_total: u64) -> Result<(), String> {
         if self.sum.is_nan() {
             if bucket_total > self.count {
                 return Err(format!(
@@ -257,13 +254,15 @@ pub(super) fn invalid_histogram(family: &CurrentFamily, reason: String) -> Decod
 /// count per bucket including `+Inf`. A stale NaN sum leaves the count zero, the sum null, and
 /// the buckets and bounds empty, like a stale classic histogram from the text loop.
 ///
-/// `dp_index` is the row of the data point, whose base columns the caller appends.
+/// `dp_index` is the row of the data point, whose base columns the caller appends. The caller
+/// drops float histograms.
 pub(super) fn push_custom_buckets(
     dp: &mut HistogramDpTable,
     dp_index: usize,
     histogram: &NativeView<'_>,
     family: &CurrentFamily,
 ) -> Result<(), DecodeError> {
+    debug_assert!(!histogram.is_float);
     check_custom_buckets(histogram).map_err(|reason| invalid_histogram(family, reason))?;
 
     if dp.bucket_offsets.is_empty() {
@@ -271,23 +270,25 @@ pub(super) fn push_custom_buckets(
         dp.bounds_offsets.push(0);
     }
     let bounds = histogram.custom_values;
-    let start = dp.bucket_counts.len();
-    dp.bucket_counts.resize(start + bounds.len() + 1, 0);
-    let counts = &mut dp.bucket_counts[start..];
-    // `check_custom_buckets` keeps every index within `0..=bounds.len()`.
-    walk_buckets(
-        "positive",
-        histogram.positive_spans,
-        histogram.positive,
-        |index, count| counts[index as usize] = count,
-    )
-    .and_then(|total| histogram.check_count(total))
-    .map_err(|reason| invalid_histogram(family, reason))?;
-
+    let (spans, buckets) = (histogram.positive_spans, histogram.positive);
     let stale = is_stale_nan(histogram.sum);
-    if stale {
-        dp.bucket_counts.truncate(start);
+    // A stale point is only checked and writes no buckets.
+    let total = if stale {
+        walk_buckets("positive", spans, buckets, |_, _| {})
     } else {
+        let start = dp.bucket_counts.len();
+        dp.bucket_counts.resize(start + bounds.len() + 1, 0);
+        let counts = &mut dp.bucket_counts[start..];
+        // `check_custom_buckets` keeps every index within `0..=bounds.len()`.
+        walk_buckets("positive", spans, buckets, |index, count| {
+            counts[index as usize] = count;
+        })
+    };
+    total
+        .and_then(|total| histogram.check_count(total))
+        .map_err(|reason| invalid_histogram(family, reason))?;
+
+    if !stale {
         dp.bounds_vals.extend_from_slice(bounds);
     }
     let bucket_off =
@@ -346,12 +347,14 @@ fn exponential_index_range(schema: i32) -> (i64, i64) {
     }
 }
 
-/// Go's `FloatHistogram.Validate` for a float histogram with an exponential schema, which the
-/// caller then drops: no custom bounds, valid spans, and no negative buckets. Like Go, it does
-/// not check the count against the buckets.
-pub(super) fn check_float_exponential(histogram: &NativeView<'_>) -> Result<(), String> {
+/// Go's `FloatHistogram.Validate` for a float histogram, which the caller then drops: the
+/// custom-bucket checks for NHCB or no custom bounds for an exponential schema, then valid
+/// spans and no negative buckets. Like Go, it does not check the count against the buckets.
+pub(super) fn check_float_histogram(histogram: &NativeView<'_>) -> Result<(), String> {
     debug_assert!(histogram.is_float);
-    if !histogram.custom_values.is_empty() {
+    if histogram.schema == CUSTOM_BUCKETS_SCHEMA {
+        check_custom_buckets(histogram)?;
+    } else if !histogram.custom_values.is_empty() {
         return Err(EXPONENTIAL_CUSTOM_BOUNDS.to_owned());
     }
     walk_buckets(
@@ -542,29 +545,29 @@ fn push_dense_side(
     let mut kept = 0u64;
     // `walk_buckets` checks the spans before it visits any bucket, so indexes only grow and
     // stay within the `kept_index_bounds` that `downscale_shift` limited to the dense limit.
-    let total = walk_buckets(side, spans, buckets, |index, count| {
-        if index < min_index || index > max_index {
-            return;
-        }
-        let otel = otel_index(index, shift);
-        let first = *first_index.get_or_insert(otel);
-        let pos = start + (otel - first) as usize;
-        if pos < counts.len() {
-            counts[pos] = counts[pos].wrapping_add(count);
-        } else {
-            counts.resize(pos, 0);
-            counts.push(count);
-        }
-        kept = kept.wrapping_add(count);
-    })
-    .map_err(|reason| invalid_histogram(family, reason))?;
-    let mut offset = first_index.unwrap_or(0);
-    if stale {
-        col.counts.truncate(start);
-        offset = 0;
+    // A stale point is only checked and writes no buckets.
+    let total = if stale {
+        walk_buckets(side, spans, buckets, |_, _| {})
+    } else {
+        walk_buckets(side, spans, buckets, |index, count| {
+            if index < min_index || index > max_index {
+                return;
+            }
+            let otel = otel_index(index, shift);
+            let first = *first_index.get_or_insert(otel);
+            let pos = start + (otel - first) as usize;
+            if pos < counts.len() {
+                counts[pos] = counts[pos].wrapping_add(count);
+            } else {
+                counts.resize(pos, 0);
+                counts.push(count);
+            }
+            kept = kept.wrapping_add(count);
+        })
     }
+    .map_err(|reason| invalid_histogram(family, reason))?;
     // Both bounds of the index range fit in i32.
-    col.offsets.push(offset as i32);
+    col.offsets.push(first_index.unwrap_or(0) as i32);
     let end = i32::try_from(col.counts.len()).map_err(|_| DecodeError::CapacityOverflow {
         table: if side == "positive" {
             "ExpHistogramDataPoints.positive"
@@ -689,7 +692,12 @@ mod tests {
 
     fn push(dp: &mut HistogramDpTable, h: &Histogram<u64, i64>) -> Result<(), DecodeError> {
         let view = NativeView::new(HistogramRef::Int(h)).unwrap();
-        push_custom_buckets(dp, dp.base.len(), &view, &family())
+        push_custom_buckets(
+            dp,
+            dp.bucket_offsets.len().saturating_sub(1),
+            &view,
+            &family(),
+        )
     }
 
     #[test]
@@ -706,15 +714,25 @@ mod tests {
 
     #[test]
     fn push_custom_buckets_empties_stale_points() {
+        let stale = nhcb(2, STALE_NAN, vec![span(0, 1)], vec![2]);
         let mut dp = HistogramDpTable::default();
         push(&mut dp, &nhcb(2, 1.0, vec![span(0, 1)], vec![2])).unwrap();
-        push(&mut dp, &nhcb(2, STALE_NAN, vec![span(0, 1)], vec![2])).unwrap();
+        push(&mut dp, &stale).unwrap();
         assert_eq!(dp.bucket_counts, [2, 0, 0, 0]);
         assert_eq!(dp.bounds_vals, [1.0, 2.0, 5.0]);
         assert_eq!(dp.bucket_offsets, [0, 4, 4]);
         assert_eq!(dp.bounds_offsets, [0, 3, 3]);
         assert!(!dp.counts.is_nullable());
-        assert!(dp.sums.is_nullable());
+        let sums = dp.sums.to_f64_array();
+        assert_eq!(
+            (sums.len(), sums.is_valid(0), sums.is_null(1)),
+            (2, true, true)
+        );
+
+        // A stale point does not grow the bucket buffer.
+        let mut dp = HistogramDpTable::default();
+        push(&mut dp, &stale).unwrap();
+        assert_eq!(dp.bucket_counts.capacity(), 0);
     }
 
     #[test]
@@ -742,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn push_custom_buckets_rejects_fractional_and_nan_float_zero_count() {
+    fn float_custom_buckets_reject_fractional_and_nan_zero_count() {
         // Go checks the float zero count as sent, before any conversion to an integer count.
         for zero_count in [0.5, f64::NAN] {
             let h = Histogram::<f64, f64> {
@@ -755,10 +773,9 @@ mod tests {
                 custom_values: vec![1.0],
                 ..Histogram::default()
             };
-            let view = NativeView::new(HistogramRef::Float(&h)).unwrap();
-            let mut dp = HistogramDpTable::default();
-            let err = push_custom_buckets(&mut dp, 0, &view, &family()).unwrap_err();
-            assert!(err.to_string().contains("zero count of 0"), "{err}");
+            let err = check_float_histogram(&NativeView::new(HistogramRef::Float(&h)).unwrap())
+                .unwrap_err();
+            assert!(err.contains("zero count of 0"), "{err}");
         }
     }
 
@@ -845,7 +862,7 @@ mod tests {
         assert_eq!((dp.counts[0], dp.zero_counts[0]), (0, 0));
         assert_eq!((dp.scales[0], dp.zero_thresholds[0]), (0, 0.0));
         assert!(dp.sums.is_nullable());
-        assert!(dp.positive.counts.is_empty());
+        assert_eq!(dp.positive.counts.capacity(), 0);
         assert_eq!(dp.positive.offsets, [0]);
     }
 
@@ -936,13 +953,13 @@ mod tests {
     }
 
     #[test]
-    fn push_exponential_truncates_stale_negative_buckets_after_the_first_row() {
+    fn push_exponential_writes_no_stale_negative_buckets_after_the_first_row() {
         let mut dp = ExpHistogramDpTable::default();
         push_exp(&mut dp, &negative(0, vec![span(0, 2)], vec![1, 1])).unwrap();
         let mut stale = negative(0, vec![span(4, 3)], vec![1, 1, 1]);
         stale.sum = STALE_NAN;
         push_exp(&mut dp, &stale).unwrap();
-        // The stale row keeps none of the buckets the walk wrote after row 0's.
+        // The stale row writes none of its buckets after row 0's.
         assert_eq!(dp.negative.counts, [1, 2]);
         assert_eq!(dp.negative.offsets, [-1, 0]);
         assert_eq!(dp.negative.list_offsets, [0, 2, 2]);
@@ -981,7 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn check_float_exponential_applies_go_checks() {
+    fn check_float_histogram_applies_go_checks() {
         let float = |spans: Vec<Span>, buckets: Vec<f64>| Histogram::<f64, f64> {
             schema: 0,
             count: 1.0,
@@ -990,7 +1007,7 @@ mod tests {
             ..Histogram::default()
         };
         let check = |h: &Histogram<f64, f64>| {
-            check_float_exponential(&NativeView::new(HistogramRef::Float(h)).unwrap())
+            check_float_histogram(&NativeView::new(HistogramRef::Float(h)).unwrap())
         };
         // Go does not check the count of a float histogram.
         assert!(check(&float(vec![span(0, 1)], vec![5.0])).is_ok());
@@ -1001,6 +1018,14 @@ mod tests {
         let mut h = float(vec![], vec![]);
         h.custom_values = vec![1.0];
         assert!(check(&h).unwrap_err().contains("custom bounds"));
+
+        // Float NHCB get the custom-bucket checks.
+        h.schema = CUSTOM_BUCKETS_SCHEMA;
+        h.positive_spans = vec![span(0, 2)];
+        h.positive_buckets = vec![1.0, 1.0];
+        assert!(check(&h).is_ok());
+        h.custom_values = vec![1.0, 1.0];
+        assert!(check(&h).unwrap_err().contains("strictly increasing"));
     }
 
     #[test]

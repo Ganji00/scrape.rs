@@ -428,19 +428,21 @@ rpc_seconds_count{method=\"get\"} 4 1700000000000
             )],
         ),
     ]);
-    let opts = DecodeOptions::default();
-    let from_text = ArrowDecoder::new()
-        .decode(text.as_bytes(), &Format::TEXT, &opts)
-        .unwrap();
-    let from_proto = decode(&proto, &opts).unwrap();
-    for (payload_type, batch) in from_text.iter() {
-        assert_eq!(
-            Some(batch),
-            from_proto.get(payload_type),
-            "{payload_type:?} differs"
-        );
+    for policy in [CounterSuffixPolicy::Keep, CounterSuffixPolicy::Strip] {
+        let opts = DecodeOptions::default().with_counter_suffix_policy(policy);
+        let from_text = ArrowDecoder::new()
+            .decode(text.as_bytes(), &Format::TEXT, &opts)
+            .unwrap();
+        let from_proto = decode(&proto, &opts).unwrap();
+        for (payload_type, batch) in from_text.iter() {
+            assert_eq!(
+                Some(batch),
+                from_proto.get(payload_type),
+                "{payload_type:?} differs with {policy:?}"
+            );
+        }
+        assert_eq!(from_text, from_proto);
     }
-    assert_eq!(from_text, from_proto);
 }
 
 #[test]
@@ -676,8 +678,8 @@ fn mixed_native_and_custom_bucket_histograms_use_two_rows() {
 }
 
 #[test]
-fn float_exponential_histograms_are_dropped_and_gauge_ones_kept() {
-    let float = dto::Histogram {
+fn float_histograms_are_dropped_and_gauge_ones_kept() {
+    let float_exponential = dto::Histogram {
         sample_count_float: 2.0,
         sample_sum: 1.0,
         schema: 0,
@@ -685,12 +687,28 @@ fn float_exponential_histograms_are_dropped_and_gauge_ones_kept() {
         zero_threshold: 1e-128,
         ..dto::Histogram::default()
     };
+    // A classic histogram with float counts converts to a float NHCB.
+    let float_classic = dto::Histogram {
+        sample_count_float: 1.8,
+        sample_sum: 1.0,
+        bucket: [(1.0, 0.6), (2.0, 1.2)]
+            .map(|(upper_bound, cumulative_count_float)| dto::Bucket {
+                upper_bound,
+                cumulative_count_float,
+                ..dto::Bucket::default()
+            })
+            .to_vec(),
+        ..dto::Histogram::default()
+    };
     let input = encode(&[
         family(
             "float",
             "",
             dto::MetricType::Histogram,
-            vec![histogram_metric(&[], float)],
+            vec![
+                histogram_metric(&[("kind", "exponential")], float_exponential),
+                histogram_metric(&[("kind", "classic")], float_classic),
+            ],
         ),
         family(
             "gauge",
@@ -1358,23 +1376,28 @@ fn split_families_keep_one_row_per_kind_for_stale_points() {
 
 #[test]
 fn chunked_stream_splits_rows_past_the_u16_metric_limit() {
-    // Each family has an exponential and an explicit-bucket row, so 32,769 families need
-    // 65,538 rows, two more than one batch holds.
-    let families = MAX_METRICS_PER_BATCH / 2 + 1;
-    let messages: Vec<_> = (0..families)
-        .map(|i| {
-            let mut metrics = Vec::with_capacity(2);
-            for metric in [
-                histogram_metric(&[], native(0, vec![span(0, 1)], vec![2])),
-                classic_histogram(&[], &[(1.0, 2)], 2, 1.0),
-            ] {
-                let mut metric = metric;
-                metric.timestamp_ms = 0;
-                metrics.push(metric);
-            }
-            family(&format!("h_{i}"), "", dto::MetricType::Histogram, metrics)
-        })
-        .collect();
+    // A gauge row, then an explicit-bucket and an exponential row per family: 65,537 rows, so
+    // the batch fills after the explicit-bucket row of the last family and its exponential row
+    // starts the next batch, in the input and in the stale pass.
+    let families = MAX_METRICS_PER_BATCH / 2;
+    let mut messages = vec![family(
+        "g",
+        "",
+        dto::MetricType::Gauge,
+        vec![gauge(&[], 1.0)],
+    )];
+    messages.extend((0..families).map(|i| {
+        let mut metrics = Vec::with_capacity(2);
+        for metric in [
+            classic_histogram(&[], &[(1.0, 2)], 2, 1.0),
+            histogram_metric(&[], native(0, vec![span(0, 1)], vec![2])),
+        ] {
+            let mut metric = metric;
+            metric.timestamp_ms = 0;
+            metrics.push(metric);
+        }
+        family(&format!("h_{i}"), "", dto::MetricType::Histogram, metrics)
+    }));
     let input = encode(&messages);
     let opts = DecodeOptions::default()
         .with_timestamp_ms(1_700_000_000_000)
@@ -1389,18 +1412,20 @@ fn chunked_stream_splits_rows_past_the_u16_metric_limit() {
     assert_eq!(chunks.len(), 2);
     assert_eq!(chunks[0].num_metrics(), MAX_METRICS_PER_BATCH);
     // The point that did not fit is replayed into the next batch, not lost.
-    assert_eq!(chunks[1].num_metrics(), 2);
+    assert_eq!(chunks[1].num_metrics(), 1);
+    assert_eq!(metric_types(&chunks[1]), [4]);
     assert_eq!(
         chunks.iter().map(|c| c.num_data_points()).sum::<usize>(),
-        2 * families
+        2 * families + 1
     );
-    assert_eq!(tracker.active_series_len(), 2 * families);
+    assert_eq!(tracker.active_series_len(), 2 * families + 1);
 
     let stale: Vec<_> = decoder
         .decode_stream_with_staleness(&encode(&[]), &Format::PROTO_DELIM, &opts, &mut tracker)
         .collect::<Result<_, _>>()
         .unwrap();
     assert_eq!(stale.len(), 2);
+    assert_eq!(metric_types(&stale[1]), [4]);
     let mut counts = [0; 4];
     for chunk in &stale {
         counts
@@ -1408,7 +1433,7 @@ fn chunked_stream_splits_rows_past_the_u16_metric_limit() {
             .zip(stale_counts(chunk))
             .for_each(|(s, c)| *s += c);
     }
-    assert_eq!(counts, [0, 0, families, families]);
+    assert_eq!(counts, [1, 0, families, families]);
     assert!(tracker.is_empty());
 }
 
@@ -1430,8 +1455,9 @@ fn exemplar_and_start_timestamps_out_of_range() {
         vec![metric],
     )]);
     let err = decode(&input, &DecodeOptions::default()).unwrap_err();
+    // The error saturates, where Go's `UnixMilli` would wrap to a small negative value.
     assert!(
-        matches!(err, DecodeError::TimestampOverflow { .. }),
+        matches!(err, DecodeError::TimestampOverflow { timestamp_ms } if timestamp_ms == i64::MAX),
         "{err:?}"
     );
 
@@ -1498,15 +1524,67 @@ fn dropped_float_exponential_histograms_check_labels() {
 #[test]
 fn a_smaller_scrape_keeps_the_larger_scratch() {
     let large = tracked_families(&["1", "2", "3", "4", "5", "6", "7", "8"]);
-    let small = tracked_families(&["1"]);
     let opts = DecodeOptions::default();
     let mut decoder = ArrowDecoder::new();
+    // A cursor started before the large scrape holds the empty scratch.
+    let mut stale_cursor = decoder.start_decode(&Format::PROTO_DELIM, &opts).unwrap();
     decoder.decode(&large, &Format::PROTO_DELIM, &opts).unwrap();
     let retained = decoder.proto.retained_memory_bytes();
-    decoder.decode(&small, &Format::PROTO_DELIM, &opts).unwrap();
+    assert!(retained > 0);
+    decoder.finish_decode(&mut stale_cursor);
     assert_eq!(decoder.proto.retained_memory_bytes(), retained);
     // The decoded metrics of the last message are not kept between scrapes.
     assert!(decoder.proto.state.family_is_empty());
+}
+
+#[test]
+fn units_are_kept_and_stripped_like_text() {
+    let mut rpc = family(
+        "rpc_seconds",
+        "",
+        dto::MetricType::Gauge,
+        vec![gauge(&[], 1.0)],
+    );
+    rpc.unit = "seconds".to_owned();
+    let input = encode(&[rpc]);
+    for (policy, name) in [
+        (UnitSuffixPolicy::Keep, "rpc_seconds"),
+        (UnitSuffixPolicy::Strip, "rpc"),
+    ] {
+        let opts = DecodeOptions::default().with_unit_suffix_policy(policy);
+        let records = decode(&input, &opts).unwrap();
+        let metrics = records.univariate_metrics().unwrap();
+        assert_eq!(strings(metrics, "name"), [name]);
+        assert_eq!(strings(metrics, "unit"), ["seconds"]);
+    }
+}
+
+#[test]
+fn empty_families_count_against_the_decode_budget() {
+    let mut messages = vec![family("empty", "", dto::MetricType::Gauge, vec![]); 3];
+    messages.push(family(
+        "g",
+        "",
+        dto::MetricType::Gauge,
+        vec![gauge(&[], 1.0)],
+    ));
+    let input = encode(&messages);
+    let mut decoder = ArrowDecoder::new();
+    let mut cursor = decoder
+        .start_decode(&Format::PROTO_DELIM, &DecodeOptions::default())
+        .unwrap();
+    let budget = DecodeBudget::default().with_max_entries(1);
+    let mut pending = 0;
+    let records = loop {
+        match decoder.step_decode(&mut cursor, &input, budget).unwrap() {
+            DecodeStep::Pending => pending += 1,
+            DecodeStep::Batch(batch) => break batch,
+            DecodeStep::Done => panic!("no batch"),
+        }
+    };
+    // One step per empty message, then the gauge family's help, type, and series entries.
+    assert_eq!(pending, 3 + 3);
+    assert_eq!(records.num_data_points(), 1);
 }
 
 #[test]
