@@ -299,7 +299,9 @@ impl Timestamp {
     }
 }
 
-/// `Exemplar`, with its labels in `Metric::exemplar_labels[labels_start..labels_end]`.
+/// `Exemplar`, with its labels in `labels_start..labels_end` of the label buffer it was merged
+/// into: `Metric::counter_exemplar_labels` for the counter exemplar, `Metric::exemplar_labels`
+/// for histogram exemplars.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(super) struct Exemplar {
     pub(super) labels_start: usize,
@@ -309,6 +311,17 @@ pub(super) struct Exemplar {
 }
 
 impl Exemplar {
+    /// Labels of `self` in `buffer`, the buffer it was merged into.
+    pub(super) fn labels<'s, 'a>(
+        &self,
+        buffer: &'s [(&'a str, &'a str)],
+    ) -> &'s [(&'a str, &'a str)] {
+        &buffer[self.labels_start..self.labels_end]
+    }
+
+    /// Merges the exemplar in `buf` into `slot`, appending its labels to `labels`. The labels
+    /// of one exemplar must stay at the end of `labels` while it is merged, so each buffer
+    /// holds the labels of one repeated exemplar field at most.
     fn merge<'a>(
         slot: &mut Option<Self>,
         labels: &mut Vec<(&'a str, &'a str)>,
@@ -319,14 +332,7 @@ impl Exemplar {
             labels_end: labels.len(),
             ..Self::default()
         });
-        if exemplar.labels_end != labels.len() {
-            // A repeated exemplar field after other exemplars: move its labels to the end,
-            // so the merged labels stay contiguous.
-            let start = labels.len();
-            labels.extend_from_within(exemplar.labels_start..exemplar.labels_end);
-            exemplar.labels_start = start;
-            exemplar.labels_end = labels.len();
-        }
+        debug_assert_eq!(exemplar.labels_end, labels.len());
         let mut reader = Reader::new(buf);
         while let Some((field, wire_type)) = reader.field()? {
             match field {
@@ -568,7 +574,10 @@ pub(super) struct Metric<'a> {
     pub(super) untyped: f64,
     pub(super) histogram: Histogram,
     pub(super) timestamp_ms: i64,
-    /// Labels of every exemplar in the metric, indexed by [`Exemplar`].
+    /// Labels of the counter exemplar. A repeated `counter` field merges into the same
+    /// exemplar, so it gets its own buffer to keep its labels contiguous without copying.
+    pub(super) counter_exemplar_labels: Vec<(&'a str, &'a str)>,
+    /// Labels of the histogram exemplars, indexed by [`Exemplar`].
     pub(super) exemplar_labels: Vec<(&'a str, &'a str)>,
 }
 
@@ -585,6 +594,7 @@ impl<'a> Metric<'a> {
         self.untyped = 0.0;
         self.histogram.clear();
         self.timestamp_ms = 0;
+        self.counter_exemplar_labels.clear();
         self.exemplar_labels.clear();
 
         let mut reader = Reader::new(buf);
@@ -615,7 +625,7 @@ impl<'a> Metric<'a> {
                 1 => counter.value = reader.read_double(wire_type)?,
                 2 => Exemplar::merge(
                     &mut counter.exemplar,
-                    &mut self.exemplar_labels,
+                    &mut self.counter_exemplar_labels,
                     reader.read_message(wire_type)?,
                 )?,
                 3 => Timestamp::merge(
@@ -626,11 +636,6 @@ impl<'a> Metric<'a> {
             }
         }
         Ok(())
-    }
-
-    /// Labels of `exemplar`.
-    pub(super) fn exemplar_labels(&self, exemplar: &Exemplar) -> &[(&'a str, &'a str)] {
-        &self.exemplar_labels[exemplar.labels_start..exemplar.labels_end]
     }
 }
 
@@ -655,7 +660,11 @@ mod tests {
         }
     }
 
-    fn assert_exemplar(metric: &Metric<'_>, got: Option<&Exemplar>, want: Option<&dto::Exemplar>) {
+    fn assert_exemplar(
+        buffer: &[(&str, &str)],
+        got: Option<&Exemplar>,
+        want: Option<&dto::Exemplar>,
+    ) {
         let (Some(got), Some(want)) = (got, want) else {
             assert_eq!(got.is_some(), want.is_some());
             return;
@@ -665,7 +674,7 @@ mod tests {
             .iter()
             .map(|label| (label.name.as_str(), label.value.as_str()))
             .collect();
-        assert_eq!(metric.exemplar_labels(got), labels);
+        assert_eq!(got.labels(buffer), labels);
         assert_eq!(got.value.to_bits(), want.value.to_bits());
         assert_eq!(
             got.timestamp,
@@ -693,7 +702,7 @@ mod tests {
         let counter = want.counter.clone().unwrap_or_default();
         assert_eq!(metric.counter.value, counter.value);
         assert_exemplar(
-            metric,
+            &metric.counter_exemplar_labels,
             metric.counter.exemplar.as_ref(),
             counter.exemplar.as_ref(),
         );
@@ -735,14 +744,18 @@ mod tests {
             assert_eq!(got_bucket.upper_bound, want_bucket.upper_bound);
             assert_eq!(got_bucket.cumulative_count, want_bucket.cumulative_count);
             assert_exemplar(
-                metric,
+                &metric.exemplar_labels,
                 got_bucket.exemplar.as_ref(),
                 want_bucket.exemplar.as_ref(),
             );
         }
         assert_eq!(got.exemplars.len(), histogram.exemplars.len());
         for (got_exemplar, want_exemplar) in got.exemplars.iter().zip(&histogram.exemplars) {
-            assert_exemplar(metric, Some(got_exemplar), Some(want_exemplar));
+            assert_exemplar(
+                &metric.exemplar_labels,
+                Some(got_exemplar),
+                Some(want_exemplar),
+            );
         }
     }
 
@@ -860,6 +873,50 @@ mod tests {
         metric.decode(&encoded).unwrap();
         assert_eq!(metric.histogram.positive_delta, [-2, 3]);
         assert_matches_prost(&metric, &want);
+    }
+
+    #[test]
+    fn alternating_counter_and_histogram_exemplars_grow_linearly() {
+        // Each round merges one more label into the counter exemplar and adds one bucket
+        // exemplar label. A shared label buffer copied the counter labels on every round.
+        let counter = dto::Metric {
+            counter: Some(dto::Counter {
+                exemplar: Some(exemplar("c", 1.0)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let histogram = dto::Metric {
+            histogram: Some(dto::Histogram {
+                bucket: vec![dto::Bucket {
+                    exemplar: Some(exemplar("b", 1.0)),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let rounds = 10_000;
+        let mut encoded = Vec::new();
+        for _ in 0..rounds {
+            encoded.extend(&counter);
+            encoded.extend(&histogram);
+        }
+
+        let mut metric = Metric::default();
+        metric.decode(&encoded).unwrap();
+        assert_eq!(metric.counter_exemplar_labels.len(), rounds);
+        assert_eq!(metric.exemplar_labels.len(), rounds);
+        let counter_exemplar = metric.counter.exemplar.unwrap();
+        assert_eq!(
+            counter_exemplar
+                .labels(&metric.counter_exemplar_labels)
+                .len(),
+            rounds
+        );
+        assert_eq!(metric.histogram.bucket.len(), rounds);
     }
 
     #[test]

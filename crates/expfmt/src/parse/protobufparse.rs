@@ -128,13 +128,14 @@ impl<'a> ProtobufParser<'a> {
     }
 
     /// Go's `NextMetric`: decodes the next metric of the family, so a malformed metric only
-    /// fails when the parser reaches it.
+    /// fails when the parser reaches it. The index moves past the metric before decoding, so
+    /// a caller that calls `next_entry` again after an error continues with the next metric.
     fn next_metric(&mut self) -> Result<bool, ParseError> {
         let Some(&message) = self.family.metrics.get(self.next_metric_index) else {
             return Ok(false);
         };
-        self.metric.decode(message)?;
         self.next_metric_index += 1;
+        self.metric.decode(message)?;
         Ok(true)
     }
 
@@ -214,6 +215,7 @@ impl<'a> ProtobufParser<'a> {
         order.extend(0..self.label_count());
         order.sort_by(|&left, &right| self.label_at(left).0.cmp(self.label_at(right).0));
         for (name, value) in order.iter().map(|&index| self.label_at(index)) {
+            let value = value.as_str();
             if name == METRIC_NAME_LABEL {
                 entry_bytes.extend_from_slice(value.as_bytes());
                 continue;
@@ -238,15 +240,23 @@ impl<'a> ProtobufParser<'a> {
 
     /// Label `index` of the current series in Go's insertion order: the metric name, the
     /// protobuf labels, then the `quantile` label.
-    fn label_at(&self, index: usize) -> (&str, &str) {
+    fn label_at(&self, index: usize) -> (&'a str, LabelValue<'_, 'a>) {
         let labels = &self.metric.label;
         match index {
-            0 => (METRIC_NAME_LABEL, self.series_name.as_str()),
-            index if index <= labels.len() => labels[index - 1],
+            0 if self.series_suffix().is_empty() => {
+                (METRIC_NAME_LABEL, LabelValue::Input(self.family.name))
+            }
+            0 => (METRIC_NAME_LABEL, LabelValue::Parser(&self.series_name)),
+            index if index <= labels.len() => {
+                let (name, value) = labels[index - 1];
+                (name, LabelValue::Input(value))
+            }
             _ => self
                 .magic_label
                 .as_ref()
-                .map_or(("", ""), |(name, value)| (*name, value.as_str())),
+                .map_or(("", LabelValue::Input("")), |(name, value)| {
+                    (*name, LabelValue::Parser(value.as_str()))
+                }),
         }
     }
 
@@ -462,29 +472,9 @@ impl<'a> Parser<'a> for ProtobufParser<'a> {
     /// `_sum` series and the `quantile` label, which are not in the input.
     fn labels(&self, buf: &mut LabelsBuffer<'a>) {
         buf.clear();
-        let labels = &self.metric.label;
         for &index in &self.label_order {
-            let (name, value): (Cow<'a, str>, Cow<'a, str>) = match index {
-                0 if self.series_name.len() == self.family.name.len() => (
-                    Cow::Borrowed(METRIC_NAME_LABEL),
-                    Cow::Borrowed(self.family.name),
-                ),
-                0 => (
-                    Cow::Borrowed(METRIC_NAME_LABEL),
-                    Cow::Owned(self.series_name.clone()),
-                ),
-                index if index <= labels.len() => {
-                    let (name, value) = labels[index - 1];
-                    (Cow::Borrowed(name), Cow::Borrowed(value))
-                }
-                _ => match &self.magic_label {
-                    Some((name, value)) => {
-                        (Cow::Borrowed(*name), Cow::Owned(value.as_str().to_owned()))
-                    }
-                    None => (Cow::Borrowed(""), Cow::Borrowed("")),
-                },
-            };
-            buf.push(name, value);
+            let (name, value) = self.label_at(index);
+            buf.push(Cow::Borrowed(name), value.into_cow());
         }
     }
 
@@ -495,16 +485,19 @@ impl<'a> Parser<'a> for ProtobufParser<'a> {
         if self.exemplar_returned && self.state == Some(Entry::Series) {
             return None;
         }
-        let exemplar = match self.kind() {
-            dto::MetricType::Counter => self.metric.counter.exemplar,
+        let (exemplar, labels) = match self.kind() {
+            dto::MetricType::Counter => (
+                self.metric.counter.exemplar?,
+                &self.metric.counter_exemplar_labels,
+            ),
             dto::MetricType::Histogram | dto::MetricType::GaugeHistogram => {
-                self.histogram_exemplar()
+                (self.histogram_exemplar()?, &self.metric.exemplar_labels)
             }
-            _ => None,
-        }?;
+            _ => return None,
+        };
         let value = exemplar.value;
         let timestamp = exemplar.timestamp.map(pb::Timestamp::millis);
-        for &(name, value) in self.metric.exemplar_labels(&exemplar) {
+        for &(name, value) in exemplar.labels(labels) {
             buf.push(Cow::Borrowed(name), Cow::Borrowed(value));
         }
         buf.sort();
@@ -551,6 +544,32 @@ impl ProtobufParser<'_> {
             }
         }
         found.filter(|exemplar| exemplar.timestamp.is_some())
+    }
+}
+
+/// Value of a series label: a slice of the input, or a string the parser built, which
+/// [`Parser::labels`] has to copy because `LabelsBuffer<'a>` outlives the parser state.
+#[derive(Clone, Copy)]
+enum LabelValue<'p, 'a> {
+    /// Borrowed from the input for `'a`.
+    Input(&'a str),
+    /// The `_count` or `_sum` metric name or the formatted `quantile` value.
+    Parser(&'p str),
+}
+
+impl<'a> LabelValue<'_, 'a> {
+    fn as_str(&self) -> &str {
+        match *self {
+            Self::Input(value) => value,
+            Self::Parser(value) => value,
+        }
+    }
+
+    fn into_cow(self) -> Cow<'a, str> {
+        match self {
+            Self::Input(value) => Cow::Borrowed(value),
+            Self::Parser(value) => Cow::Owned(value.to_owned()),
+        }
     }
 }
 
@@ -1231,23 +1250,24 @@ mod tests {
 
     #[test]
     fn returns_metrics_before_a_malformed_one() {
-        let mut family = dto::MetricFamily {
+        let gauge = |value| dto::Metric {
+            gauge: Some(dto::Gauge { value }),
+            ..Default::default()
+        };
+        let family = dto::MetricFamily {
             name: "g".to_owned(),
             r#type: dto::MetricType::Gauge as i32,
-            metric: vec![dto::Metric {
-                gauge: Some(dto::Gauge { value: 1.0 }),
-                ..Default::default()
-            }],
+            metric: vec![gauge(1.0)],
             ..Default::default()
         };
         let mut message = family.encode_to_vec();
-        family.metric.clear();
-        // A second metric whose label name is not UTF-8.
+        // A second metric whose label name is not UTF-8, then a valid third one.
         let mut bad_label = Vec::new();
         prost::encoding::bytes::encode(1, &vec![0xff], &mut bad_label);
         let mut bad_metric = Vec::new();
         prost::encoding::bytes::encode(1, &bad_label, &mut bad_metric);
         prost::encoding::bytes::encode(4, &bad_metric, &mut message);
+        prost::encoding::bytes::encode(4, &gauge(2.0).encode_to_vec(), &mut message);
         let mut input = Vec::new();
         prost::encoding::encode_varint(message.len() as u64, &mut input);
         input.extend(message);
@@ -1262,5 +1282,9 @@ mod tests {
             parser.next_entry(),
             Err(ParseError::InvalidProtobuf(_))
         ));
+        // A caller that keeps going after the error gets the next metric, not the same error.
+        assert_eq!(parser.next_entry().unwrap(), Some(Entry::Series));
+        assert_eq!(parser.series().2, 2.0);
+        assert_eq!(parser.next_entry().unwrap(), None);
     }
 }
