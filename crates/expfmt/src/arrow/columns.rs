@@ -42,6 +42,9 @@ pub(super) struct ScratchBuffers {
     pub(super) u32_buf: Vec<u32>,
     pub(super) i32_buf: Vec<i32>,
     pub(super) bytes: Vec<u8>,
+    /// `(start, end, checked)` of each label name unescaped into `bytes`, sorted by name, for
+    /// the label checks of the decode loop.
+    pub(super) label_names: Vec<(usize, usize, bool)>,
 }
 
 impl ScratchBuffers {
@@ -52,6 +55,7 @@ impl ScratchBuffers {
             u32_buf: Vec::with_capacity(data_points),
             i32_buf: Vec::with_capacity(metrics + 1),
             bytes: Vec::new(),
+            label_names: Vec::new(),
         }
     }
 
@@ -61,6 +65,7 @@ impl ScratchBuffers {
             + self.u32_buf.capacity() * size_of::<u32>()
             + self.i32_buf.capacity() * size_of::<i32>()
             + self.bytes.capacity()
+            + self.label_names.capacity() * size_of::<(usize, usize, bool)>()
     }
 
     pub(super) fn build_attr_columns(

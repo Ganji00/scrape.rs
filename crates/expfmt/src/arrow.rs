@@ -1578,9 +1578,7 @@ impl ArrowDecoder {
         let is_dropped = self.current_family.metric_type == MetricType::Unknown
             && opts.untyped_policy == UntypedPolicy::Drop;
         if is_dropped {
-            for span_idx in 0..label_spans.len() {
-                self.validate_empty_label(span_idx, &label_spans[..=span_idx], full_input)?;
-            }
+            self.check_uninterned_labels(label_spans, full_input, true)?;
             self.current_family.has_samples = true;
             return Ok(());
         }
@@ -1800,8 +1798,9 @@ impl ArrowDecoder {
         let mut sorted_by_key_id = true;
         let mut seen_special = false;
         let mut special_val: Option<f64> = None;
+        let mut has_empty_value = false;
 
-        for (span_idx, span) in label_spans.iter().enumerate() {
+        for span in label_spans {
             let raw_key = &full_input[span.name_start..span.name_end];
             let raw_val = &full_input[span.val_start..span.val_end];
 
@@ -1824,10 +1823,10 @@ impl ArrowDecoder {
             }
 
             // Prometheus treats `label=""` as an absent label (`labels.Builder` deletes empty
-            // values). Validate reserved and duplicate label names before skipping so unused keys
-            // and `""` never enter the OTAP attribute dictionaries.
+            // values). Its name is checked after the loop, so unused keys and `""` never enter
+            // the OTAP attribute dictionaries.
             if raw_val.is_empty() {
-                self.validate_empty_label(span_idx, label_spans, full_input)?;
+                has_empty_value = true;
                 continue;
             }
 
@@ -1849,6 +1848,9 @@ impl ArrowDecoder {
                 &self.key_interner,
                 &self.current_family,
             )?;
+        }
+        if has_empty_value {
+            self.check_uninterned_labels(label_spans, full_input, false)?;
         }
 
         Ok(special_val)
@@ -1916,13 +1918,14 @@ impl ArrowDecoder {
         };
         let mut prev_key_id: Option<u32> = None;
         let mut sorted_by_key_id = true;
+        let mut has_empty_value = false;
 
-        for (span_idx, span) in ex_spans.iter().enumerate() {
+        for span in ex_spans {
             let raw_key = &full_input[span.name_start..span.name_end];
             let raw_val = &full_input[span.val_start..span.val_end];
 
             if raw_val.is_empty() {
-                self.validate_empty_label(span_idx, ex_spans, full_input)?;
+                has_empty_value = true;
                 continue;
             }
 
@@ -1979,6 +1982,9 @@ impl ArrowDecoder {
                 &mut self.assembly.exemplar_attrs[attr_start..]
             };
             Self::sort_and_check_duplicates(slice, &self.key_interner, &self.current_family)?;
+        }
+        if has_empty_value {
+            self.check_uninterned_labels(ex_spans, full_input, false)?;
         }
 
         Ok((span_id, trace_id))
@@ -2083,32 +2089,41 @@ impl ArrowDecoder {
         Ok(())
     }
 
+    /// Checks the names of labels that are not interned: every label when `check_all` is set,
+    /// else only labels with empty values. A checked label fails if it is `__name__` or if
+    /// another label has the same name. The names are unescaped into scratch and sorted, so a
+    /// long label list takes O(L log L), not O(L^2).
     #[cold]
-    fn validate_empty_label(
+    fn check_uninterned_labels(
         &mut self,
-        span_idx: usize,
         label_spans: &[LabelSpan],
         full_input: &[u8],
+        check_all: bool,
     ) -> Result<(), DecodeError> {
-        let span = &label_spans[span_idx];
-        let raw_key = &full_input[span.name_start..span.name_end];
-        let key = unescape_bytes_into(raw_key, true, &mut self.unescape_buf);
-        if key == METRIC_NAME_LABEL.as_bytes() {
-            return Err(DecodeError::DuplicateLabel {
-                metric: self.current_family.name_string(),
-                label: METRIC_NAME_LABEL.to_owned(),
-            });
+        let names = &mut self.scratch.bytes;
+        let order = &mut self.scratch.label_names;
+        names.clear();
+        order.clear();
+        for span in label_spans {
+            let raw_key = &full_input[span.name_start..span.name_end];
+            let start = names.len();
+            names.extend_from_slice(unescape_bytes_into(raw_key, true, &mut self.unescape_buf));
+            order.push((
+                start,
+                names.len(),
+                check_all || span.val_start == span.val_end,
+            ));
         }
-        for (other_idx, other) in label_spans.iter().enumerate() {
-            if other_idx == span_idx {
-                continue;
-            }
-            let other_raw_key = &full_input[other.name_start..other.name_end];
-            let other_key = unescape_bytes_into(other_raw_key, true, &mut self.scratch.bytes);
-            if key == other_key {
+        order.sort_unstable_by(|a, b| names[a.0..a.1].cmp(&names[b.0..b.1]));
+        let name_at = |i: usize| order.get(i).map(|&(start, end, _)| &names[start..end]);
+        for (i, &(start, end, checked)) in order.iter().enumerate() {
+            let name = &names[start..end];
+            let duplicate =
+                i.checked_sub(1).and_then(name_at) == Some(name) || name_at(i + 1) == Some(name);
+            if checked && (name == METRIC_NAME_LABEL.as_bytes() || duplicate) {
                 return Err(DecodeError::DuplicateLabel {
                     metric: self.current_family.name_string(),
-                    label: String::from_utf8_lossy(key).into_owned(),
+                    label: String::from_utf8_lossy(name).into_owned(),
                 });
             }
         }
