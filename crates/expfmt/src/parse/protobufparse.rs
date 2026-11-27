@@ -68,10 +68,11 @@ pub struct ProtobufParser<'a> {
     is_float_histogram: bool,
     /// `(upper_bound, cumulative_count)` of the classic buckets during NHCB conversion.
     nhcb_buckets: Vec<(f64, f64)>,
-    /// Skips sorting labels and building `entry_bytes` for each series, for callers that only
-    /// read the decoded protobuf through the `pub(crate)` accessors. Such callers read a whole
-    /// summary from its first series, so the `_sum` and quantile series are skipped too. An
-    /// empty `MetricFamily` returns `Entry::Comment`, so such callers can count it.
+    /// Skips the series name, sorting labels, and building `entry_bytes` for each series, for
+    /// callers that only read the decoded protobuf through the `pub(crate)` accessors. Such
+    /// callers read a whole summary from its first series, so the `_sum` and quantile series
+    /// are skipped too. An empty `MetricFamily` returns `Entry::Comment`, so such callers can
+    /// count it.
     skip_entry_bytes: bool,
 }
 
@@ -374,27 +375,26 @@ impl<'a> ProtobufParser<'a> {
                 "invalid label name: empty".to_owned(),
             ));
         }
-        let suffix = self.series_suffix();
-        self.series_name.clear();
-        self.series_name.push_str(&self.family.name);
-        self.series_name.push_str(suffix);
-        if self.kind() == dto::MetricType::Summary
-            && self.field_pos == -1
-            && self
-                .metric()
-                .summary
-                .as_ref()
-                .is_none_or(|summary| summary.quantile.is_empty())
-        {
-            self.fields_done = true;
-        }
-        self.update_magic_label();
-
         if self.skip_entry_bytes {
             if self.kind() == dto::MetricType::Summary {
                 self.fields_done = true;
             }
         } else {
+            let suffix = self.series_suffix();
+            self.series_name.clear();
+            self.series_name.push_str(&self.family.name);
+            self.series_name.push_str(suffix);
+            if self.kind() == dto::MetricType::Summary
+                && self.field_pos == -1
+                && self
+                    .metric()
+                    .summary
+                    .as_ref()
+                    .is_none_or(|summary| summary.quantile.is_empty())
+            {
+                self.fields_done = true;
+            }
+            self.update_magic_label();
             self.update_entry_bytes();
         }
 

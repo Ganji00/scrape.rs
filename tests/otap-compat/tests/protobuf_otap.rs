@@ -587,6 +587,8 @@ fn go_nhcb_fixture_drops_float_histograms() {
         .iter()
         .map(|m| m.name.as_str())
         .collect();
-    assert!(names.contains(&"int_empty_runs"), "{names:?}");
-    assert!(names.iter().all(|n| !n.starts_with("float_")), "{names:?}");
+    // `mixed` keeps its 3 integer points, in an NHCB row and an exponential row, and drops its
+    // 3 float points.
+    assert_eq!(names, ["int_empty_runs", "mixed", "mixed"]);
+    assert_eq!(decoded.num_data_points(), 6);
 }

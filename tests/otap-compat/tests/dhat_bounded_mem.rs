@@ -490,6 +490,8 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
         // warmup, both in one batch and in budgeted chunks across `.await` points.
         let proto_decoder = Rc::new(RefCell::new(ArrowDecoder::new()));
         let proto_opts = opts.with_max_data_points_per_batch(16);
+        // A 16-point chunk takes at most 42 entries, so the step budget must be lower to pause.
+        let proto_budget = DecodeBudget::default().with_max_entries(8);
         let proto_handle = tokio::task::spawn_local(async move {
             let mut warmup_proto_dec_mem = 0usize;
             let mut warmup_proto_live_heap = 0usize;
@@ -507,17 +509,22 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
                     .borrow_mut()
                     .start_decode_stream(&Format::PROTO_DELIM, &proto_opts)
                     .expect("protobuf cursor starts");
+                let mut pending = 0;
                 loop {
                     let step = proto_decoder
                         .borrow_mut()
-                        .step_decode(&mut cursor, &proto, coop_budget)
+                        .step_decode(&mut cursor, &proto, proto_budget)
                         .expect("protobuf step succeeds");
                     match step {
-                        DecodeStep::Pending => tokio::task::yield_now().await,
+                        DecodeStep::Pending => {
+                            pending += 1;
+                            tokio::task::yield_now().await;
+                        }
                         DecodeStep::Batch(chunk) => drop(to_otap_arrow_records(&chunk)),
                         DecodeStep::Done => break,
                     }
                 }
+                assert!(pending > 0, "protobuf scrape never yielded at iteration {i}");
 
                 let dec_mem = proto_decoder.borrow().retained_memory_bytes();
                 let live_heap = dhat::HeapStats::get().curr_bytes;

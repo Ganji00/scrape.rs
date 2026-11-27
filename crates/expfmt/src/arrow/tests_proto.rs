@@ -486,6 +486,7 @@ fn label_errors_match_the_text_decoder() {
         &[("__name__", "")][..],
         &[("a", "1"), ("a", "2")][..],
         &[("a", ""), ("a", "2")][..],
+        &[("a", ""), ("b", "1"), ("a", "2")][..],
     ] {
         let input = encode(&[family(
             "g",
@@ -517,7 +518,7 @@ fn label_errors_match_the_text_decoder() {
         "u",
         "",
         dto::MetricType::Untyped,
-        vec![untyped(&[("a", "1"), ("a", "2")])],
+        vec![untyped(&[("a", "1"), ("b", "1"), ("a", "2")])],
     )]);
     assert!(matches!(
         decode(&input, &opts),
@@ -727,6 +728,11 @@ fn float_histograms_are_dropped_and_gauge_ones_kept() {
 }
 
 /// The `flags` column of a data point batch, zero for every point when it is left out.
+fn parent_ids(batch: &RecordBatch) -> Vec<u16> {
+    let parents = batch.column_by_name("parent_id").unwrap();
+    parents.as_primitive::<UInt16Type>().values().to_vec()
+}
+
 fn flags(batch: &RecordBatch) -> Vec<u32> {
     batch.column_by_name("flags").map_or_else(
         || vec![0; batch.num_rows()],
@@ -1371,7 +1377,27 @@ fn split_families_keep_one_row_per_kind_for_stale_points() {
         )
         .unwrap();
     assert_eq!(metric_types(&records), [4, 3]);
-    assert_eq!(flags(records.exp_histogram_data_points().unwrap()), [0, 1]);
+    let points = records.exp_histogram_data_points().unwrap();
+    assert_eq!(flags(points), [0, 1]);
+    assert_eq!(parent_ids(points), [0, 0]);
+
+    // The other way around: the classic row comes first, and the stale point of series 2 must
+    // not open a second classic row after the exponential-only message.
+    let records = decoder
+        .decode_with_staleness(
+            &encode(&[
+                family("h", "", dto::MetricType::Histogram, vec![classic("4")]),
+                family("h", "", dto::MetricType::Histogram, vec![exponential("3")]),
+            ]),
+            &Format::PROTO_DELIM,
+            &opts,
+            &mut tracker,
+        )
+        .unwrap();
+    assert_eq!(metric_types(&records), [3, 4]);
+    let points = records.histogram_data_points().unwrap();
+    assert_eq!(flags(points), [0, 1]);
+    assert_eq!(parent_ids(points), [0, 0]);
 }
 
 #[test]

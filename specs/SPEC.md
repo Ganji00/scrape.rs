@@ -158,7 +158,7 @@ With the `dto` feature (on by default), `ArrowDecoder` decodes delimited protobu
     - If a side's dense list would be wider than 160 buckets (the OpenTelemetry SDK's default `MaxSize`) and wider than 8 times its sparse bucket count, `scale` is lowered and adjacent buckets are merged until both sides fit, like Prometheus's `native_histogram_bucket_limit`. This keeps a few sparse buckets far apart from allocating a list of up to about 2^19 buckets.
     - A stale NaN sum sets `flags` to `FLAG_NO_RECORDED_VALUE`, with the same values as a disappeared series: zero counts, scale, and zero threshold, a null `sum` (`sum` is nullable only in batches with such a point), and empty bucket lists.
   - **Float histograms**, exponential or NHCB, are dropped, as the spec requires for the float flavor. A classic histogram with float counts converts to a float NHCB, so it is dropped too. They and their labels are still validated first, so an invalid one fails the scrape like in Go.
-  - **Any other schema** is an error.
+  - **Any other schema** fails the scrape with `DecodeError::InvalidHistogram`, like Go's `Validate` with the default scrape config. The OpenTelemetry spec drops such histograms instead. Go lowers schemas `9` to `52` only when `native_histogram_min_bucket_factor` asks for a schema below `8`, and the decoder has no such option.
 - Every native histogram is checked like Go's [`Histogram.Validate`](https://github.com/prometheus/prometheus/blob/v0.315.1/model/histogram/histogram.go#L426) and `FloatHistogram.Validate`. Prometheus runs `Validate` when it appends a scraped histogram, and an invalid histogram fails the scrape. A failed check returns `DecodeError::InvalidHistogram`. The checks cover:
   - Span offsets and lengths.
   - Negative bucket counts.
@@ -166,7 +166,7 @@ With the `dto` feature (on by default), `ArrowDecoder` decodes delimited protobu
   - For custom buckets: the bounds, the zero bucket, and the bucket count. Like Go's `checkHistogramCustomBounds`, the first bound may be `-Inf`, which classic buckets with `le="-Inf"` convert to. The zero count is checked as sent, so a fractional or NaN float zero count is rejected.
 - A bucket list that outgrows the OTAP `i32` list offsets returns `DecodeError::CapacityOverflow`, not `InvalidHistogram`.
 - A family whose messages mix NHCB and exponential points gets two metric rows with the same name and metadata, one `metric_type = 3` and one `metric_type = 4`.
-- `gaugehistogram` families keep the Prometheus type in metric metadata like text input, and exponential gauge histograms use cumulative temporality.
+- `gaugehistogram` families are kept, like in text input, though the OpenTelemetry spec drops classic and native gauge histograms. They keep the Prometheus type in metric metadata, and exponential gauge histograms use cumulative temporality.
 - Histogram exemplars go to `HistogramDpExemplars` or `ExpHistogramDpExemplars`. Exemplars without timestamps are skipped for every protobuf histogram: Go's `ProtobufParser` skips them for native histograms, and classic histograms are converted to NHCB. `span_id` and `trace_id` exemplar labels move into their OTAP columns.
 
 Known gaps:

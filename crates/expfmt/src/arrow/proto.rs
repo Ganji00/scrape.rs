@@ -48,6 +48,8 @@ pub(super) struct ProtoScratch {
     pub(super) state: ProtobufParserState,
     /// `(quantile, value)` pairs of the current summary, sorted before they are appended.
     quantiles: Vec<(f64, f64)>,
+    /// Indices of the labels being checked, sorted by name.
+    label_order: Vec<usize>,
 }
 
 impl ProtoScratch {
@@ -62,7 +64,9 @@ impl ProtoScratch {
     }
 
     pub(super) fn retained_memory_bytes(&self) -> usize {
-        self.state.retained_memory_bytes() + self.quantiles.capacity() * size_of::<(f64, f64)>()
+        self.state.retained_memory_bytes()
+            + self.quantiles.capacity() * size_of::<(f64, f64)>()
+            + self.label_order.capacity() * size_of::<usize>()
     }
 }
 
@@ -259,7 +263,11 @@ impl ArrowDecoder {
 
         if metric_type == MetricType::Unknown && opts.untyped_policy == UntypedPolicy::Drop {
             // Labels are still checked, like the text loop does for dropped families.
-            check_dropped_labels(&metric.label, &self.current_family)?;
+            check_label_names(
+                &metric.label,
+                &mut self.proto.label_order,
+                &self.current_family,
+            )?;
             self.current_family.has_samples = true;
             return Ok(None);
         }
@@ -421,7 +429,11 @@ impl ArrowDecoder {
         if view.is_float {
             check_float_histogram(&view).map_err(|r| invalid_histogram(&self.current_family, r))?;
             // Labels are still checked, like for points of dropped untyped families.
-            check_dropped_labels(&metric.label, &self.current_family)?;
+            check_label_names(
+                &metric.label,
+                &mut self.proto.label_order,
+                &self.current_family,
+            )?;
             self.current_family.has_samples = true;
             return Ok(None);
         }
@@ -504,9 +516,10 @@ impl ArrowDecoder {
         self.temp_attrs.clear();
         let mut prev_key_id = None;
         let mut sorted_by_key_id = true;
-        for (index, label) in labels.iter().enumerate() {
+        let mut has_empty_value = false;
+        for label in labels {
             if label.value.is_empty() {
-                check_label_name(index, labels, true, &self.current_family)?;
+                has_empty_value = true;
                 continue;
             }
             let key_id = Self::intern_key(
@@ -532,6 +545,10 @@ impl ArrowDecoder {
                 &self.current_family,
             )?;
         }
+        if has_empty_value {
+            // Labels with empty values are not interned, but their names still count.
+            check_label_names(labels, &mut self.proto.label_order, &self.current_family)?;
+        }
         Ok(())
     }
 }
@@ -547,14 +564,27 @@ fn exemplar_timestamp_overflow(timestamp: &prost_types::Timestamp) -> DecodeErro
     }
 }
 
-/// Checks the labels of a point that is dropped and so not interned.
+/// Rejects `__name__` and duplicate names among labels that are not interned. The labels are
+/// sorted by name in `order`, so a long label list takes O(L log L), not O(L^2).
 #[cold]
-fn check_dropped_labels(
+fn check_label_names(
     labels: &[dto::LabelPair],
+    order: &mut Vec<usize>,
     family: &CurrentFamily,
 ) -> Result<(), DecodeError> {
-    for index in 0..labels.len() {
-        check_label_name(index, labels, true, family)?;
+    order.clear();
+    order.extend(0..labels.len());
+    order.sort_unstable_by_key(|&index| labels[index].name.as_str());
+    let mut previous = None;
+    for &index in order.iter() {
+        let name = labels[index].name.as_str();
+        if name == METRIC_NAME_LABEL || previous == Some(name) {
+            return Err(DecodeError::DuplicateLabel {
+                metric: family.name_string(),
+                label: name.to_owned(),
+            });
+        }
+        previous = Some(name);
     }
     Ok(())
 }
